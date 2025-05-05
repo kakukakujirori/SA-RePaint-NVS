@@ -1,2 +1,4 @@
 __pycache__/
-example_imgs/
+data/
+output/
+notebooks/

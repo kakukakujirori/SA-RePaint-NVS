@@ -8,7 +8,7 @@ set -e
 ls data/${ITEM}/images/* | xargs -I@ convert @ -resize 1024x576! @
 
 # depth estimation
-python Depth-Anything-V2/run.py \
+python tools/Depth-Anything-V2/run.py \
   --encoder vitl \
   --img-path data/${ITEM}/images  \
   --outdir data/${ITEM}/depth

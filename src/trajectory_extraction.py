@@ -340,6 +340,8 @@ def save_warped_image(
     trans_valid_list = [np.ones((576, 1024), dtype=bool)]
 
     for i, pose_t in enumerate(poses):
+        np.save(os.path.join(save_path,str(i).zfill(4)+"_pose.npy"), pose_t)
+
         image = Image.open(images_lists[i])
         image = np.array(image)
         depth = np.load(depth_lists[i]).astype(np.float32)

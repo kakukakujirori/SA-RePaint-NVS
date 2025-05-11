@@ -536,7 +536,7 @@ class EulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
             pred_original_sample = model_output
         elif self.config.prediction_type == "epsilon":
             pred_original_sample = sample - sigma_hat * model_output
-        elif self.config.prediction_type == "v_prediction":
+        elif self.config.prediction_type == "v_prediction":  # <=== HIT
             # denoised = model_output * c_out + input * c_skip
             pred_original_sample = model_output * (-sigma / (sigma**2 + 1) ** 0.5) + (sample / (sigma**2 + 1))
         else:
@@ -576,9 +576,6 @@ class EulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
                 cutoff_index_s = num_zero-1
                 cutoff_index_e = int(weight * (len(sorted_diff)-num_zero))+num_zero
                 cutoff_value = sorted_diff[cutoff_index_e-1]
-
-                # print(f"{cutoff_value=}")
-                # cutoff_value = torch.ones_like(cutoff_value) * 1000000
 
                 top_mask = (torch.abs(masked_diff) <= cutoff_value) & mask_t
                 top_masks.append(top_mask)

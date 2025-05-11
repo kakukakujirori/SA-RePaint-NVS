@@ -1,6 +1,7 @@
 ITEM=basketball
 CAMERA_MOTION_MODE=horizontal
 DEGREE=1.0
+NUM_FRAMES=25
 
 set -e
 
@@ -22,10 +23,12 @@ python src/trajectory_extraction.py \
   --camera_motion_mode ${CAMERA_MOTION_MODE} \
   --major_radius 80 \
   --minor_radius 70 \
-  --num_frames 25
+  --num_frames ${NUM_FRAMES}
 
 # generaiton
 python src/generate.py \
   --trajectory_folder output/${ITEM}/${CAMERA_MOTION_MODE}_${DEGREE}/warped \
-  --num_frames 25 \
-  --output_folder output/${ITEM}/${CAMERA_MOTION_MODE}_${DEGREE}/generated
+  --num_frames ${NUM_FRAMES} \
+  --num_inference_steps 25 \
+  --output_folder output/${ITEM}/${CAMERA_MOTION_MODE}_${DEGREE}/generated \
+  --seed 12345

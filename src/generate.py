@@ -4,6 +4,7 @@ import glob
 import inspect
 import os
 from dataclasses import dataclass
+from tqdm import tqdm
 
 import numpy as np
 import PIL
@@ -310,7 +311,7 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
 
         return add_time_ids
 
-    def decode_latents(self, latents, num_frames, decode_chunk_size=14):
+    def decode_latents(self, latents, num_frames, decode_chunk_size=14, permute: bool = True):
         # [batch, frames, channels, height, width] -> [batch*frames, channels, height, width]
         latents = latents.flatten(0, 1)
 
@@ -332,9 +333,10 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
         frames = torch.cat(frames, dim=0)
 
         # [batch*frames, channels, height, width] -> [batch, channels, frames, height, width]
-        print(frames.shape)
-        num_frames = num_frames
-        frames = frames.reshape(-1, num_frames, *frames.shape[1:]).permute(0, 2, 1, 3, 4)
+        if permute:
+            frames = frames.reshape(-1, num_frames, *frames.shape[1:]).permute(0, 2, 1, 3, 4)
+        else:
+            frames = frames.reshape(-1, num_frames, *frames.shape[1:])
 
         # we always cast to float32 as this does not cause significant overhead and is compatible with bfloat16
         frames = frames.float()
@@ -409,6 +411,7 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
         image: Union[PIL.Image.Image, List[PIL.Image.Image], torch.FloatTensor],
         temp_cond,
         mask,
+        mask_ori,
         # pose,
         lambda_ts,
         lr,
@@ -541,6 +544,8 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
         image = self.image_processor.preprocess(image, height=height, width=width)
         mask = mask.cuda()
         mask = mask.unsqueeze(1).unsqueeze(0).repeat(1,1,4,1,1)
+        mask_ori = mask_ori.cuda()
+        mask_ori = mask_ori.unsqueeze(1).unsqueeze(0)
         temp_cond_list = []
         for i in range(len(temp_cond)):
             temp_cond_ = self.image_processor.preprocess(temp_cond[i], height=height, width=width)
@@ -569,7 +574,8 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
 
         image_latents = rearrange(image_latents, "(b f) c h w -> b f c h w",f=1)
 
-        temp_cond_latents  = torch.cat((image_latents,temp_cond_latents),dim=1)
+        temp_cond_latents  = torch.cat((image_latents,temp_cond_latents), dim=1)
+        temp_cond = torch.cat((image, temp_cond), dim=0).to(device).unsqueeze(0)
 
         # .to(image_embeddings.dtype)
         image_latents = image_latents.to(image_embeddings.dtype)
@@ -635,11 +641,8 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
             for i, t in enumerate(timesteps):
                 grads = []
                 latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
-                latent_model_input_test1=latent_model_input
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t,step_i=i)
-                latent_model_input_test2=latent_model_input
                 latent_model_input = torch.cat([latent_model_input[0:1], image_latents[1:2]], dim=2)
-                latent_model_input2 = latent_model_input
                 for ii in range(4):
                     with torch.enable_grad():
 
@@ -684,7 +687,17 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
                             return_dict=False,
                         )[0]
 
-                        output = self.scheduler.step_single(noise_pred_t, t, latents1,temp_cond_latents1,mask1,lambda_ts,step_i=i,lr=lr,weight_clamp=weight_clamp,compute_grad=True)
+                        output = self.scheduler.step_single(
+                            noise_pred_t,
+                            t,
+                            latents1,
+                            temp_cond_latents1,
+                            mask1,
+                            lambda_ts,
+                            step_i=i,
+                            lr=lr,
+                            weight_clamp=weight_clamp,
+                            compute_grad=True)
                         grad = output.grad
                         grads.append(grad)
 
@@ -698,10 +711,8 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
 
 
                 with torch.no_grad():
-
-
                     latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
-                    latent_model_input = self.scheduler.scale_model_input(latent_model_input, t,step_i=i)
+                    latent_model_input = self.scheduler.scale_model_input(latent_model_input, t, step_i=i)
                     latent_model_input = torch.cat([latent_model_input, image_latents], dim=2)
 
                     noise_pred = self.unet(
@@ -717,27 +728,102 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
                         noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_cond - noise_pred_uncond)
 
 
-                    latents = self.scheduler.step_single(noise_pred, t, latents,temp_cond_latents,mask,lambda_ts,step_i=i,compute_grad=False).prev_sample
+                    latents = self.scheduler.step_single(noise_pred, t, latents, temp_cond_latents, mask, lambda_ts, step_i=i, compute_grad=False).prev_sample
+
+                # ReSample
+                if self._num_timesteps // 3 < i < self._num_timesteps - 1:
+                    if i % 4 == 0:
+                        latents_clone = latents.detach().clone().float()
+                        inter_timesteps = 5  # NOTE: During this, no conditional signals are applied
+
+                        with torch.no_grad():
+                            for i2 in range(i + 1, min(i + inter_timesteps, self._num_timesteps - 1)):
+                                t2 = timesteps[i2]
+                                latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+                                latent_model_input = self.scheduler.scale_model_input(latent_model_input, t2, step_i=i2)
+                                latent_model_input = torch.cat([latent_model_input, image_latents], dim=2)
+
+                                noise_pred = self.unet(
+                                    latent_model_input,
+                                    t2,
+                                    encoder_hidden_states=image_embeddings,
+                                    added_time_ids=added_time_ids,
+                                    return_dict=False,
+                                )[0]
+
+                                if do_classifier_free_guidance:
+                                    noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
+                                    noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_cond - noise_pred_uncond)
+
+                                out_tmp = self.scheduler.step_single(noise_pred, t, latents, temp_cond_latents=None, mask=None, lambda_ts=None, step_i=i, compute_grad=False)
+                                latents = out_tmp.prev_sample
+                                pseudo_x0 = out_tmp.pred_original_sample
+
+                        # Some arbitrary scheduling for sigma
+                        posterior_sigma = self.scheduler.sigmas[i] * 0.5
+                        current_sigma = self.scheduler.sigmas[i]
+
+                        # Pixel-based optimization for second stage
+                        if True: #i < self._num_timesteps * 2 // 3:
+                            print(f"{i=}: Pixel space optimization !!!")
+
+                            # Enforcing consistency via pixel-based optimization
+                            pseudo_x0 = pseudo_x0.detach()
+
+                            self.vae.to(dtype=torch.float32 if needs_upcasting else None, device=device)
+                            with torch.no_grad():
+                                pseudo_x0_pixel = self.decode_latents(pseudo_x0, num_frames, decode_chunk_size, permute=False)  # Get \hat{x}_0 into pixel space
+                            #self.vae.to(device="cpu", dtype=torch.float16 if needs_upcasting else None)
+
+                            opt_var = self.pixel_optimization(measurement=temp_cond, x_prime=pseudo_x0_pixel, mask=mask_ori)
+                            opt_var = rearrange(opt_var, "() f c h w -> f c h w", f=num_frames, c=3)
+
+                            self.vae.to(dtype=torch.float32 if needs_upcasting else None, device=device)
+                            with torch.no_grad():
+                                opt_latents_list = []
+                                for j in range(opt_var.shape[0]):
+                                    opt_latents_ = self._encode_vae_image(opt_var[j:j+1,:,:,:], device, num_videos_per_prompt, do_classifier_free_guidance=False) # [12, 4, 72, 128]
+                                    opt_latents_ = rearrange(opt_latents_, "(b f) c h w -> b f c h w", b=1)
+                                    opt_latents_list.append(opt_latents_)
+                            opt_latents = torch.cat(opt_latents_list, dim=1)
+
+                            #self.vae.to(device="cpu", dtype=torch.float16 if needs_upcasting else None)
+
+                        # Latent-based optimization for third stage
+                        else:
+
+                            print(f"{i=}: Latent space optimization !!!")
+
+                            # Enforcing consistency via latent space optimization
+                            opt_latents = self.latent_optimization(measurement=temp_cond, z_init=pseudo_x0.detach(), mask=mask_ori, num_frames=num_frames, decode_chunk_size=decode_chunk_size)
 
 
-                    if callback_on_step_end is not None:
-                        callback_kwargs = {}
-                        for k in callback_on_step_end_tensor_inputs:
-                            callback_kwargs[k] = locals()[k]
-                        callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
 
-                        latents = callback_outputs.pop("latents", latents)
+                        latents = self.stochastic_resample(opt_z0=opt_latents, zt=latents_clone, current_sigma=current_sigma, posterior_sigma=posterior_sigma)
+                        latents = latents.requires_grad_() # Seems to need to require grad here
+                        latents = latents.half()
 
 
 
-                    if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
-                        progress_bar.update()
+
+
+                if callback_on_step_end is not None:
+                    callback_kwargs = {}
+                    for k in callback_on_step_end_tensor_inputs:
+                        callback_kwargs[k] = locals()[k]
+                    callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
+
+                    latents = callback_outputs.pop("latents", latents)
+
+
+
+                if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
+                    progress_bar.update()
 
 
         if not output_type == "latent":
             # cast back to fp16 if needed
-            if needs_upcasting:
-                self.vae.to(dtype=torch.float16)
+            self.vae.to(dtype=torch.float16 if needs_upcasting else None, device=device)
             with torch.no_grad():
                 frames = self.decode_latents(latents, num_frames, decode_chunk_size)
             frames = tensor2vid(frames, self.image_processor, output_type=output_type)
@@ -751,6 +837,144 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
             return frames
 
         return StableVideoDiffusionPipelineOutput(frames=frames)
+
+
+    def pixel_optimization(self, measurement, x_prime, mask, lr=1e-2, eps=1e-3, max_iters=2000):
+        """
+        Function to compute argmin_x ||y - A(x)||_2^2
+
+        Arguments:
+            measurement:           Measurement vector y in y=Ax+n.
+            x_prime:               Estimation of hat{x}_0 using Tweedie's formula
+            mask:                  Valid mask
+            eps:                   Tolerance error
+            max_iters:             Maximum number of GD iterations (default: 2000)
+        """
+
+        loss = torch.nn.MSELoss() # MSE loss
+
+        opt_var = x_prime.detach().clone()
+        opt_var = opt_var.requires_grad_()
+        optimizer = torch.optim.AdamW([opt_var], lr=lr) # Initializing optimizer
+        measurement = measurement.detach() # Need to detach for weird PyTorch reasons
+
+        # Training loop
+        mask = (1 - mask > 0.5)
+        mask_ones = torch.ones_like(mask[:,0:1,:,:,:])
+        mask = torch.cat((mask_ones,mask),1)  # (1, 25, 1, h, w)
+        mask = mask.expand_as(measurement)
+
+        for step in tqdm(range(max_iters)):
+            optimizer.zero_grad()
+
+            measurement_loss = loss(measurement[mask], opt_var[mask])
+
+            measurement_loss.backward() # Take GD step
+            optimizer.step()
+
+            # Convergence criteria
+            if measurement_loss < eps**2: # needs tuning according to noise level for early stopping
+                break
+
+            if step % 100 == 0:
+                print(f"[pixel_optimization] step {step}: {measurement_loss=}")
+
+        return opt_var
+
+
+    def latent_optimization(self, measurement, z_init, mask, eps=1e-3, max_iters=500, lr=None, num_frames: int = 25, decode_chunk_size: int = 8, needs_upcasting: bool = True):
+        """
+        Function to compute argmin_z ||y - A( D(z) )||_2^2
+
+        Arguments:
+            measurement:           Measurement vector y in y=Ax+n.
+            z_init:                Starting point for optimization
+            mask:                  Valid mask
+            eps:                   Tolerance error
+            max_iters:             Maximum number of GD iterations (default: 500)
+
+        Optimal parameters seem to be at around 500 steps, 200 steps for inpainting.
+        """
+
+        # Base case
+        if not z_init.requires_grad:
+            z_init = z_init.requires_grad_()
+
+        if lr is None:
+            lr_val = 5e-3
+        else:
+            lr_val = lr.item()
+
+        loss = torch.nn.MSELoss() # MSE loss
+        optimizer = torch.optim.AdamW([z_init], lr=lr_val) # Initializing optimizer ###change the learning rate
+        measurement = measurement.detach() # Need to detach for weird PyTorch reasons
+
+        # Training loop
+        losses = []
+
+        mask = (1 - mask > 0.5)
+        mask_ones = torch.ones_like(mask[:,0:1,:,:,:])
+        mask = torch.cat((mask_ones,mask),1)  # (1, 25, 1, h, w)
+        mask = mask.expand_as(measurement)
+
+        self.unet.to(device="cpu")
+        self.vae.to(dtype=torch.float32 if needs_upcasting else None, device=z_init.device)
+
+        torch.cuda.empty_cache()
+
+        for itr in tqdm(range(max_iters)):
+            for i in range(num_frames):
+                optimizer.zero_grad()
+                frame_i = self.decode_latents(z_init[:, i:i+1], 1, decode_chunk_size, permute=False)
+                mask_i = mask[:, i:i+1]
+                output = loss(measurement[:, i:i+1][mask_i], frame_i[mask_i])
+
+            output.backward() # Take GD step
+            optimizer.step()
+            cur_loss = output.detach().cpu().numpy()
+
+            # Convergence criteria
+
+            if itr < 200: # may need tuning for early stopping
+                losses.append(cur_loss)
+            else:
+                losses.append(cur_loss)
+                if losses[0] < cur_loss:
+                    break
+                else:
+                    losses.pop(0)
+
+            if cur_loss < eps**2:  # needs tuning according to noise level for early stopping
+                break
+
+        torch.cuda.empty_cache()
+
+        self.vae.to(dtype=torch.float16, device="cpu" if needs_upcasting else None)
+        self.unet.to(z_init.device)
+
+        return z_init
+
+
+    def stochastic_resample(self, opt_z0, zt, current_sigma, posterior_sigma):
+        """
+        Function to resample x_t based on ReSample paper.
+
+        Arguments:
+            opt_z0: hat{z}_0(y)
+            zt: z'_t
+            current_sigma: current noise level. Following the EDM formulation, this is equivalent to the timestep
+            posterior_sigma: p(z'_t | hat{z}_t, hat{z}_0(y), y) ~ N(hat{z}_t, posterior_sigma)
+        """
+        print(f"[stochastic_resample] {current_sigma=}, {posterior_sigma=}")
+        noise = torch.randn_like(opt_z0, device=opt_z0.device)
+
+        t_squared = current_sigma ** 2
+        post_sigma_squared = posterior_sigma ** 2
+
+        mean = (post_sigma_squared * opt_z0 + t_squared * zt) / (t_squared + post_sigma_squared)
+        std = 1 / torch.sqrt(1 / post_sigma_squared + 1 / t_squared)
+        print(f"[stochastic_resample] {zt.mean()=}, {zt.std()=}, {opt_z0.mean()=}, {mean.mean()=}, {std.mean()=}")
+        return mean + noise * std
 
 
 def search_hypers(sigmas, num_frames: int):
@@ -879,6 +1103,7 @@ if __name__ == '__main__':
     image_o, cond_images = warped_images[0], warped_images[1:]
 
     # load masks
+    masks_ori = []
     masks = []
     for i in range(1, args.num_frames):
         mask_erosion = PIL.Image.open(os.path.join(args.trajectory_folder, f'{i:04d}_mask.png'))
@@ -887,12 +1112,15 @@ if __name__ == '__main__':
         mask_erosion_[mask_erosion_ >= 0.5] = 1
 
         mask_erosion = np.mean(mask_erosion_,axis = -1)
+        masks_ori.append(torch.from_numpy(mask_erosion).unsqueeze(0))
+
         mask_erosion = mask_erosion.reshape(72,8,128,8).transpose(0,2,1,3).reshape(72,128,64)
         mask_erosion = np.mean(mask_erosion,axis=2)
         mask_erosion[mask_erosion < 0.2] = 0
         mask_erosion[mask_erosion >= 0.2] = 1
         masks.append(torch.from_numpy(mask_erosion).unsqueeze(0))
     masks = torch.concat(masks)
+    masks_ori = torch.concat(masks_ori)
 
     # TODO: load camera poses
     # TODO: load depths
@@ -910,6 +1138,7 @@ if __name__ == '__main__':
         [image_o],
         temp_cond=cond_images,
         mask=masks,
+        mask_ori=masks_ori,
         # poses=poses,
         # intrinsics=intrinsics,
         # depths=depths,

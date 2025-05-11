@@ -109,7 +109,7 @@ class Inpaint_Tool():
         self.fooocus = Fooocus()
         self.llava = Llava(device='cpu',llava_ckpt="llava-hf/bakLlava-v1-hf")
 
-    def _llava_prompt(self,frame):
+    def _llava_prompt(self):
         prompt = '<image>\n \
                 USER: Detaily imagine and describe the scene this image taken from? \
                 \n ASSISTANT: This image is taken from a scene of '
@@ -125,7 +125,7 @@ class Inpaint_Tool():
             print('Inpaint-Caption[1/3] Move llava.model to GPU...')
             self.llava.model.to('cuda')
             print('Inpaint-Caption[2/3] Llava inpainting instruction:')
-            query  = self._llava_prompt(frame)
+            query  = self._llava_prompt()
             prompt = self.llava(frame.rgb,query)
             split  = str.rfind(prompt,'ASSISTANT: This image is taken from a scene of ') + len(f'ASSISTANT: This image is taken from a scene of ')
             prompt = prompt[split:]

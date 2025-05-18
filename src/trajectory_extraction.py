@@ -8,98 +8,92 @@ from numba import njit
 from PIL import Image
 
 
-@njit
-def mask_occlusion_traj(depth, trans_depth, trans_coordinates, trans_valid):
-    depth_new = trans_depth * 0 + 10086
-    h, w = depth.shape
-
-    for hh in range(1,h):
-        for ww in range(1, w):
-            x1, y1 = trans_coordinates[hh-1,ww-1]
-            x2, y2 = trans_coordinates[hh,ww]
-            x1, x2, y1, y2 = int(x1), int(x2), int(y1), int(y2)
-            if x1 < w and x1 >= 0 and x2 < w and x2 >= 0 and \
-                y1 < h and y1 >= 0 and y2 < h and y2 >= 0 and \
-                abs((depth[hh,ww] - depth[hh-1,ww-1])/depth[hh,ww]/depth[hh-1,ww-1])<0.1:
-                    value_array = np.full(depth_new[min(y1,y2):max(y1,y2), min(x1,x2):max(x1,x2)].shape, trans_depth[hh,ww])
-                    depth_new[min(y1,y2):max(y1,y2), min(x1,x2):max(x1,x2)] = np.minimum(value_array, depth_new[min(y1,y2):max(y1,y2), min(x1,x2):max(x1,x2)])
-
-    for hh in range(1,h):
-        for ww in range(1, w):
-            x1, y1 = trans_coordinates[hh,ww]
-            x1 = int(x1)
-            y1 = int(y1)
-
-            if x1 < w and x1 >= 0 and y1 < h and y1 >= 0:
-                if (trans_depth[hh, ww] - depth_new[y1, x1]>0.6):
-                    trans_valid[hh, ww] = False
-
-    return trans_valid
+def create_grid(h:int, w: int):
+    x_1d = np.arange(0, w)[None]
+    y_1d = np.arange(0, h)[:, None]
+    x_2d = np.repeat(x_1d, repeats=h, axis=0)
+    y_2d = np.repeat(y_1d, repeats=w, axis=1)
+    grid = np.stack([x_2d, y_2d], axis=2)
+    return grid
 
 
-def forward_warp(
-        frame1: np.ndarray,
-        mask1: Optional[np.ndarray],
-        depth1: np.ndarray,
-        transformation1: np.ndarray,
-        transformation2: np.ndarray,
-        intrinsic1: np.ndarray,
-        intrinsic2: Optional[np.ndarray],
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def normalize(v):
+    norm = np.linalg.norm(v)
+    if norm == 0:
+        return v
+    return v / norm
+
+
+def look_at_matrix(camera_position, target, up):
+
+    # Camera's forward vector (z-axis)
+    forward = normalize(target - camera_position)
+    # Camera's right vector (x-axis)
+    right = normalize(np.cross(up, forward))
+    # Camera's up vector (y-axis), ensure it is orthogonal to the other two axes
+    up = np.cross(forward, right)
+
+    # Create the rotation matrix by combining the camera axes to form a basis
+    rotation = np.array([
+        [right[0], up[0], forward[0], 0],
+        [right[1], up[1], forward[1], 0],
+        [right[2], up[2], forward[2], 0],
+        [0, 0, 0, 1]
+    ])
+
+    # Create the translation matrix
+    translation = np.array([
+        [1, 0, 0, -camera_position[0]],
+        [0, 1, 0, -camera_position[1]],
+        [0, 0, 1, -camera_position[2]],
+        [0, 0, 0, 1]
+    ])
+
+    # The view matrix is the inverse of the camera's transformation matrix
+    # Here we assume the rotation matrix is orthogonal (i.e., rotation.T == rotation^-1)
+    view_matrix = rotation.T @ translation
+
+    return view_matrix
+
+
+def generate_camera_poses(num_poses, angle_step, major_radius, minor_radius, camera_motion_mode, inverse=False):
     """
-    Given a frame1 and global transformations transformation1 and transformation2, warps frame1 to next view using
-    bilinear splatting.
-    :param frame1: (h, w, 3) uint8 np array
-    :param mask1: (h, w) bool np array. Wherever mask1 is False, those pixels are ignored while warping. Optional
-    :param depth1: (h, w) float np array.
-    :param transformation1: (4, 4) extrinsic transformation matrix of first view: [R, t; 0, 1]
-    :param transformation2: (4, 4) extrinsic transformation matrix of second view: [R, t; 0, 1]
-    :param intrinsic1: (3, 3) camera intrinsic matrix
-    :param intrinsic2: (3, 3) camera intrinsic matrix. Optional
+    Generate a camera pose that rotates around the origin, forming an elliptical trajectory.
     """
-    h, w = frame1.shape[:2]
-    if mask1 is None:
-        mask1 = np.ones(shape=(h, w), dtype=bool)
-    if intrinsic2 is None:
-        intrinsic2 = np.copy(intrinsic1)
-    assert frame1.shape == (h, w, 3)
-    assert mask1.shape == (h, w)
-    assert depth1.shape == (h, w)
-    assert transformation1.shape == (4, 4)
-    assert transformation2.shape == (4, 4)
-    assert intrinsic1.shape == (3, 3)
-    assert intrinsic2.shape == (3, 3)
+    poses = []
 
-    trans_points1, world_points = compute_transformed_points(
-        depth1,
-        transformation1,
-        transformation2,
-        intrinsic1,
-        intrinsic2)
+    for i in range(num_poses):
+        angle = np.deg2rad(angle_step * i if not inverse else 360 - angle_step * i)
 
-    trans_coordinates = trans_points1[:, :, :2, 0] / (trans_points1[:, :, 2:3, 0])
+        if camera_motion_mode == 'horizontal':
+            cam_x = major_radius * np.sin(angle)
+            cam_y = 0
+            cam_z =  minor_radius * np.cos(angle)
+        elif camera_motion_mode == 'vertical':
+            cam_y = major_radius * np.sin(angle)
+            cam_x = 0
+            cam_z =  minor_radius * np.cos(angle)
+        elif camera_motion_mode == 'zoomin':
+            cam_x = 0
+            cam_y = 0
+            cam_z =  minor_radius * np.cos(angle)
+        elif camera_motion_mode == 'zoomout':
+            cam_x = 0
+            cam_y = 0
+            cam_z =  minor_radius * (1+np.sin(angle))
+        else:
+            raise NotImplementedError
 
-    trans_depth1 = trans_points1[:, :, 2, 0]
+        look_at = np.array([0, 0, 0])
+        camera_position = np.array([cam_x, cam_y, cam_z])
+        up_direction = np.array([0, 1, 0])
 
-    grid = create_grid(h, w)
-    flow12 = trans_coordinates - grid
-    flow12 = flow12.reshape(-1,2)
-    flow12[trans_depth1.reshape(-1) < 0] = 100000 # important
-    flow12 = flow12.reshape(576,1024,2)
+        pose_matrix = look_at_matrix(camera_position, look_at, up_direction)
+        poses.append(pose_matrix)
+    return poses
 
-    trans_coordinates = trans_coordinates.reshape(-1,2)
-    trans_coordinates[trans_depth1.reshape(-1)<0] = 100000
-    trans_coordinates = trans_coordinates.reshape(576,1024,2)
 
-    trans_valid = (trans_depth1 > 0)
-    trans_valid = mask_occlusion_traj(depth1, trans_depth1, trans_coordinates, trans_valid)
-
-    frame1 = np.concatenate([frame1, depth1[..., None]], axis=-1)
-    warped_frame2, mask2 = bilinear_splatting(frame1, mask1, trans_depth1, flow12, None, is_image=False)
-    warped_frame2, depth2 = warped_frame2[..., :3], warped_frame2[..., 3]
-    warped_frame2 = np.clip(warped_frame2, a_min=0, a_max=255).round().astype('uint8')
-
-    return warped_frame2, mask2, depth2, flow12, trans_coordinates, trans_valid
+################################################################
 
 
 def compute_transformed_points(
@@ -139,6 +133,38 @@ def compute_transformed_points(
     trans_norm_points = np.matmul(intrinsic2_4d, trans_world)
 
     return trans_norm_points,world_points
+
+
+@njit
+def mask_occlusion_traj(
+        depth: np.ndarray,  # (h, w)
+        trans_depth: np.ndarray,  # (h, w)
+        trans_coordinates: np.ndarray,  # (h, w, 2)
+        trans_valid: np.ndarray,  # (h, w)
+    ) -> np.ndarray:
+    depth_new = np.full_like(trans_depth, np.inf)
+    h, w = depth.shape
+
+    for hh in range(1,h):
+        for ww in range(1, w):
+            x1, y1 = trans_coordinates[hh-1,ww-1]
+            x2, y2 = trans_coordinates[hh,ww]
+            x1, x2, y1, y2 = int(round(x1)), int(round(x2) + 1), int(round(y1)), int(round(y2) + 1)
+            if 0 <= x1 < w and 0 <= x2 <= w and 0 <= y1 < h and 0 <= y2 <= h and \
+                abs(depth[hh,ww] - depth[hh-1,ww-1]) < 0.1 * min(depth[hh,ww], depth[hh-1,ww-1]):
+                    value_array = np.full(depth_new[min(y1,y2):max(y1,y2), min(x1,x2):max(x1,x2)].shape, trans_depth[hh,ww])
+                    depth_new[min(y1,y2):max(y1,y2), min(x1,x2):max(x1,x2)] = np.minimum(value_array, depth_new[min(y1,y2):max(y1,y2), min(x1,x2):max(x1,x2)])
+
+    for hh in range(1,h):
+        for ww in range(1, w):
+            x1, y1 = trans_coordinates[hh,ww]
+            x1 = int(round(x1))
+            y1 = int(round(y1))
+
+            if (0 <= x1 < w and 0 <= y1 < h) and (trans_depth[hh, ww] > depth_new[y1, x1] * 1.1):
+                    trans_valid[hh, ww] = False
+
+    return trans_valid
 
 
 def bilinear_splatting(
@@ -231,89 +257,72 @@ def bilinear_splatting(
     return warped_frame2, mask
 
 
-def create_grid(h, w):
-    x_1d = np.arange(0, w)[None]
-    y_1d = np.arange(0, h)[:, None]
-    x_2d = np.repeat(x_1d, repeats=h, axis=0)
-    y_2d = np.repeat(y_1d, repeats=w, axis=1)
-    grid = np.stack([x_2d, y_2d], axis=2)
-    return grid
+################################################################
 
 
-def normalize(v):
-    norm = np.linalg.norm(v)
-    if norm == 0:
-        return v
-    return v / norm
-
-
-def look_at_matrix(camera_position, target, up):
-
-    # Camera's forward vector (z-axis)
-    forward = normalize(target - camera_position)
-    # Camera's right vector (x-axis)
-    right = normalize(np.cross(up, forward))
-    # Camera's up vector (y-axis), ensure it is orthogonal to the other two axes
-    up = np.cross(forward, right)
-
-    # Create the rotation matrix by combining the camera axes to form a basis
-    rotation = np.array([
-        [right[0], up[0], forward[0], 0],
-        [right[1], up[1], forward[1], 0],
-        [right[2], up[2], forward[2], 0],
-        [0, 0, 0, 1]
-    ])
-
-    # Create the translation matrix
-    translation = np.array([
-        [1, 0, 0, -camera_position[0]],
-        [0, 1, 0, -camera_position[1]],
-        [0, 0, 1, -camera_position[2]],
-        [0, 0, 0, 1]
-    ])
-
-    # The view matrix is the inverse of the camera's transformation matrix
-    # Here we assume the rotation matrix is orthogonal (i.e., rotation.T == rotation^-1)
-    view_matrix = rotation.T @ translation
-
-    return view_matrix
-
-
-def generate_camera_poses(num_poses, angle_step, major_radius, minor_radius, camera_motion_mode, inverse=False):
+def forward_warp(
+        frame1: np.ndarray,
+        mask1: Optional[np.ndarray],
+        depth1: np.ndarray,
+        transformation1: np.ndarray,
+        transformation2: np.ndarray,
+        intrinsic1: np.ndarray,
+        intrinsic2: Optional[np.ndarray],
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    Generate a camera pose that rotates around the origin, forming an elliptical trajectory.
+    Given a frame1 and global transformations transformation1 and transformation2, warps frame1 to next view using
+    bilinear splatting.
+    :param frame1: (h, w, 3) uint8 np array
+    :param mask1: (h, w) bool np array. Wherever mask1 is False, those pixels are ignored while warping. Optional
+    :param depth1: (h, w) float np array.
+    :param transformation1: (4, 4) extrinsic transformation matrix of first view: [R, t; 0, 1]
+    :param transformation2: (4, 4) extrinsic transformation matrix of second view: [R, t; 0, 1]
+    :param intrinsic1: (3, 3) camera intrinsic matrix
+    :param intrinsic2: (3, 3) camera intrinsic matrix. Optional
     """
-    poses = []
+    h, w = frame1.shape[:2]
+    if mask1 is None:
+        mask1 = np.ones(shape=(h, w), dtype=bool)
+    if intrinsic2 is None:
+        intrinsic2 = np.copy(intrinsic1)
+    assert frame1.shape == (h, w, 3)
+    assert mask1.shape == (h, w)
+    assert depth1.shape == (h, w)
+    assert transformation1.shape == (4, 4)
+    assert transformation2.shape == (4, 4)
+    assert intrinsic1.shape == (3, 3)
+    assert intrinsic2.shape == (3, 3)
 
-    for i in range(num_poses):
-        angle = np.deg2rad(angle_step * i if not inverse else 360 - angle_step * i)
+    trans_points1, world_points = compute_transformed_points(
+        depth1,
+        transformation1,
+        transformation2,
+        intrinsic1,
+        intrinsic2)
 
-        if camera_motion_mode == 'horizontal':
-            cam_x = major_radius * np.sin(angle)
-            cam_y = 0
-            cam_z =  minor_radius * np.cos(angle)
-        elif camera_motion_mode == 'vertical':
-            cam_y = major_radius * np.sin(angle)
-            cam_x = 0
-            cam_z =  minor_radius * np.cos(angle)
-        elif camera_motion_mode == 'zoomin':
-            cam_x = 0
-            cam_y = 0
-            cam_z =  minor_radius * np.cos(angle)
-        elif camera_motion_mode == 'zoomout':
-            cam_x = 0
-            cam_y = 0
-            cam_z =  minor_radius * (1+np.sin(angle))
-        else:
-            raise NotImplementedError
+    trans_coordinates = trans_points1[:, :, :2, 0] / (trans_points1[:, :, 2:3, 0])
 
-        look_at = np.array([0, 0, 0])
-        camera_position = np.array([cam_x, cam_y, cam_z])
-        up_direction = np.array([0, 1, 0])
+    trans_depth1 = trans_points1[:, :, 2, 0]
 
-        pose_matrix = look_at_matrix(camera_position, look_at, up_direction)
-        poses.append(pose_matrix)
-    return poses
+    grid = create_grid(h, w)
+    flow12 = trans_coordinates - grid
+    flow12 = flow12.reshape(-1,2)
+    flow12[trans_depth1.reshape(-1) < 0] = 100000 # important
+    flow12 = flow12.reshape(576,1024,2)
+
+    trans_coordinates = trans_coordinates.reshape(-1,2)
+    trans_coordinates[trans_depth1.reshape(-1)<0] = 100000
+    trans_coordinates = trans_coordinates.reshape(576,1024,2)
+
+    trans_valid = (trans_depth1 > 0)
+    trans_valid = mask_occlusion_traj(depth1, trans_depth1, trans_coordinates, trans_valid)
+
+    frame1 = np.concatenate([frame1, depth1[..., None]], axis=-1)
+    warped_frame2, mask2 = bilinear_splatting(frame1, mask1, trans_depth1, flow12, None, is_image=False)
+    warped_frame2, depth2 = warped_frame2[..., :3], warped_frame2[..., 3]
+    warped_frame2 = np.clip(warped_frame2, a_min=0, a_max=255).round().astype('uint8')
+
+    return warped_frame2, mask2, depth2, flow12, trans_coordinates, trans_valid
 
 
 def save_warped_image(
@@ -325,6 +334,7 @@ def save_warped_image(
         major_radius: float,
         minor_radius: float,
         camera_motion_mode: str,
+        no_occlusion_revealing: bool = False,
     ) -> None:
     poses = generate_camera_poses(num_frames, degrees_per_frame,major_radius, minor_radius,camera_motion_mode)
 
@@ -335,9 +345,10 @@ def save_warped_image(
     K[0,0] = focal; K[1,1] = focal; K[0,2] = 1024./2; K[1,2] = 576./2
 
     pose_s = poses[0]
+    never_occluded = np.ones((576, 1024), dtype=bool)
 
-    trans_coordinates_list = [create_grid(576, 1024)]
-    trans_valid_list = [np.ones((576, 1024), dtype=bool)]
+    trans_coordinates_list = []
+    trans_valid_list = []
 
     for i, pose_t in enumerate(poses):
         np.save(os.path.join(save_path,str(i).zfill(4)+"_pose.npy"), pose_t)
@@ -349,7 +360,9 @@ def save_warped_image(
         depth = 10000./depth
         depth = np.clip(depth, near, far)
 
-        warped_frame2, mask2, depth2, flow12, trans_coordinates, trans_valid = forward_warp(image, None, depth, pose_s, pose_t, K, None)
+        warped_frame2, mask2, depth2, flow12, trans_coordinates, trans_valid = forward_warp(image, never_occluded, depth, pose_s, pose_t, K, None)
+        if no_occlusion_revealing:
+            never_occluded *= trans_valid
 
         trans_coordinates_list.append(trans_coordinates)
         trans_valid_list.append(trans_valid)
@@ -431,6 +444,11 @@ if __name__== '__main__':
         type=str,
         default='image'
     )
+    parser.add_argument(
+        "--no_occlusion_revealing",
+        action="store_true",
+        help="If set, the pixels once occluded in the past frames never show up in the latter frames."
+    )
 
     args = parser.parse_args()
 
@@ -464,5 +482,6 @@ if __name__== '__main__':
         args.degrees_per_frame,
         args.major_radius,
         args.minor_radius,
-        args.camera_motion_mode)
+        args.camera_motion_mode,
+        args.no_occlusion_revealing)
     print(f"Trajectory extraction finished, saved to {args.output_folder}")

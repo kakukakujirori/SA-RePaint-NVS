@@ -550,8 +550,12 @@ class EulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
             index_list = [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24]
 
             mask = (1-mask) > 0.5  # valid region (1->valid, 0->invalid)
-            mask_ones = torch.ones_like(mask[:,0:1,:,:,:])
-            mask = torch.cat((mask_ones,mask),1)  # (1, 25, 4, h, w)
+            if mask.shape[1] == 24:
+                mask_ones = torch.ones_like(mask[:,0:1,:,:,:])
+                mask = torch.cat((mask_ones,mask),1)  # (1, 25, 4, h, w)
+            elif mask.shape[1] != 25:
+                raise ValueError(f"Something is wrong: {mask.shape=}")
+
             top_masks = []
             for ii, tau in enumerate(index_list):
                 FEA = temp_cond_latents[1:2, tau,:,:,:]

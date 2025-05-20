@@ -23,8 +23,8 @@ python src/trajectory_extraction.py \
   --camera_motion_mode ${CAMERA_MOTION_MODE} \
   --major_radius 80 \
   --minor_radius 70 \
-  --num_frames ${NUM_FRAMES}
-  #--no_occlusion_revealing
+  --num_frames ${NUM_FRAMES} \
+  --no_occlusion_revealing
 
 # generaiton
 python src/generate.py \

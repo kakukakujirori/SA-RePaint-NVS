@@ -438,6 +438,15 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
         if denoise_start_step is not None:
             assert denoise_start_step < num_inference_steps
 
+        # 1.5 preprocess: inpaint the holes with the mean color
+        assert len(warped_images) == len(warped_masks)
+        print("Warning: The void regions in the warped images are filled with the mean color of the non-void regions.")
+        for i, (img, msk) in enumerate(zip(warped_images, warped_masks)):
+            img = np.array(img)
+            msk = np.array(msk).mean(axis=-1)
+            img[msk >= 128] = np.mean(img[msk < 128], axis=0)
+            warped_images[i] = PIL.Image.fromarray(img)
+
         # 2. Define call parameters
         batch_size = 1  # NOTE: Modified
         device = self._execution_device
@@ -578,22 +587,22 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
                             if ii == 0:
                                 latent_model_input1 = latent_model_input[0:1,:,:,:40,:72]
                                 latents1 = latents[0:1,:,:,:40,:72]
-                                warped_safe_latents1 = warped_latents[:2,:,:,:40,:72]
+                                warped_latents1 = warped_latents[:2,:,:,:40,:72]
                                 mask1 = warped_masks_sh[0:1,:,:,:40,:72]
                             elif ii ==1:
                                 latent_model_input1 = latent_model_input[0:1,:,:,32:,:72]
                                 latents1 = latents[0:1,:,:,32:,:72]
-                                warped_safe_latents1 = warped_latents[:2,:,:,32:,:72]
+                                warped_latents1 = warped_latents[:2,:,:,32:,:72]
                                 mask1 = warped_masks_sh[0:1,:,:,32:,:72]
                             elif ii ==2:
                                 latent_model_input1 = latent_model_input[0:1,:,:,:40,56:]
                                 latents1 = latents[0:1,:,:,:40,56:]
-                                warped_safe_latents1 = warped_latents[:2,:,:,:40,56:]
+                                warped_latents1 = warped_latents[:2,:,:,:40,56:]
                                 mask1 = warped_masks_sh[0:1,:,:,:40,56:]
                             elif ii ==3:
                                 latent_model_input1 = latent_model_input[0:1,:,:,32:,56:]
                                 latents1 = latents[0:1,:,:,32:,56:]
-                                warped_safe_latents1 = warped_latents[:2,:,:,32:,56:]
+                                warped_latents1 = warped_latents[:2,:,:,32:,56:]
                                 mask1 = warped_masks_sh[0:1,:,:,32:,56:]
                             image_embeddings1 = image_embeddings[0:1,:,:]
                             added_time_ids1 =added_time_ids[0:1,:]
@@ -610,7 +619,7 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
                                 noise_pred_t,
                                 t,
                                 latents1,
-                                warped_safe_latents1,
+                                warped_latents1,
                                 mask1,
                                 lambda_ts,
                                 step_i=i,
@@ -680,18 +689,16 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
                         )
 
                         # Directly paste the measurement into the opt_var_aligned
-                        opt_var_safe = torch.where(warped_masks < 0.5, warped_images, opt_var_aligned)
-                        opt_var_risky = torch.where(warped_masks < 0.5, warped_images, opt_var_aligned)
-                        opt_var_safe = rearrange(opt_var_safe, "() f c h w -> f c h w", f=num_frames, c=3)
-                        opt_var_risky = rearrange(opt_var_risky, "() f c h w -> f c h w", f=num_frames, c=3)
+                        opt_var_modified = torch.where(warped_masks < 0.5, warped_images, opt_var_aligned)
+                        opt_var_modified = rearrange(opt_var_modified, "() f c h w -> f c h w", f=num_frames, c=3)
 
                         # from pixel to latent
                         self.vae.to(dtype=torch.float32 if needs_upcasting else None, device=device)
                         with torch.no_grad():
 
                             opt_latents_list = []
-                            for j in range(opt_var_safe.shape[0]):
-                                opt_latents_ = self._encode_vae_image(opt_var_safe[j:j+1,:,:,:], device, num_videos_per_prompt, do_classifier_free_guidance=False) # [12, 4, 72, 128]
+                            for j in range(opt_var_modified.shape[0]):
+                                opt_latents_ = self._encode_vae_image(opt_var_modified[j:j+1,:,:,:], device, num_videos_per_prompt, do_classifier_free_guidance=False) # [12, 4, 72, 128]
                                 opt_latents_ *= self.vae.config.scaling_factor
                                 opt_latents_ = rearrange(opt_latents_, "(b f) c h w -> b f c h w", b=1)
                                 opt_latents_list.append(opt_latents_)

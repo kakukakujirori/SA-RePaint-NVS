@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 from jaxtyping import Float
-from kornia.geometry.transform import warp_perspective
+from kornia.geometry.transform.imgwarp import homography_warp
 
 
 # spline interpolation utils
@@ -103,11 +103,11 @@ def homography_estimation(
         frames_dst: Float[torch.Tensor, "batch num_frames c h w"],
         frames_dst_mask: Float[torch.Tensor, "batch num_frames 1 h w"],
         shrink_scale: int = 8,
-        lr: float = 1e-5,
+        lr: float = 1e-2,
         max_iters: int = 500,
         num_control_points: Optional[int] = None,
         fix_first_frame: bool = True,
-        invalid_region_loss_weight: float = 0.5,  # regularization to prevent the warped frames to seep outside frames_dst_mask
+        invalid_region_loss_weight: float = 0.1,  # regularization to prevent the warped frames to seep outside frames_dst_mask
     ):
     batch, num_frames, channel, height, width = frames_src.shape
     assert frames_src.shape == frames_dst.shape, f"{frames_src.shape=}"
@@ -147,9 +147,9 @@ def homography_estimation(
         M = M.permute(0, 3, 1, 2).reshape(batch * num_frames, 3, 3)
 
         frames_src_sh_with_alpha = torch.cat([frames_src_sh, torch.ones_like(frames_src_sh[:, :, 0:1, :, :])], dim=2)
-        src_warped = warp_perspective(
-            src=frames_src_sh_with_alpha.reshape(batch * num_frames, channel + 1, height_sh, width_sh),
-            M=M,
+        src_warped = homography_warp(
+            frames_src_sh_with_alpha.reshape(batch * num_frames, channel + 1, height_sh, width_sh),
+            M,
             dsize=(height_sh, width_sh),
         ).reshape_as(frames_src_sh_with_alpha)
         src_warped, homography_warp_mask = src_warped[:, :, 0:-1, :, :], src_warped[:, :, -1:, :, :]
@@ -168,13 +168,14 @@ def homography_estimation(
             print(f"[homography_estimation] {iter=}, loss_valid={loss_valid.item()}, loss_invalid={loss_invalid.item()}")
 
     with torch.no_grad():
-        # rescale to the original size
-        M = torch.diag(torch.tensor([shrink_scale, shrink_scale, 1.0], device=M.device)) @ M @ torch.diag(torch.tensor([1.0, 1.0, shrink_scale], device=M.device))
+        # rescale to the original size (NOTE: homography_warp normalizes the homography so rescaling is unnecessary)
+        # if WARP == warp_perspective:
+        #     M = torch.diag(torch.tensor([shrink_scale, shrink_scale, 1.0], device=M.device)) @ M @ torch.diag(torch.tensor([1.0, 1.0, shrink_scale], device=M.device))
 
         # apply the optimized warp
-        src_warped = warp_perspective(
-            src=frames_src.flatten(0, 1),
-            M=M,
+        src_warped = homography_warp(
+            frames_src.flatten(0, 1),
+            M,
             dsize=(height, width),
             padding_mode="border",
         ).reshape_as(frames_src)

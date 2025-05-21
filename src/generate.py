@@ -681,11 +681,11 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
                             warped_images,
                             warped_masks < 0.5,
                             shrink_scale=8,
-                            lr=1e-5,
+                            lr=1e-2,
                             max_iters=500,
                             num_control_points=num_frames//3,
                             fix_first_frame=True,
-                            invalid_region_loss_weight=0.5,
+                            invalid_region_loss_weight=0.1,
                         )
 
                         # Directly paste the measurement into the opt_var_aligned

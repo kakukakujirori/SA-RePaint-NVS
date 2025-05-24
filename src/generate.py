@@ -711,7 +711,7 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
                         resample_noise = randn_tensor(opt_latents.shape, generator=generator, device=opt_latents.device, dtype=opt_latents.dtype)
                         latents = self.stochastic_resample(opt_z0=opt_latents, zt=latents.detach().clone().float(), current_sigma=current_sigma, posterior_sigma=posterior_sigma, noise=resample_noise, generator=generator)
 
-                        latents = latents.requires_grad_() # Seems to need to require grad here
+                        # latents = latents.requires_grad_() # Seems to need to require grad here
                         latents = latents.half()
 
 
@@ -891,6 +891,23 @@ if __name__ == '__main__':
     )
 
     parser.add_argument(
+        "--enable_nvssolver",
+        action="store_true",
+    )
+
+    parser.add_argument(
+        "--enable_resample",
+        action="store_true",
+    )
+
+    parser.add_argument(
+        "--denoise_start_step",
+        type=int,
+        default=None,
+        help="If you enable resample, num_inference_steps // 3 is the recommended value"
+    )
+
+    parser.add_argument(
         "--lr",
         type=float,
         default=0.02,
@@ -902,9 +919,15 @@ if __name__ == '__main__':
         default=0.2,
     )
 
+    parser.add_argument(
+        "--gpu",
+        type=int,
+        default=0,
+    )
+
     args = parser.parse_args()
 
-    device = "cuda:0"
+    device = f"cuda:{args.gpu}"
 
     # load pipeline
     pipe = StableVideoDiffusionPipeline.from_pretrained(
@@ -916,8 +939,8 @@ if __name__ == '__main__':
     pipe.to(device)
 
     # calculate lambda
-    sigma_list = sigma_list = np.load(f'sigmas/sigmas_{args.num_inference_steps}.npy').tolist()
-    lambda_ts = search_hypers(sigma_list,args.num_frames)
+    sigma_list = np.load(f'sigmas/sigmas_{args.num_inference_steps}.npy').tolist()
+    lambda_ts = search_hypers(sigma_list, args.num_frames)
     lambda_ts = torch.tensor(lambda_ts)
 
     # load images
@@ -926,11 +949,11 @@ if __name__ == '__main__':
 
     # inference
     svd_output = pipe(
-        enable_nvssolver=True,
-        enable_resample=True,
+        enable_nvssolver=args.enable_nvssolver,
+        enable_resample=args.enable_resample,
         warped_images=warped_images,
         warped_masks=warped_masks,
-        denoise_start_step=args.num_inference_steps // 3,  # IMPORTANT!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+        denoise_start_step=args.denoise_start_step,  # IMPORTANT!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
         ########
         lambda_ts=lambda_ts,
         lr=args.lr,

@@ -125,7 +125,7 @@ def homography_estimation(
     frames_dst_mask_sh = frames_dst_mask_sh.expand_as(frames_dst_sh) > 0.5
     height_sh, width_sh = frames_src_sh.shape[-2:]
 
-    # spatially align
+    # construct control homographies
     if num_control_points is None:
         num_control_points = num_frames
     else:

@@ -28,8 +28,10 @@ python src/trajectory_extraction.py \
 
 # generaiton
 python src/generate.py \
+  --output_folder output/${ITEM}/${CAMERA_MOTION_MODE}_${DEGREE}/generated \
   --trajectory_folder output/${ITEM}/${CAMERA_MOTION_MODE}_${DEGREE}/warped \
   --num_frames ${NUM_FRAMES} \
   --num_inference_steps 25 \
-  --output_folder output/${ITEM}/${CAMERA_MOTION_MODE}_${DEGREE}/generated \
+  --enable_resample \
+  --denoise_start_step 8 \
   --seed 12345

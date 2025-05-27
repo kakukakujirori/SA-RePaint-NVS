@@ -164,7 +164,7 @@ def homography_estimation(
             homography_params.grad[:, :, 0] = 0.0  # Zero grad for 0-th control point
         optimizer.step()
 
-        if iter % 100 == 0:
+        if iter % 100 == 0 or iter == max_iters - 1:
             print(f"[homography_estimation] {iter=}, loss_valid={loss_valid.item()}, loss_invalid={loss_invalid.item()}")
 
     with torch.no_grad():

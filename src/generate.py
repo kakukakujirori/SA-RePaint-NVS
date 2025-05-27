@@ -682,7 +682,7 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
                             warped_masks < 0.5,
                             shrink_scale=8,
                             lr=1e-2,
-                            max_iters=500,
+                            max_iters=100,
                             num_control_points=num_frames//3,
                             fix_first_frame=True,
                             invalid_region_loss_weight=0.1,
@@ -706,8 +706,9 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
                         opt_latents = torch.cat(opt_latents_list, dim=1)
 
                         # resample
-                        posterior_sigma = self.scheduler.sigmas[i + 1] * 1
+                        opt_std = self.scheduler.sigmas[i + 1] / self.scheduler.sigmas[0]
                         current_sigma = self.scheduler.sigmas[i + 1]
+                        posterior_sigma = (self.scheduler.sigmas[i + 1])**2 / opt_std
                         resample_noise = randn_tensor(opt_latents.shape, generator=generator, device=opt_latents.device, dtype=opt_latents.dtype)
                         latents = self.stochastic_resample(opt_z0=opt_latents, zt=latents.detach().clone().float(), current_sigma=current_sigma, posterior_sigma=posterior_sigma, noise=resample_noise, generator=generator)
 

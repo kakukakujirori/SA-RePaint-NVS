@@ -639,34 +639,53 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
 
 
                 with torch.no_grad():
-                    # expand the latents if we are doing classifier free guidance
-                    latent_model_input = torch.cat([latents] * 2) if self.do_classifier_free_guidance else latents
-                    latent_model_input = self.scheduler.scale_model_input(latent_model_input, t, step_i=i)
+                    RESAMPLING_ITERATIONS = 5
+                    latents_ori = latents.clone()
+                    for j in range(RESAMPLING_ITERATIONS):
+                        # expand the latents if we are doing classifier free guidance
+                        latent_model_input = torch.cat([latents] * 2) if self.do_classifier_free_guidance else latents
+                        latent_model_input = self.scheduler.scale_model_input(latent_model_input, t, step_i=i)
 
-                    # Concatenate image_latents over channels dimension
-                    latent_model_input = torch.cat([latent_model_input, image_latents], dim=2)
+                        # Concatenate image_latents over channels dimension
+                        latent_model_input = torch.cat([latent_model_input, image_latents], dim=2)
 
-                    # predict the noise residual
-                    noise_pred = self.unet(
-                        latent_model_input,
-                        t,
-                        encoder_hidden_states=image_embeddings,
-                        added_time_ids=added_time_ids,
-                        return_dict=False,
-                    )[0]
+                        # predict the noise residual
+                        noise_pred = self.unet(
+                            latent_model_input,
+                            t,
+                            encoder_hidden_states=image_embeddings,
+                            added_time_ids=added_time_ids,
+                            return_dict=False,
+                        )[0]
 
-                    # perform guidance
-                    if self.do_classifier_free_guidance:
-                        noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
-                        noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_cond - noise_pred_uncond)
+                        # perform guidance
+                        if self.do_classifier_free_guidance:
+                            noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
+                            noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_cond - noise_pred_uncond)
 
-                    # compute the previous noisy sample x_t -> x_t-1
-                    out = self.scheduler.step_single(noise_pred, t, latents, None, None, lambda_ts, step_i=i, compute_grad=False)
-                    latents = out.prev_sample
-                    pseudo_x0 = out.pred_original_sample
+                        # compute the previous noisy sample x_t -> x_t-1
+                        out = self.scheduler.step_single(noise_pred, t, latents, None, None, lambda_ts, step_i=i, compute_grad=False)
+                        latents = out.prev_sample
+                        pseudo_x0 = out.pred_original_sample
+
+                        # resampling
+                        if j < RESAMPLING_ITERATIONS - 1:
+                            pseudo_x0 = (1 - warped_masks_sh) * warped_latents[1:2] + warped_masks_sh * pseudo_x0
+
+                            opt_std = 0.5 #self.scheduler.sigmas[i] / self.scheduler.sigmas[0]
+                            current_sigma = self.scheduler.sigmas[i]
+                            posterior_sigma = (self.scheduler.sigmas[i])**2 / opt_std
+
+                            resample_noise = randn_tensor(latents.shape, generator=generator, device=latents.device, dtype=latents.dtype)
+                            latents = self.stochastic_resample(opt_z0=pseudo_x0, zt=latents_ori, current_sigma=current_sigma, posterior_sigma=posterior_sigma, noise=resample_noise, generator=generator)
+
+                            latents = latents.half()
+
+
+
 
                 # ReSample
-                if enable_resample and self._num_timesteps // 3 <= i < self._num_timesteps - 1:
+                if enable_resample and self._num_timesteps // 3 <= i < self._num_timesteps // 2:
                     if i % 1 == 0:
                         print(f"{i=}: ReSample optimization start!!!")
 
@@ -685,7 +704,7 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
                             max_iters=100,
                             num_control_points=num_frames//3,
                             fix_first_frame=True,
-                            invalid_region_loss_weight=0.1,
+                            acceleration_penalty_weight=0.5,
                         )
 
                         # Directly paste the measurement into the opt_var_aligned
@@ -779,7 +798,8 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
         t_squared = current_sigma ** 2
         post_sigma_squared = posterior_sigma ** 2
 
-        mean = (post_sigma_squared * opt_z0 + t_squared * zt) / (t_squared + post_sigma_squared)
+        denom = t_squared + post_sigma_squared
+        mean = (post_sigma_squared / denom) * opt_z0 + (t_squared / denom) * zt
         std = 1 / torch.sqrt(1 / post_sigma_squared + 1 / t_squared)
         return mean + noise * std
 

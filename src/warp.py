@@ -98,25 +98,26 @@ def interpolate_linear(signal, times):
     return interpolation
 
 
+@torch.enable_grad()
 def homography_estimation(
         frames_src: Float[torch.Tensor, "batch num_frames c h w"],
         frames_dst: Float[torch.Tensor, "batch num_frames c h w"],
         frames_dst_mask: Float[torch.Tensor, "batch num_frames 1 h w"],
         shrink_scale: int = 8,
         lr: float = 1e-2,
-        max_iters: int = 500,
+        max_iters: int = 100,
         num_control_points: Optional[int] = None,
         fix_first_frame: bool = True,
-        invalid_region_loss_weight: float = 0.1,  # regularization to prevent the warped frames to seep outside frames_dst_mask
+        acceleration_penalty_weight: float = 0.1,  # regularization to prevent erratic warp
     ):
     batch, num_frames, channel, height, width = frames_src.shape
     assert frames_src.shape == frames_dst.shape, f"{frames_src.shape=}"
     assert frames_dst_mask.shape == (batch, num_frames, 1, height, width), f"{frames_dst_mask.shape=}"
 
     # flatten -> resize -> unflatten
-    frames_src_sh = F.interpolate(frames_src.flatten(0,1), scale_factor=1/shrink_scale, mode="bilinear", align_corners=False)
-    frames_dst_sh = F.interpolate(frames_dst.flatten(0,1), scale_factor=1/shrink_scale, mode="bilinear", align_corners=False)
-    frames_dst_mask_sh = F.interpolate(frames_dst_mask.flatten(0,1).float(), scale_factor=1/shrink_scale, mode="bilinear", align_corners=False)
+    frames_src_sh = F.interpolate(frames_src.flatten(0,1), scale_factor=1/shrink_scale, mode="bilinear")
+    frames_dst_sh = F.interpolate(frames_dst.flatten(0,1), scale_factor=1/shrink_scale, mode="bilinear")
+    frames_dst_mask_sh = F.interpolate(frames_dst_mask.flatten(0,1).float(), scale_factor=1/shrink_scale, mode="area")
     frames_src_sh = rearrange(frames_src_sh, "(b f) c h w -> b f c h w", b=batch, f=num_frames)
     frames_dst_sh = rearrange(frames_dst_sh, "(b f) c h w -> b f c h w", b=batch, f=num_frames)
     frames_dst_mask_sh = rearrange(frames_dst_mask_sh, "(b f) c h w -> b f c h w", b=batch, f=num_frames)
@@ -125,7 +126,7 @@ def homography_estimation(
     frames_dst_mask_sh = frames_dst_mask_sh.expand_as(frames_dst_sh) > 0.5
     height_sh, width_sh = frames_src_sh.shape[-2:]
 
-    # construct control homographies
+    # spatially align
     if num_control_points is None:
         num_control_points = num_frames
     else:
@@ -146,26 +147,26 @@ def homography_estimation(
         M = torch.cat([homography_all, torch.ones_like(homography_all[:, 0:1, :])], dim=1).reshape(batch, 3, 3, num_frames)
         M = M.permute(0, 3, 1, 2).reshape(batch * num_frames, 3, 3)
 
-        frames_src_sh_with_alpha = torch.cat([frames_src_sh, torch.ones_like(frames_src_sh[:, :, 0:1, :, :])], dim=2)
         src_warped = homography_warp(
-            frames_src_sh_with_alpha.reshape(batch * num_frames, channel + 1, height_sh, width_sh),
+            frames_src_sh.reshape(batch * num_frames, channel, height_sh, width_sh),
             M,
             dsize=(height_sh, width_sh),
-        ).reshape_as(frames_src_sh_with_alpha)
-        src_warped, homography_warp_mask = src_warped[:, :, 0:-1, :, :], src_warped[:, :, -1:, :, :]
+        ).reshape_as(frames_src_sh)
 
         # update
-        loss_valid = loss_func(src_warped[frames_dst_mask_sh], frames_dst_sh[frames_dst_mask_sh])
-        loss_invalid = torch.mean((~frames_dst_mask_sh).float() * homography_warp_mask.float())
-        loss_invalid = loss_invalid * invalid_region_loss_weight * (loss_valid / loss_invalid).detach()
-        loss = loss_valid + loss_invalid
+        loss_reconst = loss_func(src_warped[frames_dst_mask_sh], frames_dst_sh[frames_dst_mask_sh])
+        if num_control_points >= 3:
+            loss_regularize = (homography_params[:, :, 2:] - 2 * homography_params[:, :, 1:-1] + homography_params[:, :, :-2]).abs().mean() * acceleration_penalty_weight
+        else:
+            loss_regularize = 0
+        loss = loss_reconst + loss_regularize
         loss.backward()
         if fix_first_frame:
             homography_params.grad[:, :, 0] = 0.0  # Zero grad for 0-th control point
         optimizer.step()
 
         if iter % 100 == 0 or iter == max_iters - 1:
-            print(f"[homography_estimation] {iter=}, loss_valid={loss_valid.item()}, loss_invalid={loss_invalid.item()}")
+            print(f"[homography_estimation] {iter=}, loss_reconst={loss_reconst.item()}, loss_regularize={loss_regularize.item()}")
 
     with torch.no_grad():
         # rescale to the original size (NOTE: homography_warp normalizes the homography so rescaling is unnecessary)

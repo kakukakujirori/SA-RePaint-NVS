@@ -1,3 +1,4 @@
+"""Basic concept: Modify trajectory_extraction.py"""
 from typing import Optional
 import argparse
 import os
@@ -308,11 +309,11 @@ def forward_warp(
     flow12 = trans_coordinates - grid
     flow12 = flow12.reshape(-1,2)
     flow12[trans_depth1.reshape(-1) < 0] = 100000 # important
-    flow12 = flow12.reshape(576,1024,2)
+    flow12 = flow12.reshape(h, w, 2)
 
     trans_coordinates = trans_coordinates.reshape(-1,2)
     trans_coordinates[trans_depth1.reshape(-1)<0] = 100000
-    trans_coordinates = trans_coordinates.reshape(576,1024,2)
+    trans_coordinates = trans_coordinates.reshape(h, w, 2)
 
     trans_valid = (trans_depth1 > 0)
     trans_valid = mask_occlusion_traj(depth1, trans_depth1, trans_coordinates, trans_valid)
@@ -329,23 +330,31 @@ def save_warped_image(
         save_path: str,
         images_lists: list[str],
         depth_lists: list[str],
-        num_frames: int,
-        degrees_per_frame: float,
-        major_radius: float,
-        minor_radius: float,
-        camera_motion_mode: str,
+        num_frames: int = 25,
+        crop_height: int = 576,
+        crop_width: int = 1024,
+        degrees_per_frame: float = 1.0,
+        major_radius: float = 80,
+        minor_radius: float = 70,
+        camera_motion_mode: str = "horizontal",
         no_occlusion_revealing: bool = False,
     ) -> None:
+    """
+    The images will be center cropped after each warp.
+    """
+    width, height = Image.open(images_lists[0]).size
+    assert width >= crop_width and height >= crop_height, f"{width=}, {height=}, {crop_width=}, {crop_height=}"
+
     poses = generate_camera_poses(num_frames, degrees_per_frame,major_radius, minor_radius,camera_motion_mode)
 
     near=0.0001
     far=10000.
     focal = 260.
     K = np.eye(3)
-    K[0,0] = focal; K[1,1] = focal; K[0,2] = 1024./2; K[1,2] = 576./2
+    K[0,0] = focal; K[1,1] = focal; K[0,2] = width/2.0; K[1,2] = height/2.0
 
     pose_s = poses[0]
-    never_occluded = np.ones((576, 1024), dtype=bool)
+    never_occluded = np.ones((height, width), dtype=bool)
 
     trans_coordinates_list = []
     trans_valid_list = []
@@ -355,14 +364,33 @@ def save_warped_image(
 
         image = Image.open(images_lists[i])
         image = np.array(image)
+        assert image.shape[:2] == (height, width), f"{image.shape=}, {height=}, {width=}"
+
         depth = np.load(depth_lists[i]).astype(np.float32)
         depth[depth < 1e-5] = 1e-5
         depth = 10000./depth
         depth = np.clip(depth, near, far)
+        assert depth.shape == (height, width), f"{image.shape=} {depth.shape=}"
 
         warped_frame2, mask2, depth2, flow12, trans_coordinates, trans_valid = forward_warp(image, never_occluded, depth, pose_s, pose_t, K, None)
         if no_occlusion_revealing:
             never_occluded *= trans_valid
+
+        # center crop
+        if height > crop_height or width > crop_width:
+            sy = (height - crop_height) // 2
+            sx = (width - crop_width) // 2
+            warped_frame2 = warped_frame2[sy:sy+crop_height, sx:sx+crop_width]
+            mask2 = mask2[sy:sy+crop_height, sx:sx+crop_width]
+            depth2 = depth2[sy:sy+crop_height, sx:sx+crop_width]
+            flow12 = flow12[sy:sy+crop_height, sx:sx+crop_width]
+            trans_coordinates = trans_coordinates[sy:sy+crop_height, sx:sx+crop_width]
+            trans_valid = trans_valid[sy:sy+crop_height, sx:sx+crop_width]
+
+            trans_coordinates[:, :, 0] -= sx
+            trans_coordinates[:, :, 1] -= sy
+            trans_valid *= (trans_coordinates[:, :, 0] < 0) * (trans_coordinates[:, :, 0] >= crop_width)
+            trans_valid *= (trans_coordinates[:, :, 1] < 0) * (trans_coordinates[:, :, 1] >= crop_height)
 
         trans_coordinates_list.append(trans_coordinates)
         trans_valid_list.append(trans_valid)
@@ -440,6 +468,18 @@ if __name__== '__main__':
     )
 
     parser.add_argument(
+        "--crop_height",
+        type=int,
+        default=576
+    )
+
+    parser.add_argument(
+        "--crop_width",
+        type=int,
+        default=1024
+    )
+
+    parser.add_argument(
         "--control_mode",
         type=str,
         default='image'
@@ -479,6 +519,8 @@ if __name__== '__main__':
         image_path,
         depth_path,
         args.num_frames,
+        args.crop_height,
+        args.crop_width,
         args.degrees_per_frame,
         args.major_radius,
         args.minor_radius,

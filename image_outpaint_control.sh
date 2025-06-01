@@ -49,4 +49,5 @@ python src/generate.py \
   --num_inference_steps 25 \
   --enable_resample \
   --denoise_start_step 8 \
+  --repaint_iter_num 5 \
   --seed 12345

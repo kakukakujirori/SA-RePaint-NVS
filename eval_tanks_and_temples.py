@@ -20,10 +20,12 @@ tanks_and_temples_input_root = "./tanks_and_temples_input"
 tanks_and_temples_output_root = "./tanks_and_temples_output"
 NUM_FRAMES = 25
 NUM_INFERECE_STEPS = 25
+DENOISE_START_STEP = NUM_INFERECE_STEPS // 3
+REPAINT_ITER_NUM = 5
 MOTION_MODES = ["horizontal", "vertical", "zoomout"]
 DEGREE_LIST = [-1.0, -0.5, 0.5, 1.0]
 MOTION_DEGREE_PAIRS = [x for x in product(MOTION_MODES, DEGREE_LIST) if x not in [('vertical', -1.0), ('vertical', 1.0)]]
-NUM_GPUS = 3
+NUM_GPUS = 4
 
 
 def organize_images_and_depth(tanks_and_temples_data_root: str):
@@ -122,7 +124,8 @@ def run_generation_task(scene: str, motion_mode: str, degree: float, gpu_id: int
             "--num_inference_steps", f"{NUM_INFERECE_STEPS}",
             "--enable_nvssolver",
             "--enable_resample",
-            "--denoise_start_step", f"{NUM_INFERECE_STEPS//3}",
+            "--denoise_start_step", f"{DENOISE_START_STEP}",
+            "--repaint_iter_num", f"{REPAINT_ITER_NUM}",
             "--output_folder", f"{tanks_and_temples_output_root}/{scene}/{motion_mode}_{degree}/generated",
             "--seed", "12345",
             "--gpu", f"{gpu_id}"],
@@ -299,6 +302,8 @@ if __name__ == '__main__':
                     continue
                 motion_mode, degree = motion_degree.split("_")
                 scene_motion_degree_pairs.append((scene, motion_mode, degree))
+
+    print(f"Total number of tasks to run: {len(scene_motion_degree_pairs)}")
 
     try:
         # 3. Generation

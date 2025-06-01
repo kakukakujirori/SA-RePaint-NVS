@@ -403,6 +403,7 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
         warped_images: List[PIL.Image.Image],
         warped_masks: List[PIL.Image.Image],
         denoise_start_step: Optional[int],
+        repaint_iter_num: int,
         lambda_ts,
         lr: float,
         weight_clamp: float,
@@ -639,9 +640,8 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
 
 
                 with torch.no_grad():
-                    RESAMPLING_ITERATIONS = 5
                     latents_ori = latents.clone()
-                    for j in range(RESAMPLING_ITERATIONS):
+                    for j in range(repaint_iter_num):
                         # expand the latents if we are doing classifier free guidance
                         latent_model_input = torch.cat([latents] * 2) if self.do_classifier_free_guidance else latents
                         latent_model_input = self.scheduler.scale_model_input(latent_model_input, t, step_i=i)
@@ -669,8 +669,11 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
                         pseudo_x0 = out.pred_original_sample
 
                         # resampling
-                        if j < RESAMPLING_ITERATIONS - 1:
-                            pseudo_x0 = (1 - warped_masks_sh) * warped_latents[1:2] + warped_masks_sh * pseudo_x0
+                        if j < repaint_iter_num - 1:
+                            if self.do_classifier_free_guidance:
+                                pseudo_x0 = (1 - warped_masks_sh) * warped_latents[batch_size:] + warped_masks_sh * pseudo_x0
+                            else:
+                                pseudo_x0 = (1 - warped_masks_sh) * warped_latents + warped_masks_sh * pseudo_x0
 
                             opt_std = 0.5 #self.scheduler.sigmas[i] / self.scheduler.sigmas[0]
                             current_sigma = self.scheduler.sigmas[i]
@@ -929,6 +932,12 @@ if __name__ == '__main__':
     )
 
     parser.add_argument(
+        "--repaint_iter_num",
+        type=int,
+        default=5,
+    )
+
+    parser.add_argument(
         "--lr",
         type=float,
         default=0.02,
@@ -975,6 +984,7 @@ if __name__ == '__main__':
         warped_images=warped_images,
         warped_masks=warped_masks,
         denoise_start_step=args.denoise_start_step,  # IMPORTANT!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+        repaint_iter_num=args.repaint_iter_num,  # IMPORTANT!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
         ########
         lambda_ts=lambda_ts,
         lr=args.lr,

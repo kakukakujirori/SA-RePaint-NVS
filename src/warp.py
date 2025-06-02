@@ -103,7 +103,7 @@ def homography_estimation(
         frames_src: Float[torch.Tensor, "batch num_frames c h w"],
         frames_dst: Float[torch.Tensor, "batch num_frames c h w"],
         frames_dst_mask: Float[torch.Tensor, "batch num_frames 1 h w"],
-        shrink_scale: int = 8,
+        process_size: int = 128,
         lr: float = 1e-2,
         max_iters: int = 100,
         num_control_points: Optional[int] = None,
@@ -115,9 +115,10 @@ def homography_estimation(
     assert frames_dst_mask.shape == (batch, num_frames, 1, height, width), f"{frames_dst_mask.shape=}"
 
     # flatten -> resize -> unflatten
-    frames_src_sh = F.interpolate(frames_src.flatten(0,1), scale_factor=1/shrink_scale, mode="bilinear")
-    frames_dst_sh = F.interpolate(frames_dst.flatten(0,1), scale_factor=1/shrink_scale, mode="bilinear")
-    frames_dst_mask_sh = F.interpolate(frames_dst_mask.flatten(0,1).float(), scale_factor=1/shrink_scale, mode="area")
+    shrink_scale = process_size / max(height, width)
+    frames_src_sh = F.interpolate(frames_src.flatten(0,1), scale_factor=shrink_scale, mode="bilinear")
+    frames_dst_sh = F.interpolate(frames_dst.flatten(0,1), scale_factor=shrink_scale, mode="bilinear")
+    frames_dst_mask_sh = F.interpolate(frames_dst_mask.flatten(0,1).float(), scale_factor=shrink_scale, mode="area")
     frames_src_sh = rearrange(frames_src_sh, "(b f) c h w -> b f c h w", b=batch, f=num_frames)
     frames_dst_sh = rearrange(frames_dst_sh, "(b f) c h w -> b f c h w", b=batch, f=num_frames)
     frames_dst_mask_sh = rearrange(frames_dst_mask_sh, "(b f) c h w -> b f c h w", b=batch, f=num_frames)
@@ -169,10 +170,6 @@ def homography_estimation(
             print(f"[homography_estimation] {iter=}, loss_reconst={loss_reconst.item()}, loss_regularize={loss_regularize.item()}")
 
     with torch.no_grad():
-        # rescale to the original size (NOTE: homography_warp normalizes the homography so rescaling is unnecessary)
-        # if WARP == warp_perspective:
-        #     M = torch.diag(torch.tensor([shrink_scale, shrink_scale, 1.0], device=M.device)) @ M @ torch.diag(torch.tensor([1.0, 1.0, shrink_scale], device=M.device))
-
         # apply the optimized warp
         src_warped = homography_warp(
             frames_src.flatten(0, 1),

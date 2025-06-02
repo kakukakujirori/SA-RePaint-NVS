@@ -684,7 +684,8 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
 
                             latents = latents.half()
 
-
+                    del latents_ori
+                    torch.cuda.empty_cache()
 
 
                 # ReSample
@@ -702,7 +703,7 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
                             pseudo_x0_pixel,
                             warped_images,
                             warped_masks < 0.5,
-                            shrink_scale=8,
+                            process_size=128,
                             lr=1e-2,
                             max_iters=100,
                             num_control_points=num_frames//3,
@@ -737,7 +738,7 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
                         # latents = latents.requires_grad_() # Seems to need to require grad here
                         latents = latents.half()
 
-
+                        torch.cuda.empty_cache()
 
 
 

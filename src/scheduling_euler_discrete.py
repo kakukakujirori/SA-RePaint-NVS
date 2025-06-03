@@ -11,24 +11,22 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from scipy.spatial.transform import Rotation
-import torch.nn.functional as F
-import math
-import matplotlib.pyplot as plt
 
+import math
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
-import copy
+
 import numpy as np
 import torch
 
 from diffusers.configuration_utils import ConfigMixin, register_to_config
-
-from diffusers.utils import BaseOutput, logging
+from diffusers.utils import BaseOutput, is_scipy_available, logging
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.schedulers.scheduling_utils import KarrasDiffusionSchedulers, SchedulerMixin
 
-import math
+
+if is_scipy_available():
+    import scipy.stats
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -40,18 +38,17 @@ class EulerDiscreteSchedulerOutput(BaseOutput):
     Output class for the scheduler's `step` function output.
 
     Args:
-        prev_sample (`torch.FloatTensor` of shape `(batch_size, num_channels, height, width)` for images):
+        prev_sample (`torch.Tensor` of shape `(batch_size, num_channels, height, width)` for images):
             Computed sample `(x_{t-1})` of previous timestep. `prev_sample` should be used as next model input in the
             denoising loop.
-        pred_original_sample (`torch.FloatTensor` of shape `(batch_size, num_channels, height, width)` for images):
+        pred_original_sample (`torch.Tensor` of shape `(batch_size, num_channels, height, width)` for images):
             The predicted denoised sample `(x_{0})` based on the model output from the current timestep.
             `pred_original_sample` can be used to preview progress or for guidance.
     """
 
-    prev_sample: torch.FloatTensor
-    pred_original_sample: Optional[torch.FloatTensor] = None
-    grad: Optional[torch.FloatTensor] = None
-    loss_plot:Optional[torch.FloatTensor] = None
+    prev_sample: torch.Tensor
+    pred_original_sample: Optional[torch.Tensor] = None
+    grad: Optional[torch.Tensor] = None
 
 
 # Copied from diffusers.schedulers.scheduling_ddpm.betas_for_alpha_bar
@@ -102,15 +99,15 @@ def betas_for_alpha_bar(
 # Copied from diffusers.schedulers.scheduling_ddim.rescale_zero_terminal_snr
 def rescale_zero_terminal_snr(betas):
     """
-    Rescales betas to have zero terminal SNR Based on https://arxiv.org/pdf/2305.08891.pdf (Algorithm 1)
+    Rescales betas to have zero terminal SNR Based on https://huggingface.co/papers/2305.08891 (Algorithm 1)
 
 
     Args:
-        betas (`torch.FloatTensor`):
+        betas (`torch.Tensor`):
             the betas that the scheduler is being initialized with.
 
     Returns:
-        `torch.FloatTensor`: rescaled betas with zero terminal SNR
+        `torch.Tensor`: rescaled betas with zero terminal SNR
     """
     # Convert betas to alphas_bar_sqrt
     alphas = 1.0 - betas
@@ -165,6 +162,11 @@ class EulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
         use_karras_sigmas (`bool`, *optional*, defaults to `False`):
             Whether to use Karras sigmas for step sizes in the noise schedule during the sampling process. If `True`,
             the sigmas are determined according to a sequence of noise levels {σi}.
+        use_exponential_sigmas (`bool`, *optional*, defaults to `False`):
+            Whether to use exponential sigmas for step sizes in the noise schedule during the sampling process.
+        use_beta_sigmas (`bool`, *optional*, defaults to `False`):
+            Whether to use beta sigmas for step sizes in the noise schedule during the sampling process. Refer to [Beta
+            Sampling is All You Need](https://huggingface.co/papers/2407.12173) for more information.
         timestep_spacing (`str`, defaults to `"linspace"`):
             The way the timesteps should be scaled. Refer to Table 2 of the [Common Diffusion Noise Schedules and
             Sample Steps are Flawed](https://huggingface.co/papers/2305.08891) for more information.
@@ -174,6 +176,9 @@ class EulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
             Whether to rescale the betas to have zero terminal SNR. This enables the model to generate very bright and
             dark samples instead of limiting it to samples with medium brightness. Loosely related to
             [`--offset_noise`](https://github.com/huggingface/diffusers/blob/74fd735eb073eb1d774b1ab4154a0876eb82f055/examples/dreambooth/train_dreambooth.py#L506).
+        final_sigmas_type (`str`, defaults to `"zero"`):
+            The final `sigma` value for the noise schedule during the sampling process. If `"sigma_min"`, the final
+            sigma is the same as the last sigma in the training schedule. If `zero`, the final sigma is set to 0.
     """
 
     _compatibles = [e.name for e in KarrasDiffusionSchedulers]
@@ -190,13 +195,22 @@ class EulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
         prediction_type: str = "epsilon",
         interpolation_type: str = "linear",
         use_karras_sigmas: Optional[bool] = False,
+        use_exponential_sigmas: Optional[bool] = False,
+        use_beta_sigmas: Optional[bool] = False,
         sigma_min: Optional[float] = None,
         sigma_max: Optional[float] = None,
         timestep_spacing: str = "linspace",
         timestep_type: str = "discrete",  # can be "discrete" or "continuous"
         steps_offset: int = 0,
         rescale_betas_zero_snr: bool = False,
+        final_sigmas_type: str = "zero",  # can be "zero" or "sigma_min"
     ):
+        if self.config.use_beta_sigmas and not is_scipy_available():
+            raise ImportError("Make sure to install scipy if you want to use beta sigmas.")
+        if sum([self.config.use_beta_sigmas, self.config.use_exponential_sigmas, self.config.use_karras_sigmas]) > 1:
+            raise ValueError(
+                "Only one of `config.use_beta_sigmas`, `config.use_exponential_sigmas`, `config.use_karras_sigmas` can be used."
+            )
         if trained_betas is not None:
             self.betas = torch.tensor(trained_betas, dtype=torch.float32)
         elif beta_schedule == "linear":
@@ -208,15 +222,13 @@ class EulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
             # Glide cosine schedule
             self.betas = betas_for_alpha_bar(num_train_timesteps)
         else:
-            raise NotImplementedError(f"{beta_schedule} does is not implemented for {self.__class__}")
+            raise NotImplementedError(f"{beta_schedule} is not implemented for {self.__class__}")
 
         if rescale_betas_zero_snr:
             self.betas = rescale_zero_terminal_snr(self.betas)
 
         self.alphas = 1.0 - self.betas
         self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
-
-        self.dt_sum = 0.
 
         if rescale_betas_zero_snr:
             # Close to 0 without being 0 so first sigma is not inf
@@ -240,6 +252,8 @@ class EulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
 
         self.is_scale_input_called = False
         self.use_karras_sigmas = use_karras_sigmas
+        self.use_exponential_sigmas = use_exponential_sigmas
+        self.use_beta_sigmas = use_beta_sigmas
 
         self._step_index = None
         self._begin_index = None
@@ -279,28 +293,24 @@ class EulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
         """
         self._begin_index = begin_index
 
-    def scale_model_input(
-        self, sample: torch.FloatTensor, timestep: Union[float, torch.FloatTensor], step_i: int
-    ) -> torch.FloatTensor:
+    def scale_model_input(self, sample: torch.Tensor, timestep: Union[float, torch.Tensor], step_i: int) -> torch.Tensor:
         """
         Ensures interchangeability with schedulers that need to scale the denoising model input depending on the
         current timestep. Scales the denoising model input by `(sigma**2 + 1) ** 0.5` to match the Euler algorithm.
 
         Args:
-            sample (`torch.FloatTensor`):
+            sample (`torch.Tensor`):
                 The input sample.
             timestep (`int`, *optional*):
                 The current timestep in the diffusion chain.
 
         Returns:
-            `torch.FloatTensor`:
+            `torch.Tensor`:
                 A scaled input sample.
         """
         if self.step_index is None:
             self._init_step_index(timestep)
-        self._step_index = step_i  # Reset the scheduler step for double inference
-
-        # print(self.step_index)
+        self._step_index = step_i  # NOTE: NVS-Solver: Reset the scheduler step for multiple inference
 
         sigma = self.sigmas[self.step_index]
         sample = sample / ((sigma**2 + 1) ** 0.5)
@@ -308,7 +318,13 @@ class EulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
         self.is_scale_input_called = True
         return sample
 
-    def set_timesteps(self, num_inference_steps: int, device: Union[str, torch.device] = None):
+    def set_timesteps(
+        self,
+        num_inference_steps: int = None,
+        device: Union[str, torch.device] = None,
+        timesteps: Optional[List[int]] = None,
+        sigmas: Optional[List[float]] = None,
+    ):
         """
         Sets the discrete timesteps used for the diffusion chain (to be run before inference).
 
@@ -317,60 +333,123 @@ class EulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
                 The number of diffusion steps used when generating samples with a pre-trained model.
             device (`str` or `torch.device`, *optional*):
                 The device to which the timesteps should be moved to. If `None`, the timesteps are not moved.
+            timesteps (`List[int]`, *optional*):
+                Custom timesteps used to support arbitrary timesteps schedule. If `None`, timesteps will be generated
+                based on the `timestep_spacing` attribute. If `timesteps` is passed, `num_inference_steps` and `sigmas`
+                must be `None`, and `timestep_spacing` attribute will be ignored.
+            sigmas (`List[float]`, *optional*):
+                Custom sigmas used to support arbitrary timesteps schedule schedule. If `None`, timesteps and sigmas
+                will be generated based on the relevant scheduler attributes. If `sigmas` is passed,
+                `num_inference_steps` and `timesteps` must be `None`, and the timesteps will be generated based on the
+                custom sigmas schedule.
         """
+
+        if timesteps is not None and sigmas is not None:
+            raise ValueError("Only one of `timesteps` or `sigmas` should be set.")
+        if num_inference_steps is None and timesteps is None and sigmas is None:
+            raise ValueError("Must pass exactly one of `num_inference_steps` or `timesteps` or `sigmas.")
+        if num_inference_steps is not None and (timesteps is not None or sigmas is not None):
+            raise ValueError("Can only pass one of `num_inference_steps` or `timesteps` or `sigmas`.")
+        if timesteps is not None and self.config.use_karras_sigmas:
+            raise ValueError("Cannot set `timesteps` with `config.use_karras_sigmas = True`.")
+        if timesteps is not None and self.config.use_exponential_sigmas:
+            raise ValueError("Cannot set `timesteps` with `config.use_exponential_sigmas = True`.")
+        if timesteps is not None and self.config.use_beta_sigmas:
+            raise ValueError("Cannot set `timesteps` with `config.use_beta_sigmas = True`.")
+        if (
+            timesteps is not None
+            and self.config.timestep_type == "continuous"
+            and self.config.prediction_type == "v_prediction"
+        ):
+            raise ValueError(
+                "Cannot set `timesteps` with `config.timestep_type = 'continuous'` and `config.prediction_type = 'v_prediction'`."
+            )
+
+        if num_inference_steps is None:
+            num_inference_steps = len(timesteps) if timesteps is not None else len(sigmas) - 1
         self.num_inference_steps = num_inference_steps
 
-        # "linspace", "leading", "trailing" corresponds to annotation of Table 2. of https://arxiv.org/abs/2305.08891
-        if self.config.timestep_spacing == "linspace":
-            timesteps = np.linspace(0, self.config.num_train_timesteps - 1, num_inference_steps, dtype=np.float32)[
-                ::-1
-            ].copy()
-        elif self.config.timestep_spacing == "leading":
-            step_ratio = self.config.num_train_timesteps // self.num_inference_steps
-            # creates integer timesteps by multiplying by ratio
-            # casting to int to avoid issues when num_inference_step is power of 3
-            timesteps = (np.arange(0, num_inference_steps) * step_ratio).round()[::-1].copy().astype(np.float32)
-            timesteps += self.config.steps_offset
-        elif self.config.timestep_spacing == "trailing":
-            step_ratio = self.config.num_train_timesteps / self.num_inference_steps
-            # creates integer timesteps by multiplying by ratio
-            # casting to int to avoid issues when num_inference_step is power of 3
-            timesteps = (np.arange(self.config.num_train_timesteps, 0, -step_ratio)).round().copy().astype(np.float32)
-            timesteps -= 1
+        if sigmas is not None:
+            log_sigmas = np.log(np.array(((1 - self.alphas_cumprod) / self.alphas_cumprod) ** 0.5))
+            sigmas = np.array(sigmas).astype(np.float32)
+            timesteps = np.array([self._sigma_to_t(sigma, log_sigmas) for sigma in sigmas[:-1]])
+
         else:
-            raise ValueError(
-                f"{self.config.timestep_spacing} is not supported. Please make sure to choose one of 'linspace', 'leading' or 'trailing'."
-            )
+            if timesteps is not None:
+                timesteps = np.array(timesteps).astype(np.float32)
+            else:
+                # "linspace", "leading", "trailing" corresponds to annotation of Table 2. of https://huggingface.co/papers/2305.08891
+                if self.config.timestep_spacing == "linspace":
+                    timesteps = np.linspace(
+                        0, self.config.num_train_timesteps - 1, num_inference_steps, dtype=np.float32
+                    )[::-1].copy()
+                elif self.config.timestep_spacing == "leading":
+                    step_ratio = self.config.num_train_timesteps // self.num_inference_steps
+                    # creates integer timesteps by multiplying by ratio
+                    # casting to int to avoid issues when num_inference_step is power of 3
+                    timesteps = (
+                        (np.arange(0, num_inference_steps) * step_ratio).round()[::-1].copy().astype(np.float32)
+                    )
+                    timesteps += self.config.steps_offset
+                elif self.config.timestep_spacing == "trailing":
+                    step_ratio = self.config.num_train_timesteps / self.num_inference_steps
+                    # creates integer timesteps by multiplying by ratio
+                    # casting to int to avoid issues when num_inference_step is power of 3
+                    timesteps = (
+                        (np.arange(self.config.num_train_timesteps, 0, -step_ratio)).round().copy().astype(np.float32)
+                    )
+                    timesteps -= 1
+                else:
+                    raise ValueError(
+                        f"{self.config.timestep_spacing} is not supported. Please make sure to choose one of 'linspace', 'leading' or 'trailing'."
+                    )
 
-        sigmas = np.array(((1 - self.alphas_cumprod) / self.alphas_cumprod) ** 0.5)
-        log_sigmas = np.log(sigmas)
+            sigmas = np.array(((1 - self.alphas_cumprod) / self.alphas_cumprod) ** 0.5)
+            log_sigmas = np.log(sigmas)
+            if self.config.interpolation_type == "linear":
+                sigmas = np.interp(timesteps, np.arange(0, len(sigmas)), sigmas)
+            elif self.config.interpolation_type == "log_linear":
+                sigmas = torch.linspace(np.log(sigmas[-1]), np.log(sigmas[0]), num_inference_steps + 1).exp().numpy()
+            else:
+                raise ValueError(
+                    f"{self.config.interpolation_type} is not implemented. Please specify interpolation_type to either"
+                    " 'linear' or 'log_linear'"
+                )
 
-        if self.config.interpolation_type == "linear":
-            sigmas = np.interp(timesteps, np.arange(0, len(sigmas)), sigmas)
-        elif self.config.interpolation_type == "log_linear":
-            sigmas = torch.linspace(np.log(sigmas[-1]), np.log(sigmas[0]), num_inference_steps + 1).exp().numpy()
-        else:
-            raise ValueError(
-                f"{self.config.interpolation_type} is not implemented. Please specify interpolation_type to either"
-                " 'linear' or 'log_linear'"
-            )
+            if self.config.use_karras_sigmas:
+                sigmas = self._convert_to_karras(in_sigmas=sigmas, num_inference_steps=self.num_inference_steps)
+                timesteps = np.array([self._sigma_to_t(sigma, log_sigmas) for sigma in sigmas])
 
-        if self.config.use_karras_sigmas:
-            sigmas = self._convert_to_karras(in_sigmas=sigmas, num_inference_steps=self.num_inference_steps)
-            timesteps = np.array([self._sigma_to_t(sigma, log_sigmas) for sigma in sigmas])
+            elif self.config.use_exponential_sigmas:
+                sigmas = self._convert_to_exponential(in_sigmas=sigmas, num_inference_steps=num_inference_steps)
+                timesteps = np.array([self._sigma_to_t(sigma, log_sigmas) for sigma in sigmas])
+
+            elif self.config.use_beta_sigmas:
+                sigmas = self._convert_to_beta(in_sigmas=sigmas, num_inference_steps=num_inference_steps)
+                timesteps = np.array([self._sigma_to_t(sigma, log_sigmas) for sigma in sigmas])
+
+            if self.config.final_sigmas_type == "sigma_min":
+                sigma_last = ((1 - self.alphas_cumprod[0]) / self.alphas_cumprod[0]) ** 0.5
+            elif self.config.final_sigmas_type == "zero":
+                sigma_last = 0
+            else:
+                raise ValueError(
+                    f"`final_sigmas_type` must be one of 'zero', or 'sigma_min', but got {self.config.final_sigmas_type}"
+                )
+
+            sigmas = np.concatenate([sigmas, [sigma_last]]).astype(np.float32)
 
         sigmas = torch.from_numpy(sigmas).to(dtype=torch.float32, device=device)
 
         # TODO: Support the full EDM scalings for all prediction types and timestep types
         if self.config.timestep_type == "continuous" and self.config.prediction_type == "v_prediction":
-            self.timesteps = torch.Tensor([0.25 * sigma.log() for sigma in sigmas]).to(device=device)
+            self.timesteps = torch.Tensor([0.25 * sigma.log() for sigma in sigmas[:-1]]).to(device=device)
         else:
             self.timesteps = torch.from_numpy(timesteps.astype(np.float32)).to(device=device)
 
-        self.sigmas = torch.cat([sigmas, torch.zeros(1, device=sigmas.device)])
         self._step_index = None
         self._begin_index = None
-        self.sigmas = self.sigmas.to("cpu")  # to avoid too much CPU/GPU communication
+        self.sigmas = sigmas.to("cpu")  # to avoid too much CPU/GPU communication
 
     def _sigma_to_t(self, sigma, log_sigmas):
         # get log sigma
@@ -396,7 +475,7 @@ class EulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
         return t
 
     # Copied from https://github.com/crowsonkb/k-diffusion/blob/686dbad0f39640ea25c8a8c6a6e56bb40eacefa2/k_diffusion/sampling.py#L17
-    def _convert_to_karras(self, in_sigmas: torch.FloatTensor, num_inference_steps) -> torch.FloatTensor:
+    def _convert_to_karras(self, in_sigmas: torch.Tensor, num_inference_steps) -> torch.Tensor:
         """Constructs the noise schedule of Karras et al. (2022)."""
 
         # Hack to make sure that other schedulers which copy this function don't break
@@ -419,6 +498,59 @@ class EulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
         min_inv_rho = sigma_min ** (1 / rho)
         max_inv_rho = sigma_max ** (1 / rho)
         sigmas = (max_inv_rho + ramp * (min_inv_rho - max_inv_rho)) ** rho
+        return sigmas
+
+    # Copied from https://github.com/crowsonkb/k-diffusion/blob/686dbad0f39640ea25c8a8c6a6e56bb40eacefa2/k_diffusion/sampling.py#L26
+    def _convert_to_exponential(self, in_sigmas: torch.Tensor, num_inference_steps: int) -> torch.Tensor:
+        """Constructs an exponential noise schedule."""
+
+        # Hack to make sure that other schedulers which copy this function don't break
+        # TODO: Add this logic to the other schedulers
+        if hasattr(self.config, "sigma_min"):
+            sigma_min = self.config.sigma_min
+        else:
+            sigma_min = None
+
+        if hasattr(self.config, "sigma_max"):
+            sigma_max = self.config.sigma_max
+        else:
+            sigma_max = None
+
+        sigma_min = sigma_min if sigma_min is not None else in_sigmas[-1].item()
+        sigma_max = sigma_max if sigma_max is not None else in_sigmas[0].item()
+
+        sigmas = np.exp(np.linspace(math.log(sigma_max), math.log(sigma_min), num_inference_steps))
+        return sigmas
+
+    def _convert_to_beta(
+        self, in_sigmas: torch.Tensor, num_inference_steps: int, alpha: float = 0.6, beta: float = 0.6
+    ) -> torch.Tensor:
+        """From "Beta Sampling is All You Need" [arXiv:2407.12173] (Lee et. al, 2024)"""
+
+        # Hack to make sure that other schedulers which copy this function don't break
+        # TODO: Add this logic to the other schedulers
+        if hasattr(self.config, "sigma_min"):
+            sigma_min = self.config.sigma_min
+        else:
+            sigma_min = None
+
+        if hasattr(self.config, "sigma_max"):
+            sigma_max = self.config.sigma_max
+        else:
+            sigma_max = None
+
+        sigma_min = sigma_min if sigma_min is not None else in_sigmas[-1].item()
+        sigma_max = sigma_max if sigma_max is not None else in_sigmas[0].item()
+
+        sigmas = np.array(
+            [
+                sigma_min + (ppf * (sigma_max - sigma_min))
+                for ppf in [
+                    scipy.stats.beta.ppf(timestep, alpha, beta)
+                    for timestep in 1 - np.linspace(0, 1, num_inference_steps)
+                ]
+            ]
+        )
         return sigmas
 
     def index_for_timestep(self, timestep, schedule_timesteps=None):
@@ -445,16 +577,18 @@ class EulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
 
     def step_single(
         self,
-        model_output: torch.FloatTensor,
-        timestep: Union[float, torch.FloatTensor],
-        sample: torch.FloatTensor,
-        temp_cond_latents: Optional[torch.FloatTensor] = None,
-        mask: Optional[torch.FloatTensor] = None,
-        lambda_ts:Optional[torch.FloatTensor] = None,
-        step_i:Optional[torch.FloatTensor] = None,
-        lr:Optional[torch.FloatTensor] = None,
-        weight_clamp:Optional[torch.FloatTensor] = None,
+        model_output: torch.Tensor,
+        timestep: Union[float, torch.Tensor],
+        sample: torch.Tensor,
+        # >>> NVS-Solver >>>
+        temp_cond_latents: Optional[torch.Tensor] = None,
+        mask: Optional[torch.Tensor] = None,
+        lambda_ts:Optional[torch.Tensor] = None,
+        step_i: Optional[int] = None,
+        lr:Optional[torch.Tensor] = None,
+        weight_clamp:Optional[torch.Tensor] = None,
         compute_grad:Optional[bool] = False,
+        # <<< NVS-Solver <<<
         s_churn: float = 0.0,
         s_tmin: float = 0.0,
         s_tmax: float = float("inf"),
@@ -467,11 +601,11 @@ class EulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
         process from the learned model outputs (most often the predicted noise).
 
         Args:
-            model_output (`torch.FloatTensor`):
+            model_output (`torch.Tensor`):
                 The direct output from learned diffusion model.
             timestep (`float`):
                 The current discrete timestep in the diffusion chain.
-            sample (`torch.FloatTensor`):
+            sample (`torch.Tensor`):
                 A current instance of a sample created by the diffusion process.
             s_churn (`float`):
             s_tmin  (`float`):
@@ -490,11 +624,7 @@ class EulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
                 returned, otherwise a tuple is returned where the first element is the sample tensor.
         """
 
-        if (
-            isinstance(timestep, int)
-            or isinstance(timestep, torch.IntTensor)
-            or isinstance(timestep, torch.LongTensor)
-        ):
+        if isinstance(timestep, (int, torch.IntTensor, torch.LongTensor)):
             raise ValueError(
                 (
                     "Passing integer indices (e.g. from `enumerate(timesteps)`) as timesteps to"
@@ -511,13 +641,12 @@ class EulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
 
         if self.step_index is None:
             self._init_step_index(timestep)
-        self._step_index = step_i
+        self._step_index = step_i  # NOTE: NVS-Solver: Reset the scheduler step for multiple inference
 
         # Upcast to avoid precision issues when computing prev_sample
         sample = sample.to(torch.float32)
 
         sigma = self.sigmas[self.step_index]
-
         gamma = min(s_churn / (len(self.sigmas) - 1), 2**0.5 - 1) if s_tmin <= sigma <= s_tmax else 0.0
 
         sigma_hat = sigma * (gamma + 1)
@@ -536,7 +665,7 @@ class EulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
             pred_original_sample = model_output
         elif self.config.prediction_type == "epsilon":
             pred_original_sample = sample - sigma_hat * model_output
-        elif self.config.prediction_type == "v_prediction":  # <=== HIT
+        elif self.config.prediction_type == "v_prediction":
             # denoised = model_output * c_out + input * c_skip
             pred_original_sample = model_output * (-sigma / (sigma**2 + 1) ** 0.5) + (sample / (sigma**2 + 1))
         else:
@@ -544,6 +673,8 @@ class EulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
                 f"prediction_type given as {self.config.prediction_type} must be one of `epsilon`, or `v_prediction`"
             )
 
+
+        # <<< NVS-Solver <<<
         if temp_cond_latents is not None:
             b,cond_len,c,h,w = temp_cond_latents.shape
 
@@ -589,10 +720,6 @@ class EulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
             mask_ones = torch.ones_like(top_masks[:,0:1,:,:,:])
             top_masks = torch.cat((mask_ones,top_masks),1)
 
-            # np.save(f'top_masks_step{step_i}.npy', top_masks.cpu().numpy())
-
-
-        # 2. Convert to an ODE derivative
         if compute_grad:
 
             squared_diffs = (pred_original_sample - temp_cond_latents[1:2]) ** 2
@@ -607,9 +734,10 @@ class EulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
             grad  = grad/torch.std(grad)*sigma**0.5
 
             grad = lr * grad
+        # <<< NVS-Solver <<<
 
 
-
+        # 2. Convert to an ODE derivative
         derivative = (sample - pred_original_sample) / sigma_hat
 
         dt = self.sigmas[self.step_index + 1] - sigma_hat
@@ -632,522 +760,12 @@ class EulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
         else:
             return EulerDiscreteSchedulerOutput(prev_sample=prev_sample, pred_original_sample=pred_original_sample)
 
-    def step_multi(
-        self,
-        model_output: torch.FloatTensor,
-        timestep: Union[float, torch.FloatTensor],
-        sample: torch.FloatTensor,
-        temp_cond_latents: Optional[torch.FloatTensor] = None,
-        mask: Optional[torch.FloatTensor] = None,
-        lambda_ts:Optional[torch.FloatTensor] = None,
-        step_i:Optional[torch.FloatTensor] = None,
-        lr:Optional[torch.FloatTensor] = None,
-        compute_grad:Optional[bool] = False,
-        s_churn: float = 0.0,
-        s_tmin: float = 0.0,
-        s_tmax: float = float("inf"),
-        s_noise: float = 1.0,
-        generator: Optional[torch.Generator] = None,
-        return_dict: bool = True,
-    ) -> Union[EulerDiscreteSchedulerOutput, Tuple]:
-        """
-        Predict the sample from the previous timestep by reversing the SDE. This function propagates the diffusion
-        process from the learned model outputs (most often the predicted noise).
-
-        Args:
-            model_output (`torch.FloatTensor`):
-                The direct output from learned diffusion model.
-            timestep (`float`):
-                The current discrete timestep in the diffusion chain.
-            sample (`torch.FloatTensor`):
-                A current instance of a sample created by the diffusion process.
-            s_churn (`float`):
-            s_tmin  (`float`):
-            s_tmax  (`float`):
-            s_noise (`float`, defaults to 1.0):
-                Scaling factor for noise added to the sample.
-            generator (`torch.Generator`, *optional*):
-                A random number generator.
-            return_dict (`bool`):
-                Whether or not to return a [`~schedulers.scheduling_euler_discrete.EulerDiscreteSchedulerOutput`] or
-                tuple.
-
-        Returns:
-            [`~schedulers.scheduling_euler_discrete.EulerDiscreteSchedulerOutput`] or `tuple`:
-                If return_dict is `True`, [`~schedulers.scheduling_euler_discrete.EulerDiscreteSchedulerOutput`] is
-                returned, otherwise a tuple is returned where the first element is the sample tensor.
-        """
-
-        if (
-            isinstance(timestep, int)
-            or isinstance(timestep, torch.IntTensor)
-            or isinstance(timestep, torch.LongTensor)
-        ):
-            raise ValueError(
-                (
-                    "Passing integer indices (e.g. from `enumerate(timesteps)`) as timesteps to"
-                    " `EulerDiscreteScheduler.step()` is not supported. Make sure to pass"
-                    " one of the `scheduler.timesteps` as a timestep."
-                ),
-            )
-
-        if not self.is_scale_input_called:
-            logger.warning(
-                "The `scale_model_input` function should be called before `step` to ensure correct denoising. "
-                "See `StableDiffusionPipeline` for a usage example."
-            )
-
-        if self.step_index is None:
-            self._init_step_index(timestep)
-        self._step_index = step_i
-        # print(self.step_index)
-        # Upcast to avoid precision issues when computing prev_sample
-        sample = sample.to(torch.float32)
-
-        sigma = self.sigmas[self.step_index]
-
-        gamma = min(s_churn / (len(self.sigmas) - 1), 2**0.5 - 1) if s_tmin <= sigma <= s_tmax else 0.0
-
-        noise = randn_tensor(
-            model_output.shape, dtype=model_output.dtype, device=model_output.device, generator=generator
-        )
-
-        eps = noise * s_noise
-        sigma_hat = sigma * (gamma + 1)
-
-        if gamma > 0:
-            sample = sample + eps * (sigma_hat**2 - sigma**2) ** 0.5
-        # print(self.config.prediction_type)
-        # 1. compute predicted original sample (x_0) from sigma-scaled predicted noise
-        # NOTE: "original_sample" should not be an expected prediction_type but is left in for
-        # backwards compatibility
-        if self.config.prediction_type == "original_sample" or self.config.prediction_type == "sample":
-            pred_original_sample = model_output
-        elif self.config.prediction_type == "epsilon":
-            pred_original_sample = sample - sigma_hat * model_output
-        elif self.config.prediction_type == "v_prediction":
-            # denoised = model_output * c_out + input * c_skip
-            pred_original_sample = model_output * (-sigma / (sigma**2 + 1) ** 0.5) + (sample / (sigma**2 + 1))
-        else:
-            raise ValueError(
-                f"prediction_type given as {self.config.prediction_type} must be one of `epsilon`, or `v_prediction`"
-            )
-
-        # print(torch.std(pred_original_sample))
-        if temp_cond_latents is not None:
-            b,cond_len,c,h,w = temp_cond_latents.shape
-
-
-
-            index_list = [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23]
-
-            mask = (1-mask) > 0.5
-            mask_ones = torch.ones_like(mask[:,0:1,:,:,:])
-            mask = torch.cat((mask_ones,mask),1)
-            top_masks = []
-
-            for ii, tau in enumerate(index_list):
-                FEA = temp_cond_latents[1:2, tau,:,:,:]
-                weight = lambda_ts[self.step_index,tau]
-                # mask_t = (1-mask[:,ii,:,:,:]) > 0.5
-                mask_t = torch.mean(mask[:,tau,:,:,:].float(),1,keepdim=True)
-                mask_t = mask_t>0.5
-                mask_zero = ~mask_t
-                num_zero = torch.sum(mask_zero)
-
-
-                masked_tensor1 = pred_original_sample[:,tau,:,:,:] * mask_t
-                masked_tensor2 = FEA * mask_t
-                masked_diff = masked_tensor1 - masked_tensor2
-
-                flat_diff = torch.abs(masked_diff.flatten())
-
-
-                sorted_diff, indices = torch.sort(flat_diff)
-
-
-                weight = torch.clamp(weight,0.4,1)
-                cutoff_index_s = num_zero-1
-                cutoff_index_e = int(weight * (len(sorted_diff)-num_zero))+num_zero
-                cutoff_value = sorted_diff[cutoff_index_e-1]
-
-                top_mask = (torch.abs(masked_diff) <= cutoff_value) & mask_t
-                top_masks.append(top_mask)
-
-            top_masks = torch.cat(top_masks,0)
-            top_masks = top_masks.unsqueeze(0)
-            mask_ones = torch.ones_like(top_masks[:,0:1,:,:,:])
-            top_masks = torch.cat((mask_ones,top_masks),1)
-            top_masks = torch.cat((top_masks,mask_ones),1)
-
-        # 2. Convert to an ODE derivative
-        if compute_grad:
-
-
-            squared_diffs = (pred_original_sample - temp_cond_latents[1:2]) ** 2
-            masked_squared_diffs = squared_diffs * top_masks
-            loss = masked_squared_diffs.sum() / top_masks.sum()
-
-            sample.retain_grad()
-            loss.backward()
-            grad = sample.grad
-
-            grad  = grad/torch.std(grad)*sigma**0.5
-
-
-            grad = lr * grad
-
-
-        derivative = (sample - pred_original_sample) / sigma_hat
-
-        dt = self.sigmas[self.step_index + 1] - sigma_hat
-
-        prev_sample = sample + derivative * dt
-
-        prev_sample = prev_sample.to(model_output.dtype)
-
-        # upon completion increase step index by one
-        self._step_index += 1
-
-        if not return_dict:
-            return (prev_sample,)
-        if compute_grad:
-            return EulerDiscreteSchedulerOutput(prev_sample=prev_sample, pred_original_sample=pred_original_sample,grad = grad)
-        else:
-            return EulerDiscreteSchedulerOutput(prev_sample=prev_sample, pred_original_sample=pred_original_sample)
-
-
-    def step_single_dgs(
-        self,
-        model_output: torch.FloatTensor,
-        timestep: Union[float, torch.FloatTensor],
-        sample: torch.FloatTensor,
-        temp_cond_latents: Optional[torch.FloatTensor] = None,
-        mask: Optional[torch.FloatTensor] = None,
-        lambda_ts:Optional[torch.FloatTensor] = None,
-        step_i:Optional[torch.FloatTensor] = None,
-        weight_clamp:Optional[torch.FloatTensor] = None,
-        s_churn: float = 0.0,
-        s_tmin: float = 0.0,
-        s_tmax: float = float("inf"),
-        s_noise: float = 1.0,
-        generator: Optional[torch.Generator] = None,
-        return_dict: bool = True,
-    ) -> Union[EulerDiscreteSchedulerOutput, Tuple]:
-        """
-        Predict the sample from the previous timestep by reversing the SDE. This function propagates the diffusion
-        process from the learned model outputs (most often the predicted noise).
-
-        Args:
-            model_output (`torch.FloatTensor`):
-                The direct output from learned diffusion model.
-            timestep (`float`):
-                The current discrete timestep in the diffusion chain.
-            sample (`torch.FloatTensor`):
-                A current instance of a sample created by the diffusion process.
-            s_churn (`float`):
-            s_tmin  (`float`):
-            s_tmax  (`float`):
-            s_noise (`float`, defaults to 1.0):
-                Scaling factor for noise added to the sample.
-            generator (`torch.Generator`, *optional*):
-                A random number generator.
-            return_dict (`bool`):
-                Whether or not to return a [`~schedulers.scheduling_euler_discrete.EulerDiscreteSchedulerOutput`] or
-                tuple.
-
-        Returns:
-            [`~schedulers.scheduling_euler_discrete.EulerDiscreteSchedulerOutput`] or `tuple`:
-                If return_dict is `True`, [`~schedulers.scheduling_euler_discrete.EulerDiscreteSchedulerOutput`] is
-                returned, otherwise a tuple is returned where the first element is the sample tensor.
-        """
-
-        if (
-            isinstance(timestep, int)
-            or isinstance(timestep, torch.IntTensor)
-            or isinstance(timestep, torch.LongTensor)
-        ):
-            raise ValueError(
-                (
-                    "Passing integer indices (e.g. from `enumerate(timesteps)`) as timesteps to"
-                    " `EulerDiscreteScheduler.step()` is not supported. Make sure to pass"
-                    " one of the `scheduler.timesteps` as a timestep."
-                ),
-            )
-
-        if not self.is_scale_input_called:
-            logger.warning(
-                "The `scale_model_input` function should be called before `step` to ensure correct denoising. "
-                "See `StableDiffusionPipeline` for a usage example."
-            )
-
-        if self.step_index is None:
-            self._init_step_index(timestep)
-        self._step_index = step_i
-        # Upcast to avoid precision issues when computing prev_sample
-        sample = sample.to(torch.float32)
-
-        sigma = self.sigmas[self.step_index]
-
-        gamma = min(s_churn / (len(self.sigmas) - 1), 2**0.5 - 1) if s_tmin <= sigma <= s_tmax else 0.0
-
-        noise = randn_tensor(
-            model_output.shape, dtype=model_output.dtype, device=model_output.device, generator=generator
-        )
-
-        eps = noise * s_noise
-        sigma_hat = sigma * (gamma + 1)
-
-        if gamma > 0:
-            sample = sample + eps * (sigma_hat**2 - sigma**2) ** 0.5
-        # print(self.config.prediction_type)
-        # 1. compute predicted original sample (x_0) from sigma-scaled predicted noise
-        # NOTE: "original_sample" should not be an expected prediction_type but is left in for
-        # backwards compatibility
-        if self.config.prediction_type == "original_sample" or self.config.prediction_type == "sample":
-            pred_original_sample = model_output
-        elif self.config.prediction_type == "epsilon":
-            pred_original_sample = sample - sigma_hat * model_output
-        elif self.config.prediction_type == "v_prediction":
-            # denoised = model_output * c_out + input * c_skip
-            pred_original_sample = model_output * (-sigma / (sigma**2 + 1) ** 0.5) + (sample / (sigma**2 + 1))
-        else:
-            raise ValueError(
-                f"prediction_type given as {self.config.prediction_type} must be one of `epsilon`, or `v_prediction`"
-            )
-
-        # print(torch.std(pred_original_sample))
-        if temp_cond_latents is not None:
-            b,cond_len,c,h,w = temp_cond_latents.shape
-
-
-
-            index_list = [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24]
-
-            mask = (1-mask) > 0.5
-            mask_ones = torch.ones_like(mask[:,0:1,:,:,:])
-            mask = torch.cat((mask_ones,mask),1)
-            top_masks = []
-            for ii, tau in enumerate(index_list):
-                FEA = temp_cond_latents[1:2, tau,:,:,:]
-                weight = lambda_ts[self.step_index,tau]
-                mask_t = torch.mean(mask[:,tau,:,:,:].float(),1,keepdim=True)
-                mask_t = mask_t>0.5
-                mask_zero = ~mask_t
-                num_zero = torch.sum(mask_zero)
-
-
-                masked_tensor1 = pred_original_sample[:,tau,:,:,:] * mask_t
-                masked_tensor2 = FEA * mask_t
-                masked_diff = masked_tensor1 - masked_tensor2
-
-                # Flatten the differences and get absolute values
-                flat_diff = torch.abs(masked_diff.flatten())
-
-
-                # Sort differences and calculate the threshold
-                sorted_diff, indices = torch.sort(flat_diff)
-
-
-                weight = torch.clamp(weight,weight_clamp,1)
-                cutoff_index_s = num_zero-1
-                cutoff_index_e = int(weight * (len(sorted_diff)-num_zero))+num_zero
-                cutoff_value = sorted_diff[cutoff_index_e-1]
-
-                # Create a new mask for the top 80% differences
-                top_mask = (torch.abs(masked_diff) <= cutoff_value) & mask_t
-                top_masks.append(top_mask)
-                pred_original_sample[:,tau,:,:,:][top_mask] =  FEA[top_mask]
-
-
-
-            pred_original_sample[:,0:1,:,:,:] = temp_cond_latents[1:2,0:1,:,:,:]
-
-        # 2. Convert to an ODE derivative
-
-        derivative = (sample - pred_original_sample) / sigma_hat
-
-        dt = self.sigmas[self.step_index + 1] - sigma_hat
-
-        prev_sample = sample + derivative * dt
-
-        prev_sample = prev_sample.to(model_output.dtype)
-
-        # upon completion increase step index by one
-        self._step_index += 1
-
-        if not return_dict:
-            return (prev_sample,)
-
-        return EulerDiscreteSchedulerOutput(prev_sample=prev_sample, pred_original_sample=pred_original_sample)
-    def step_multi_dgs(
-        self,
-        model_output: torch.FloatTensor,
-        timestep: Union[float, torch.FloatTensor],
-        sample: torch.FloatTensor,
-        temp_cond_latents: Optional[torch.FloatTensor] = None,
-        mask: Optional[torch.FloatTensor] = None,
-        lambda_ts:Optional[torch.FloatTensor] = None,
-        step_i:Optional[torch.FloatTensor] = None,
-        s_churn: float = 0.0,
-        s_tmin: float = 0.0,
-        s_tmax: float = float("inf"),
-        s_noise: float = 1.0,
-        generator: Optional[torch.Generator] = None,
-        return_dict: bool = True,
-    ) -> Union[EulerDiscreteSchedulerOutput, Tuple]:
-        """
-        Predict the sample from the previous timestep by reversing the SDE. This function propagates the diffusion
-        process from the learned model outputs (most often the predicted noise).
-
-        Args:
-            model_output (`torch.FloatTensor`):
-                The direct output from learned diffusion model.
-            timestep (`float`):
-                The current discrete timestep in the diffusion chain.
-            sample (`torch.FloatTensor`):
-                A current instance of a sample created by the diffusion process.
-            s_churn (`float`):
-            s_tmin  (`float`):
-            s_tmax  (`float`):
-            s_noise (`float`, defaults to 1.0):
-                Scaling factor for noise added to the sample.
-            generator (`torch.Generator`, *optional*):
-                A random number generator.
-            return_dict (`bool`):
-                Whether or not to return a [`~schedulers.scheduling_euler_discrete.EulerDiscreteSchedulerOutput`] or
-                tuple.
-
-        Returns:
-            [`~schedulers.scheduling_euler_discrete.EulerDiscreteSchedulerOutput`] or `tuple`:
-                If return_dict is `True`, [`~schedulers.scheduling_euler_discrete.EulerDiscreteSchedulerOutput`] is
-                returned, otherwise a tuple is returned where the first element is the sample tensor.
-        """
-
-        if (
-            isinstance(timestep, int)
-            or isinstance(timestep, torch.IntTensor)
-            or isinstance(timestep, torch.LongTensor)
-        ):
-            raise ValueError(
-                (
-                    "Passing integer indices (e.g. from `enumerate(timesteps)`) as timesteps to"
-                    " `EulerDiscreteScheduler.step()` is not supported. Make sure to pass"
-                    " one of the `scheduler.timesteps` as a timestep."
-                ),
-            )
-
-        if not self.is_scale_input_called:
-            logger.warning(
-                "The `scale_model_input` function should be called before `step` to ensure correct denoising. "
-                "See `StableDiffusionPipeline` for a usage example."
-            )
-
-        if self.step_index is None:
-            self._init_step_index(timestep)
-        self._step_index = step_i
-        # print(self.step_index)
-        # Upcast to avoid precision issues when computing prev_sample
-        sample = sample.to(torch.float32)
-
-        sigma = self.sigmas[self.step_index]
-
-        gamma = min(s_churn / (len(self.sigmas) - 1), 2**0.5 - 1) if s_tmin <= sigma <= s_tmax else 0.0
-
-        noise = randn_tensor(
-            model_output.shape, dtype=model_output.dtype, device=model_output.device, generator=generator
-        )
-
-        eps = noise * s_noise
-        sigma_hat = sigma * (gamma + 1)
-
-        if gamma > 0:
-            sample = sample + eps * (sigma_hat**2 - sigma**2) ** 0.5
-        # 1. compute predicted original sample (x_0) from sigma-scaled predicted noise
-        # NOTE: "original_sample" should not be an expected prediction_type but is left in for
-        # backwards compatibility
-        if self.config.prediction_type == "original_sample" or self.config.prediction_type == "sample":
-            pred_original_sample = model_output
-        elif self.config.prediction_type == "epsilon":
-            pred_original_sample = sample - sigma_hat * model_output
-        elif self.config.prediction_type == "v_prediction":
-            # denoised = model_output * c_out + input * c_skip
-            pred_original_sample = model_output * (-sigma / (sigma**2 + 1) ** 0.5) + (sample / (sigma**2 + 1))
-        else:
-            raise ValueError(
-                f"prediction_type given as {self.config.prediction_type} must be one of `epsilon`, or `v_prediction`"
-            )
-
-        if temp_cond_latents is not None:
-            b,cond_len,c,h,w = temp_cond_latents.shape
-
-
-
-            index_list = [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23]
-
-            mask = (1-mask) > 0.5
-            mask_ones = torch.ones_like(mask[:,0:1,:,:,:])
-            mask = torch.cat((mask_ones,mask),1)
-            top_masks = []
-            for ii, tau in enumerate(index_list):
-                FEA = temp_cond_latents[1:2, tau,:,:,:]
-                weight = lambda_ts[self.step_index,tau]
-                mask_t = torch.mean(mask[:,tau,:,:,:].float(),1,keepdim=True)
-                mask_t = mask_t>0.5
-                mask_zero = ~mask_t
-                num_zero = torch.sum(mask_zero)
-
-
-                masked_tensor1 = pred_original_sample[:,tau,:,:,:] * mask_t
-                masked_tensor2 = FEA * mask_t
-                masked_diff = masked_tensor1 - masked_tensor2
-
-                # Flatten the differences and get absolute values
-                flat_diff = torch.abs(masked_diff.flatten())
-
-
-                # Sort differences and calculate the  threshold
-                sorted_diff, indices = torch.sort(flat_diff)
-
-
-                weight = torch.clamp(weight,0.4,1)
-                cutoff_index_s = num_zero-1
-                cutoff_index_e = int(weight * (len(sorted_diff)-num_zero))+num_zero
-                cutoff_value = sorted_diff[cutoff_index_e-1]
-
-                # Create a new mask for the top 80% differences
-                top_mask = (torch.abs(masked_diff) <= cutoff_value) & mask_t
-
-
-
-                pred_original_sample[:,tau,:,:,:][top_mask] =  FEA[top_mask]
-
-
-            pred_original_sample[:,0:1,:,:,:] = temp_cond_latents[1:2,0:1,:,:,:]
-
-        derivative = (sample - pred_original_sample) / sigma_hat
-
-        dt = self.sigmas[self.step_index + 1] - sigma_hat
-
-        prev_sample = sample + derivative * dt
-
-        prev_sample = prev_sample.to(model_output.dtype)
-
-        # upon completion increase step index by one
-        self._step_index += 1
-
-        if not return_dict:
-            return (prev_sample,)
-
-        return EulerDiscreteSchedulerOutput(prev_sample=prev_sample, pred_original_sample=pred_original_sample)
-
-
     def add_noise(
         self,
-        original_samples: torch.FloatTensor,
-        noise: torch.FloatTensor,
-        timesteps: torch.FloatTensor,
-    ) -> torch.FloatTensor:
+        original_samples: torch.Tensor,
+        noise: torch.Tensor,
+        timesteps: torch.Tensor,
+    ) -> torch.Tensor:
         # Make sure sigmas and timesteps have the same device and dtype as original_samples
         sigmas = self.sigmas.to(device=original_samples.device, dtype=original_samples.dtype)
         if original_samples.device.type == "mps" and torch.is_floating_point(timesteps):
@@ -1175,5 +793,104 @@ class EulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
         noisy_samples = original_samples + noise * sigma
         return noisy_samples
 
+    def get_velocity(self, sample: torch.Tensor, noise: torch.Tensor, timesteps: torch.Tensor) -> torch.Tensor:
+        if (
+            isinstance(timesteps, int)
+            or isinstance(timesteps, torch.IntTensor)
+            or isinstance(timesteps, torch.LongTensor)
+        ):
+            raise ValueError(
+                (
+                    "Passing integer indices (e.g. from `enumerate(timesteps)`) as timesteps to"
+                    " `EulerDiscreteScheduler.get_velocity()` is not supported. Make sure to pass"
+                    " one of the `scheduler.timesteps` as a timestep."
+                ),
+            )
+
+        if sample.device.type == "mps" and torch.is_floating_point(timesteps):
+            # mps does not support float64
+            schedule_timesteps = self.timesteps.to(sample.device, dtype=torch.float32)
+            timesteps = timesteps.to(sample.device, dtype=torch.float32)
+        else:
+            schedule_timesteps = self.timesteps.to(sample.device)
+            timesteps = timesteps.to(sample.device)
+
+        step_indices = [self.index_for_timestep(t, schedule_timesteps) for t in timesteps]
+        alphas_cumprod = self.alphas_cumprod.to(sample)
+        sqrt_alpha_prod = alphas_cumprod[step_indices] ** 0.5
+        sqrt_alpha_prod = sqrt_alpha_prod.flatten()
+        while len(sqrt_alpha_prod.shape) < len(sample.shape):
+            sqrt_alpha_prod = sqrt_alpha_prod.unsqueeze(-1)
+
+        sqrt_one_minus_alpha_prod = (1 - alphas_cumprod[step_indices]) ** 0.5
+        sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.flatten()
+        while len(sqrt_one_minus_alpha_prod.shape) < len(sample.shape):
+            sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.unsqueeze(-1)
+
+        velocity = sqrt_alpha_prod * noise - sqrt_one_minus_alpha_prod * sample
+        return velocity
+
     def __len__(self):
         return self.config.num_train_timesteps
+
+    def invert(
+        self,
+        model_output: torch.Tensor,
+        timestep: Union[float, torch.Tensor],
+        sample: torch.Tensor,
+        return_dict: bool = True,
+    ) -> Union[EulerDiscreteSchedulerOutput, Tuple]:
+        """
+        Perform an inversion step, i.e., add noise to the sample according to the model output.
+        This is the reverse of the `step` method.
+
+        Args:
+            model_output (`torch.Tensor`):
+                The direct output from the learned diffusion model (e.g., predicted noise or v-prediction)
+                for the input sample x_t with the 'next' timestep t+1 (so there is a slight mismatch inherent in inversion).
+            timestep (`float` or `torch.Tensor`):
+                The 'next' timestep t+1 corresponding to the noiser target x_{t+1}.
+            sample (`torch.Tensor`):
+                The 'current' sample x_t.
+            return_dict (`bool`):
+                Whether or not to return a [`~schedulers.scheduling_euler_discrete.EulerDiscreteSchedulerOutput`] or tuple.
+
+        Returns:
+            [`~schedulers.scheduling_euler_discrete.EulerDiscreteSchedulerOutput`] or `tuple`:
+                If return_dict is `True`, `EulerDiscreteSchedulerOutput` is returned where `prev_sample`
+                is the noisier `inverted_sample` (x_{t+1}) and `pred_original_sample` is the
+                prediction for the input `sample`. Otherwise a tuple is returned.
+        """
+        if self.timesteps is None or len(self.timesteps) == 0 or self.sigmas is None or len(self.sigmas) == 0:
+            raise ValueError("Timesteps and sigmas must be set before calling invert. Call `set_timesteps` first.")
+
+        # Determine index of the current timestep
+        # `self.timesteps` are [t_0, t_1, ..., t_{N-1}] (N = num_inference_steps) usually high to low.
+        # `self.sigmas` are [s_0, s_1, ..., s_{N-1}, s_N] (N+1 sigmas) also high to low.
+        # `timesteps[i]` corresponds to `sigmas[i]`.
+        idx_next = self.index_for_timestep(timestep, self.timesteps.to(sample.device))
+
+        sample_dtype = sample.dtype
+        sample_fp32 = sample.to(torch.float32)
+        model_output_fp32 = model_output.to(torch.float32)
+
+        sigma_of_sample = self.sigmas[idx_next + 1].to(sample.device, dtype=torch.float32)
+        sigma_target_noisier = self.sigmas[idx_next].to(sample.device, dtype=torch.float32) # Previous index means higher sigma
+
+        # NOTE: pred_original_sample is decomposed to extract 'sample' for inversion, so the resulting formula should be very different between prediction types
+        if self.config.get('prediction_type') == "v_prediction":
+            coeff_1 = (sigma_target_noisier ** 2 + 1) / (sigma_target_noisier * sigma_of_sample + 1)
+            coeff_2 = (sigma_target_noisier - sigma_of_sample) / (sigma_target_noisier ** 2 + 1).sqrt()
+            inverted_sample = coeff_1 * (sample_fp32 + coeff_2 * model_output_fp32)
+            # calculate pred_original_sample
+            pred_original_sample = model_output_fp32 * (-sigma_target_noisier / (sigma_target_noisier**2 + 1) ** 0.5) + (inverted_sample / (sigma_target_noisier**2 + 1))
+        else:
+            raise NotImplementedError(f"Unsupported prediction type: {self.config.get('prediction_type')}")
+
+        inverted_sample = inverted_sample.to(sample_dtype)
+        pred_original_sample = pred_original_sample.to(sample_dtype)
+
+        if not return_dict:
+            return (inverted_sample, pred_original_sample)
+
+        return EulerDiscreteSchedulerOutput(prev_sample=inverted_sample, pred_original_sample=pred_original_sample)

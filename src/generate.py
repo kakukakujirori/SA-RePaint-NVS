@@ -677,7 +677,7 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
 
                             opt_std = 0.5 #self.scheduler.sigmas[i] / self.scheduler.sigmas[0]
                             current_sigma = self.scheduler.sigmas[i]
-                            posterior_sigma = (self.scheduler.sigmas[i])**2 / opt_std
+                            posterior_sigma = current_sigma**2 / opt_std
 
                             resample_noise = randn_tensor(latents.shape, generator=generator, device=latents.device, dtype=latents.dtype)
                             latents = self.stochastic_resample(opt_z0=pseudo_x0, zt=latents_ori, current_sigma=current_sigma, posterior_sigma=posterior_sigma, noise=resample_noise, generator=generator)
@@ -729,13 +729,12 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
                         opt_latents = torch.cat(opt_latents_list, dim=1)
 
                         # resample
-                        opt_std = self.scheduler.sigmas[i + 1] / self.scheduler.sigmas[0]
+                        opt_std = 0.5  # self.scheduler.sigmas[i + 1] / self.scheduler.sigmas[0]
                         current_sigma = self.scheduler.sigmas[i + 1]
-                        posterior_sigma = (self.scheduler.sigmas[i + 1])**2 / opt_std
+                        posterior_sigma = current_sigma**2 / opt_std
                         resample_noise = randn_tensor(opt_latents.shape, generator=generator, device=opt_latents.device, dtype=opt_latents.dtype)
                         latents = self.stochastic_resample(opt_z0=opt_latents, zt=latents.detach().clone().float(), current_sigma=current_sigma, posterior_sigma=posterior_sigma, noise=resample_noise, generator=generator)
 
-                        # latents = latents.requires_grad_() # Seems to need to require grad here
                         latents = latents.half()
 
                         torch.cuda.empty_cache()

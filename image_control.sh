@@ -31,8 +31,8 @@ python src/generate.py \
   --output_folder output/${ITEM}/${CAMERA_MOTION_MODE}_${DEGREE}/generated \
   --trajectory_folder output/${ITEM}/${CAMERA_MOTION_MODE}_${DEGREE}/warped \
   --num_frames ${NUM_FRAMES} \
-  --num_inference_steps 25 \
   --enable_resample \
-  --denoise_start_step 8 \
-  --repaint_iter_num 5 \
+  --num_inference_steps 50 \
+  --denoise_start_step 16 \
+  --repaint_iter_num 2 \
   --seed 12345

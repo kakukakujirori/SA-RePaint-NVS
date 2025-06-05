@@ -670,6 +670,23 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
 
                         # resampling
                         if j < repaint_iter_num - 1:
+
+
+                            # alignment
+                            if i < self._num_timesteps // 2:
+                                _, pseudo_x0 = homography_estimation(
+                                    pseudo_x0,
+                                    warped_latents[batch_size:] if self.do_classifier_free_guidance else warped_latents,
+                                    warped_masks_sh[:, :, 0:1, :, :] < 0.5,
+                                    process_size=128,
+                                    lr=1e-2,
+                                    max_iters=100,
+                                    num_control_points=num_frames//3,
+                                    fix_first_frame=True,
+                                    acceleration_penalty_weight=0.5,
+                                )
+
+
                             if self.do_classifier_free_guidance:
                                 pseudo_x0 = (1 - warped_masks_sh) * warped_latents[batch_size:] + warped_masks_sh * pseudo_x0
                             else:
@@ -678,14 +695,22 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
                             opt_std = 0.5 #self.scheduler.sigmas[i] / self.scheduler.sigmas[0]
                             current_sigma = self.scheduler.sigmas[i]
                             posterior_sigma = current_sigma**2 / opt_std
-
-                            resample_noise = randn_tensor(latents.shape, generator=generator, device=latents.device, dtype=latents.dtype)
-                            latents = self.stochastic_resample(opt_z0=pseudo_x0, zt=latents_ori, current_sigma=current_sigma, posterior_sigma=posterior_sigma, noise=resample_noise, generator=generator)
-
+                            latents = self.stochastic_resample(
+                                opt_z0=pseudo_x0,
+                                zt=latents_ori,
+                                current_sigma=current_sigma,
+                                posterior_sigma=posterior_sigma,
+                                generator=generator,
+                            )
                             latents = latents.half()
 
                     del latents_ori
                     torch.cuda.empty_cache()
+
+
+                # os.makedirs("dump", exist_ok=True)
+                # torch.save(pseudo_x0, f"dump/latents_with_resample_{i}.pt")
+
 
 
                 # ReSample
@@ -699,17 +724,20 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
                             pseudo_x0_pixel = self.decode_latents(pseudo_x0, num_frames, decode_chunk_size, permute=False)  # Get \hat{x}_0 into pixel space
 
                         # alignment
-                        _, opt_var_aligned = homography_estimation(
-                            pseudo_x0_pixel,
-                            warped_images,
-                            warped_masks < 0.5,
-                            process_size=128,
-                            lr=1e-2,
-                            max_iters=100,
-                            num_control_points=num_frames//3,
-                            fix_first_frame=True,
-                            acceleration_penalty_weight=0.5,
-                        )
+                        if i < self._num_timesteps // 2:
+                            _, opt_var_aligned = homography_estimation(
+                                pseudo_x0_pixel,
+                                warped_images,
+                                warped_masks < 0.5,
+                                process_size=128,
+                                lr=1e-2,
+                                max_iters=100,
+                                num_control_points=num_frames//3,
+                                fix_first_frame=True,
+                                acceleration_penalty_weight=0.5,
+                            )
+                        else:
+                            opt_var_aligned = pseudo_x0_pixel
 
                         # Directly paste the measurement into the opt_var_aligned
                         opt_var_modified = torch.where(warped_masks < 0.5, warped_images, opt_var_aligned)
@@ -732,11 +760,16 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
                         opt_std = 0.5  # self.scheduler.sigmas[i + 1] / self.scheduler.sigmas[0]
                         current_sigma = self.scheduler.sigmas[i + 1]
                         posterior_sigma = current_sigma**2 / opt_std
-                        resample_noise = randn_tensor(opt_latents.shape, generator=generator, device=opt_latents.device, dtype=opt_latents.dtype)
-                        latents = self.stochastic_resample(opt_z0=opt_latents, zt=latents.detach().clone().float(), current_sigma=current_sigma, posterior_sigma=posterior_sigma, noise=resample_noise, generator=generator)
-
+                        latents = self.stochastic_resample(
+                            opt_z0=opt_latents,
+                            zt=latents.detach().clone().float(),
+                            current_sigma=current_sigma,
+                            posterior_sigma=posterior_sigma,
+                            generator=generator,
+                        )
                         latents = latents.half()
 
+                        del pseudo_x0_pixel, opt_var_aligned, opt_var_modified, opt_latents
                         torch.cuda.empty_cache()
 
 

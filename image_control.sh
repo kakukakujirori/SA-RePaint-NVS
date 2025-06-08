@@ -1,6 +1,6 @@
-ITEM=basketball
-CAMERA_MOTION_MODE=horizontal
-DEGREE=1.0
+ITEM=2a16f82a29b2fa17_51433333
+CAMERA_MOTION_MODE=zoomout
+DEGREE=0.5
 NUM_FRAMES=25
 
 set -e
@@ -31,7 +31,6 @@ python src/generate.py \
   --output_folder output/${ITEM}/${CAMERA_MOTION_MODE}_${DEGREE}/generated \
   --trajectory_folder output/${ITEM}/${CAMERA_MOTION_MODE}_${DEGREE}/warped \
   --num_frames ${NUM_FRAMES} \
-  --enable_resample \
   --num_inference_steps 50 \
   --denoise_start_step 16 \
   --repaint_iter_num 2 \

@@ -665,32 +665,30 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
 
                         # compute the previous noisy sample x_t -> x_t-1
                         out = self.scheduler.step_single(noise_pred, t, latents, None, None, lambda_ts, step_i=i, compute_grad=False)
-                        latents = out.prev_sample
                         pseudo_x0 = out.pred_original_sample
+                        pred_score = (pseudo_x0 - latents) / self.scheduler.sigmas[i]**2
+                        latents = out.prev_sample
+
+                        # alignment
+                        if i < self._num_timesteps // 2:
+                            _, pseudo_x0 = homography_estimation(
+                                pseudo_x0,
+                                warped_latents[batch_size:] if self.do_classifier_free_guidance else warped_latents,
+                                warped_masks_sh[:, :, 0:1, :, :] < 0.5,
+                                process_size=128,
+                                lr=1e-2,
+                                max_iters=100,
+                                num_control_points=num_frames//3,
+                                fix_first_frame=True,
+                                acceleration_penalty_weight=0.5,
+                            )
+
+                        # direct pasting
+                        pseudo_x0 = warped_masks_sh * pseudo_x0 + \
+                                    (1 - warped_masks_sh) * (warped_latents[batch_size:] if self.do_classifier_free_guidance else warped_latents)
 
                         # resampling
                         if j < repaint_iter_num - 1:
-
-
-                            # alignment
-                            if i < self._num_timesteps // 2:
-                                _, pseudo_x0 = homography_estimation(
-                                    pseudo_x0,
-                                    warped_latents[batch_size:] if self.do_classifier_free_guidance else warped_latents,
-                                    warped_masks_sh[:, :, 0:1, :, :] < 0.5,
-                                    process_size=128,
-                                    lr=1e-2,
-                                    max_iters=100,
-                                    num_control_points=num_frames//3,
-                                    fix_first_frame=True,
-                                    acceleration_penalty_weight=0.5,
-                                )
-
-
-                            if self.do_classifier_free_guidance:
-                                pseudo_x0 = (1 - warped_masks_sh) * warped_latents[batch_size:] + warped_masks_sh * pseudo_x0
-                            else:
-                                pseudo_x0 = (1 - warped_masks_sh) * warped_latents + warped_masks_sh * pseudo_x0
 
                             opt_std = 0.5 #self.scheduler.sigmas[i] / self.scheduler.sigmas[0]
                             current_sigma = self.scheduler.sigmas[i]

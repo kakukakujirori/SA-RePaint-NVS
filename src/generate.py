@@ -501,7 +501,6 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
 
         warped_masks_sh = rearrange(warped_masks, "() f () (nh ph) (nw pw) -> () f () nh nw (ph pw)", ph=8, pw=8)
         warped_masks_sh = warped_masks_sh.mean(dim=-1) > 0.2
-        warped_masks_sh = warped_masks_sh.float().repeat(1, 1, 4, 1, 1)
 
         # To use warped_latents inside the denoising loop, it must be scaled!!!
         # NOTE: The VAE scaling is unnecessary for image_latents
@@ -684,8 +683,11 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
                             )
 
                         # direct pasting
-                        pseudo_x0 = warped_masks_sh * pseudo_x0 + \
-                                    (1 - warped_masks_sh) * (warped_latents[batch_size:] if self.do_classifier_free_guidance else warped_latents)
+                        pseudo_x0 = torch.where(
+                            warped_masks_sh > 0.5,
+                            pseudo_x0,
+                            (warped_latents[batch_size:] if self.do_classifier_free_guidance else warped_latents),
+                        )
 
                         # resampling
                         if j < repaint_iter_num - 1:

@@ -680,7 +680,7 @@ class EulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
 
             index_list = [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24]
 
-            mask = (1-mask) > 0.5  # valid region (1->valid, 0->invalid)
+            mask = mask < 0.5  # valid region (1->valid, 0->invalid)
             if mask.shape[1] == 24:
                 mask_ones = torch.ones_like(mask[:,0:1,:,:,:])
                 mask = torch.cat((mask_ones,mask),1)  # (1, 25, 4, h, w)

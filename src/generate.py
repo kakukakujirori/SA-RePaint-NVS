@@ -18,6 +18,7 @@ from einops import rearrange
 from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection
 
 from scheduling_euler_discrete import EulerDiscreteScheduler
+from unet import MyUNet
 from warp import homography_estimation
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
@@ -649,23 +650,54 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
                         latent_model_input = torch.cat([latent_model_input, image_latents], dim=2)
 
                         # predict the noise residual
-                        noise_pred = self.unet(
-                            latent_model_input,
-                            t,
-                            encoder_hidden_states=image_embeddings,
-                            added_time_ids=added_time_ids,
-                            return_dict=False,
-                        )[0]
+                        if i < self._num_timesteps * 2 // 3:
+                            self.unet.latent_shape_ = (
+                                1,  # 2 if self.do_classifier_free_guidance else 1,
+                                num_frames, 8, height//8, width//8)  # NOTE: image_latents is appended so the channel num is 8
 
-                        # perform guidance
-                        if self.do_classifier_free_guidance:
-                            noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
+                            self.unet.inject(None)
+                            noise_pred_uncond = self.unet(
+                                latent_model_input.split(batch_size, dim=0)[i%2],
+                                t,
+                                encoder_hidden_states=image_embeddings.split(batch_size, dim=0)[i%2],
+                                added_time_ids=added_time_ids.split(batch_size, dim=0)[i%2],
+                                return_dict=False,
+                                record_attention=False,
+                            )[0]
+
+                            self.unet.inject(warped_masks_sh < 0.5)
+                            noise_pred_cond = self.unet(
+                                latent_model_input[batch_size:],
+                                t,
+                                encoder_hidden_states=image_embeddings[batch_size:],
+                                added_time_ids=added_time_ids[batch_size:],
+                                return_dict=False,
+                            )[0]
+
                             noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_cond - noise_pred_uncond)
+
+                        else:
+                            self.unet.latent_shape_ = (
+                                2 if self.do_classifier_free_guidance else 1,
+                                num_frames, 8, height//8, width//8)  # NOTE: image_latents is appended so the channel num is 8
+
+                            self.unet.inject(None)
+                            noise_pred = self.unet(
+                                latent_model_input,
+                                t,
+                                encoder_hidden_states=image_embeddings,
+                                added_time_ids=added_time_ids,
+                                return_dict=False,
+                            )[0]
+
+                            # perform guidance
+                            if self.do_classifier_free_guidance:
+                                noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
+                                noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_cond - noise_pred_uncond)
 
                         # compute the previous noisy sample x_t -> x_t-1
                         out = self.scheduler.step_single(noise_pred, t, latents, None, None, lambda_ts, step_i=i, compute_grad=False)
                         pseudo_x0 = out.pred_original_sample
-                        pred_score = (pseudo_x0 - latents) / self.scheduler.sigmas[i]**2
                         latents = out.prev_sample
 
                         # alignment
@@ -948,6 +980,18 @@ if __name__ == '__main__':
     )
 
     parser.add_argument(
+        "--min_guidance_scale",
+        type=float,
+        default=1.0,
+    )
+
+    parser.add_argument(
+        "--max_guidance_scale",
+        type=float,
+        default=3.0,
+    )
+
+    parser.add_argument(
         "--enable_nvssolver",
         action="store_true",
     )
@@ -998,6 +1042,12 @@ if __name__ == '__main__':
         torch_dtype=torch.float16,
         variant="fp16",
     )
+    pipe.unet = MyUNet.from_pretrained(
+        "stabilityai/stable-video-diffusion-img2vid-xt",
+        subfolder="unet",
+        torch_dtype=torch.float16,
+        variant="fp16",
+    )
     pipe.scheduler = EulerDiscreteScheduler.from_config(pipe.scheduler.config)
     pipe.to(device)
 
@@ -1025,6 +1075,8 @@ if __name__ == '__main__':
         num_frames=args.num_frames,
         decode_chunk_size=8,
         num_inference_steps=args.num_inference_steps,
+        min_guidance_scale=args.min_guidance_scale,
+        max_guidance_scale=args.max_guidance_scale,
         generator=torch.manual_seed(args.seed),
     )
     frames = svd_output.frames[0]

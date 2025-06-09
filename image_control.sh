@@ -1,6 +1,6 @@
-ITEM=2a16f82a29b2fa17_51433333
-CAMERA_MOTION_MODE=zoomout
-DEGREE=0.5
+ITEM=basketball
+CAMERA_MOTION_MODE=horizontal
+DEGREE=1.0
 NUM_FRAMES=25
 
 set -e
@@ -34,4 +34,6 @@ python src/generate.py \
   --num_inference_steps 50 \
   --denoise_start_step 16 \
   --repaint_iter_num 2 \
+  --min_guidance_scale 3.0 \
+  --max_guidance_scale 5.0 \
   --seed 12345

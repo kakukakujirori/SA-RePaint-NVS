@@ -8,10 +8,12 @@ import subprocess
 import tempfile
 from itertools import product
 
+import lpips
 import numpy as np
 import torch
 import torch_fidelity
-from diffusers.utils import load_video
+from diffusers.utils import load_image, load_video
+from torchmetrics.image import PeakSignalNoiseRatio
 
 from src.eval_trajectories import eval_trajectories
 
@@ -19,9 +21,9 @@ from src.eval_trajectories import eval_trajectories
 mannequin_challenge_input_root = "./mannequin_challenge_input"
 mannequin_challenge_output_root = "./mannequin_challenge_output"
 NUM_FRAMES = 25
-NUM_INFERECE_STEPS = 25
+NUM_INFERECE_STEPS = 50
 DENOISE_START_STEP = NUM_INFERECE_STEPS // 3
-REPAINT_ITER_NUM = 5
+REPAINT_ITER_NUM = 2
 MOTION_MODES = ["horizontal", "vertical", "zoomout"]
 DEGREE_LIST = [-1.0, -0.5, 0.5, 1.0]
 MOTION_DEGREE_PAIRS = [x for x in product(MOTION_MODES, DEGREE_LIST) if x not in [('vertical', -1.0), ('vertical', 1.0)]]
@@ -53,7 +55,6 @@ def reorganize_frames(mannequin_challenge_data_root: str):
             cnt += 1
 
         print(f"[extract_frames] Finished reorganizing '{split}' ({cnt}/{len(os.listdir(split_root))})")
-
 
 
 def organize_images_and_depth(mannequin_challenge_data_root: str):
@@ -181,6 +182,61 @@ def run_generation_task(scene: str, motion_mode: str, degree: float, gpu_id: int
 
     return msg
 
+
+def run_pixelwise_metrics_calculation(mannequin_challenge_output_root: str):
+    device = "cuda:0"
+    PSNR = PeakSignalNoiseRatio(data_range=1.0).to(device)
+    LPIPS = lpips.LPIPS(net='alex', spatial=True).to(device).eval()
+
+    total_results = {}
+    missing = []
+    for scene in sorted(os.listdir(mannequin_challenge_output_root)):
+        scene_path = os.path.join(mannequin_challenge_output_root, scene)
+        if not os.path.isdir(scene_path):
+            continue
+        for motion_degree in os.listdir(scene_path):
+            data_dir = os.path.join(mannequin_challenge_output_root, scene, motion_degree)
+            assert os.path.isdir(data_dir)
+
+            if not os.path.isdir(os.path.join(data_dir, "generated")):
+                print(f"Missing {os.path.join(data_dir, 'generated')}")
+                missing.append(data_dir)
+                continue
+
+            # load warped frames and generated frames
+            mask_frames = [load_image(os.path.join(data_dir, "warped", f"{i:04d}_mask.png")) for i in range(NUM_FRAMES)]
+            warped_frames = [load_image(os.path.join(data_dir, "warped", f"{i:04d}.png")) for i in range(NUM_FRAMES)]
+            generated_frames = [load_image(os.path.join(data_dir, "generated", f"{i:04d}.png")) for i in range(NUM_FRAMES)]
+
+            # batchfy the frames
+            mask_tensor = torch.stack([torch.from_numpy(np.array(x).astype(np.float32) / 255.0).permute(2, 0, 1) for x in mask_frames], dim=0).to(device)
+            warped_tensor = torch.stack([torch.from_numpy(np.array(x).astype(np.float32) / 255.0).permute(2, 0, 1) for x in warped_frames], dim=0).to(device)
+            generated_tensor = torch.stack([torch.from_numpy(np.array(x).astype(np.float32) / 255.0).permute(2, 0, 1) for x in generated_frames], dim=0).to(device)
+
+            # binarize the mask
+            mask_tensor_bool = mask_tensor < 0.5
+            mask_tensor_float = mask_tensor_bool.float().mean(dim=1, keepdim=True)
+
+            # calculate psnr, lpips (NOTE: image range is [-1, 1] for LPIPS)
+            results = {}
+            with torch.no_grad():
+                results["psnr"] = PSNR(warped_tensor[mask_tensor_bool], generated_tensor[mask_tensor_bool])
+
+                lpips_full = LPIPS(warped_tensor * 2 - 1, generated_tensor * 2 - 1)
+                results["lpips"] = torch.sum(lpips_full * mask_tensor_float) / torch.sum(mask_tensor_float)
+
+            total_results[data_dir] = results
+
+    total_psnr_mean = sum([result["psnr"] for result in total_results.values()]) / len(total_results)
+    total_lpips_mean = sum([result["lpips"] for result in total_results.values()]) / len(total_results)
+    print(f"Total PSNR Mean: {total_psnr_mean}")
+    print(f"Total LPIPS Mean: {total_lpips_mean}")
+    print(f"Missing dirs: {len(missing)}")
+    total_results["total_psnr_mean"] = total_psnr_mean
+    total_results["total_lpips_mean"] = total_lpips_mean
+    total_results["missing_dirs"] = missing
+
+    return total_results, missing
 
 def run_fid_calculation(
         mannequin_challenge_data_root: str,
@@ -355,7 +411,12 @@ if __name__ == '__main__':
                     print(f"Main loop caught exception for {task_desc}: {exc}")
                     raise exc
 
-        # 4. FID calculation
+        # 4. Pixelwise metrics calculation
+        pixelwise_results, _ = run_pixelwise_metrics_calculation(mannequin_challenge_output_root)
+        with open(os.path.join(mannequin_challenge_output_root, "pixelwise_results.txt"), "w") as f:
+            json.dump(pixelwise_results, f, indent=4)
+
+        # 5. FID calculation
         fid = run_fid_calculation(
             mannequin_challenge_data_root=args.data_root,
             mannequin_challenge_output_root=mannequin_challenge_output_root,
@@ -363,7 +424,7 @@ if __name__ == '__main__':
         with open(os.path.join(mannequin_challenge_output_root, "fid.txt"), "w") as f:
             f.write(str(fid))
 
-        # 5. Camera pose error calculation
+        # 6. Camera pose error calculation
         camera_pose_results, _ = run_camera_pose_error_calculation(mannequin_challenge_output_root)
         with open(os.path.join(mannequin_challenge_output_root, "camera_pose_results.txt"), "w") as f:
             json.dump(camera_pose_results, f, indent=4)

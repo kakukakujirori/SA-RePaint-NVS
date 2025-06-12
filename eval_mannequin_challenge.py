@@ -17,6 +17,7 @@ from diffusers.utils import load_image, load_video
 from torchmetrics.image import PeakSignalNoiseRatio
 
 from src.eval_trajectories import eval_trajectories
+from src.eval_sed import eval_sed
 
 
 mannequin_challenge_input_root = "./mannequin_challenge_input"
@@ -366,6 +367,46 @@ def run_camera_pose_error_calculation(mannequin_challenge_output_root: str, gt_f
     return total_results, missing_videos
 
 
+def run_sed_calculation(mannequin_challenge_output_root: str):
+    missing = []
+    total_results = {}
+    for scene in tqdm(os.listdir(mannequin_challenge_output_root), desc="Calculating SED"):
+        scene_path = os.path.join(mannequin_challenge_output_root, scene)
+        if not os.path.isdir(scene_path):
+            continue
+        for motion_degree in os.listdir(scene_path):
+            data_dir = os.path.join(mannequin_challenge_output_root, scene, motion_degree)
+            assert os.path.isdir(data_dir)
+            video_path = os.path.join(data_dir, "generated/generated.mp4")
+            camera_paths = os.path.join(data_dir, "warped/*_pose.npy")
+            poses = [np.load(p) for p in sorted(glob.glob(camera_paths))]
+
+            with tempfile.TemporaryDirectory() as colmap_root:
+                consistent_ratios, sed_summary = eval_sed(
+                    colmap_root=colmap_root,
+                    video_path=video_path,
+                    poses=poses,
+                    gt_focal_len=260.0,
+                    save_sed_graph_to=None,
+                )
+                total_results[data_dir] = consistent_ratios
+
+    total_consistent_ratios = {}
+    for result in total_results.values():
+        for key, value in result.items():
+            if key not in total_consistent_ratios:
+                total_consistent_ratios[key] = 0
+            total_consistent_ratios[key] += value
+    for key in total_consistent_ratios:
+        total_consistent_ratios[key] /= len(total_results)
+        print(f"Total SED Mean (threshold {key:.2f}): {total_consistent_ratios[key]:.3f}")
+
+    total_results["total_sed_mean"] = total_consistent_ratios
+    total_results["missing_videos"] = missing
+
+    return total_results, missing
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Mannequin Challenge Evaluation")
     parser.add_argument("--data_root", type=str, default="/home/ryotaro/data/MannequinChallengeHQ/validation_frames")
@@ -458,6 +499,10 @@ if __name__ == '__main__':
         with open(os.path.join(mannequin_challenge_output_root, "camera_pose_results.txt"), "w") as f:
             json.dump(camera_pose_results, f, indent=4)
 
+        # 7. SED calculation
+        sed_results = run_sed_calculation(mannequin_challenge_output_root)
+        with open(os.path.join(mannequin_challenge_output_root, "sed.txt"), "w") as f:
+            json.dump(sed_results, f, indent=4)
 
     except KeyboardInterrupt:
         print("Caught KeyboardInterrupt, shutting down.")

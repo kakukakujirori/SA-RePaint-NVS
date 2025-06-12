@@ -108,7 +108,8 @@ def homography_estimation(
         max_iters: int = 100,
         num_control_points: Optional[int] = None,
         fix_first_frame: bool = True,
-        acceleration_penalty_weight: float = 0.1,  # regularization to prevent erratic warp
+        acceleration_penalty_weight: float = 0.5,  # regularization to prevent erratic warp
+        padding_mode: str = "border",
     ):
     batch, num_frames, channel, height, width = frames_src.shape
     assert frames_src.shape == frames_dst.shape, f"{frames_src.shape=}"
@@ -175,7 +176,7 @@ def homography_estimation(
             frames_src.flatten(0, 1),
             M,
             dsize=(height, width),
-            padding_mode="border",
+            padding_mode=padding_mode,
         ).reshape_as(frames_src)
 
     return M, src_warped

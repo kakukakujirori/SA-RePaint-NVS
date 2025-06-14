@@ -3,6 +3,7 @@ import argparse
 import inspect
 import os
 from dataclasses import dataclass
+from tqdm import tqdm
 
 import numpy as np
 import PIL
@@ -400,7 +401,6 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
     def __call__(
         self,
         enable_nvssolver: bool,
-        enable_resample: bool,
         warped_images: List[PIL.Image.Image],
         warped_masks: List[PIL.Image.Image],
         denoise_start_step: Optional[int],
@@ -477,13 +477,13 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
         with torch.no_grad():
             warped_latents = []
             for img in warped_images:
-                warped_latent =  self._encode_vae_image(
+                warped_latent_ =  self._encode_vae_image(
                     img.unsqueeze(0),
                     device=device,
                     num_videos_per_prompt=num_videos_per_prompt,
                     do_classifier_free_guidance=self.do_classifier_free_guidance,
                 ) # [2, 4, 72, 128]
-                warped_latents.append(warped_latent.unsqueeze(1))
+                warped_latents.append(warped_latent_.unsqueeze(1))
 
         warped_latents = torch.cat(warped_latents, dim=1).to(image_embeddings.dtype)
 
@@ -499,6 +499,22 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
         warped_masks = [torch.from_numpy(np.array(msk).mean(axis=-1) > 128).float() for msk in warped_masks]
         warped_masks = torch.stack(warped_masks, dim=0).to(device)
         warped_masks = rearrange(warped_masks, "f h w -> () f () h w")
+
+
+
+
+
+
+        from kornia.morphology import dilation
+        print(f"Warning: warped_masks dilated!!!")
+        warped_masks = rearrange(warped_masks, "() f () h w -> f () h w")
+        warped_masks = dilation(warped_masks, kernel=torch.ones((7,7), device=device, dtype=warped_masks.dtype))
+        warped_masks = rearrange(warped_masks, "f () h w -> () f () h w")
+
+
+
+
+
 
         warped_masks_sh = rearrange(warped_masks, "() f () (nh ph) (nw pw) -> () f () nh nw (ph pw)", ph=8, pw=8)
         warped_masks_sh = warped_masks_sh.mean(dim=-1) > 0.2
@@ -640,8 +656,9 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
 
 
                 with torch.no_grad():
-                    latents_ori = latents.clone()
                     for j in range(repaint_iter_num):
+                        latents_ori = latents.clone()
+
                         # expand the latents if we are doing classifier free guidance
                         latent_model_input = torch.cat([latents] * 2) if self.do_classifier_free_guidance else latents
                         latent_model_input = self.scheduler.scale_model_input(latent_model_input, t, step_i=i)
@@ -702,17 +719,25 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
 
                         # alignment
                         if i < self._num_timesteps // 2:
-                            _, pseudo_x0 = homography_estimation(
+                            M, pseudo_x0 = homography_estimation(
                                 pseudo_x0,
                                 warped_latents[batch_size:] if self.do_classifier_free_guidance else warped_latents,
-                                warped_masks_sh[:, :, 0:1, :, :] < 0.5,
+                                warped_masks_sh < 0.5,
                                 process_size=128,
                                 lr=1e-2,
                                 max_iters=100,
                                 num_control_points=num_frames//3,
                                 fix_first_frame=True,
                                 acceleration_penalty_weight=0.5,
+                                padding_mode="border",
                             )
+                            from kornia.geometry.transform.imgwarp import homography_warp
+                            latents = homography_warp(
+                                latents.flatten(0, 1).float(),
+                                M,
+                                dsize=latents.shape[-2:],
+                                padding_mode="reflection",
+                            ).reshape_as(latents).to(latents.dtype)
 
                         # direct pasting
                         pseudo_x0 = torch.where(
@@ -720,90 +745,50 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
                             pseudo_x0,
                             (warped_latents[batch_size:] if self.do_classifier_free_guidance else warped_latents),
                         )
+                        warped_latents_noisy = warped_latents + self.scheduler.sigmas[i+1] * randn_tensor(
+                            warped_latents.shape, generator=generator, device=warped_latents.device, dtype=warped_latents.dtype)
+                        latents = torch.where(
+                            warped_masks_sh > 0.5,
+                            latents,
+                            warped_latents_noisy[batch_size:] if self.do_classifier_free_guidance else warped_latents_noisy,
+                        )
+
 
                         # resampling
                         if j < repaint_iter_num - 1:
 
-                            opt_std = 0.5 #self.scheduler.sigmas[i] / self.scheduler.sigmas[0]
-                            current_sigma = self.scheduler.sigmas[i]
-                            posterior_sigma = current_sigma**2 / opt_std
-                            latents = self.stochastic_resample(
-                                opt_z0=pseudo_x0,
-                                zt=latents_ori,
-                                current_sigma=current_sigma,
-                                posterior_sigma=posterior_sigma,
-                                generator=generator,
-                            )
+                            if i < self._num_timesteps * 2 // 3:
+                                opt_std = 0.5
+                                posterior_sigma = self.scheduler.sigmas[i]**2 / opt_std
+                                latents = self.stochastic_resample(
+                                    opt_zs=pseudo_x0,
+                                    ori_zt=latents_ori,
+                                    sigma_s=0,
+                                    sigma_t=self.scheduler.sigmas[i],
+                                    posterior_sigma=posterior_sigma,
+                                    generator=generator,
+                                )
+                            else:
+                                opt_std = 0.5
+                                posterior_sigma = self.scheduler.sigmas[i]**2 / opt_std
+                                latents = self.stochastic_resample(
+                                    opt_zs=latents,
+                                    ori_zt=latents_ori,
+                                    sigma_s=self.scheduler.sigmas[i+1],
+                                    sigma_t=self.scheduler.sigmas[i],
+                                    posterior_sigma=posterior_sigma,
+                                    generator=generator,
+                                )
+
                             latents = latents.half()
 
-                    del latents_ori
+                        del latents_ori
+
                     torch.cuda.empty_cache()
 
 
                 # os.makedirs("dump", exist_ok=True)
                 # torch.save(pseudo_x0, f"dump/latents_with_resample_{i}.pt")
-
-
-
-                # ReSample
-                if enable_resample and self._num_timesteps // 3 <= i < self._num_timesteps // 2:
-                    if i % 1 == 0:
-                        print(f"{i=}: ReSample optimization start!!!")
-
-                        # from latent to pixel
-                        self.vae.to(dtype=torch.float32 if needs_upcasting else None, device=device)
-                        with torch.no_grad():
-                            pseudo_x0_pixel = self.decode_latents(pseudo_x0, num_frames, decode_chunk_size, permute=False)  # Get \hat{x}_0 into pixel space
-
-                        # alignment
-                        if i < self._num_timesteps // 2:
-                            _, opt_var_aligned = homography_estimation(
-                                pseudo_x0_pixel,
-                                warped_images,
-                                warped_masks < 0.5,
-                                process_size=128,
-                                lr=1e-2,
-                                max_iters=100,
-                                num_control_points=num_frames//3,
-                                fix_first_frame=True,
-                                acceleration_penalty_weight=0.5,
-                            )
-                        else:
-                            opt_var_aligned = pseudo_x0_pixel
-
-                        # Directly paste the measurement into the opt_var_aligned
-                        opt_var_modified = torch.where(warped_masks < 0.5, warped_images, opt_var_aligned)
-                        opt_var_modified = rearrange(opt_var_modified, "() f c h w -> f c h w", f=num_frames, c=3)
-
-                        # from pixel to latent
-                        self.vae.to(dtype=torch.float32 if needs_upcasting else None, device=device)
-                        with torch.no_grad():
-
-                            opt_latents_list = []
-                            for j in range(opt_var_modified.shape[0]):
-                                opt_latents_ = self._encode_vae_image(opt_var_modified[j:j+1,:,:,:], device, num_videos_per_prompt, do_classifier_free_guidance=False) # [12, 4, 72, 128]
-                                opt_latents_ *= self.vae.config.scaling_factor
-                                opt_latents_ = rearrange(opt_latents_, "(b f) c h w -> b f c h w", b=1)
-                                opt_latents_list.append(opt_latents_)
-
-                        opt_latents = torch.cat(opt_latents_list, dim=1)
-
-                        # resample
-                        opt_std = 0.5  # self.scheduler.sigmas[i + 1] / self.scheduler.sigmas[0]
-                        current_sigma = self.scheduler.sigmas[i + 1]
-                        posterior_sigma = current_sigma**2 / opt_std
-                        latents = self.stochastic_resample(
-                            opt_z0=opt_latents,
-                            zt=latents.detach().clone().float(),
-                            current_sigma=current_sigma,
-                            posterior_sigma=posterior_sigma,
-                            generator=generator,
-                        )
-                        latents = latents.half()
-
-                        del pseudo_x0_pixel, opt_var_aligned, opt_var_modified, opt_latents
-                        torch.cuda.empty_cache()
-
 
 
                 if callback_on_step_end is not None:
@@ -840,35 +825,38 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
 
     def stochastic_resample(
             self,
-            opt_z0: torch.Tensor,
-            zt: torch.Tensor,
-            current_sigma: float,
-            posterior_sigma: float,
-            noise: Optional[torch.Tensor] = None,
+            opt_zs: torch.Tensor,
+            ori_zt: Optional[torch.Tensor],
+            sigma_s: float,
+            sigma_t: float,
+            posterior_sigma: float = torch.inf,
             generator: Optional[torch.Generator] = None,
         ):
         """
-        Function to resample x_t based on the ReSample paper.
+        Function to resample z_t based on the ReSample paper.
         The formulation is translated from VP to VE to adapt to SVD.
 
         Arguments:
-            opt_z0: hat{z}_0(y)
-            zt: z'_t
-            current_sigma: current noise level. Following the EDM formulation, this is equivalent to the timestep
-            posterior_sigma: p(z'_t | hat{z}_t, hat{z}_0(y), y) ~ N(hat{z}_t, posterior_sigma)
+            opt_zs: hat{z}_s(y)
+            ori_zt: z'_t
+            sigma_s: The noise level of opt_zs.
+            sigma_t: The noise level of ori_zt.
+            posterior_sigma: p(z'_t | hat{z}_t, hat{z}_s, y) ~ N(hat{z}_s(y), posterior_sigma)
         """
-        if noise is not None:
-            assert noise.shape == opt_z0.shape
-            noise = noise.to(opt_z0)
-        else:
-            noise = randn_tensor(opt_z0.shape, generator=generator, device=opt_z0.device, dtype=opt_z0.dtype)
+        assert 0 <= sigma_s <= sigma_t, f"{sigma_s=}, {sigma_t=}"
+        noise = randn_tensor(opt_zs.shape, generator=generator, device=opt_zs.device, dtype=opt_zs.dtype)
 
-        t_squared = current_sigma ** 2
+        t_squared_minus_s_squared = sigma_t ** 2 - sigma_s ** 2
         post_sigma_squared = posterior_sigma ** 2
 
-        denom = t_squared + post_sigma_squared
-        mean = (post_sigma_squared / denom) * opt_z0 + (t_squared / denom) * zt
-        std = 1 / torch.sqrt(1 / post_sigma_squared + 1 / t_squared)
+        if posterior_sigma == torch.inf:
+            return opt_zs + noise * t_squared_minus_s_squared**0.5
+        else:
+            assert ori_zt is not None
+
+        denom = post_sigma_squared + t_squared_minus_s_squared
+        mean = (post_sigma_squared / denom) * opt_zs + (t_squared_minus_s_squared / denom) * ori_zt
+        std = posterior_sigma * torch.sqrt(t_squared_minus_s_squared / (post_sigma_squared + t_squared_minus_s_squared))
         return mean + noise * std
 
 
@@ -997,11 +985,6 @@ if __name__ == '__main__':
     )
 
     parser.add_argument(
-        "--enable_resample",
-        action="store_true",
-    )
-
-    parser.add_argument(
         "--denoise_start_step",
         type=int,
         default=None,
@@ -1053,7 +1036,7 @@ if __name__ == '__main__':
 
     # calculate lambda
     sigma_list = np.load(f'sigmas/sigmas_{args.num_inference_steps}.npy').tolist()
-    lambda_ts = search_hypers(sigma_list, args.num_frames)
+    lambda_ts = search_hypers(sigma_list, args.num_frames) if args.enable_nvssolver else []
     lambda_ts = torch.tensor(lambda_ts)
 
     # load images
@@ -1063,7 +1046,6 @@ if __name__ == '__main__':
     # inference
     svd_output = pipe(
         enable_nvssolver=args.enable_nvssolver,
-        enable_resample=args.enable_resample,
         warped_images=warped_images,
         warped_masks=warped_masks,
         denoise_start_step=args.denoise_start_step,  # IMPORTANT!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!

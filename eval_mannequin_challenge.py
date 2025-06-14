@@ -155,7 +155,6 @@ def run_generation_task(scene: str, motion_mode: str, degree: float, gpu_id: int
             "--num_frames", f"{NUM_FRAMES}",
             "--num_inference_steps", f"{NUM_INFERECE_STEPS}",
             # "--enable_nvssolver",
-            # "--enable_resample",
             "--denoise_start_step", f"{DENOISE_START_STEP}",
             "--repaint_iter_num", f"{REPAINT_ITER_NUM}",
             "--min_guidance_scale", "3.0",
@@ -409,7 +408,7 @@ def run_sed_calculation(mannequin_challenge_output_root: str):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Mannequin Challenge Evaluation")
-    parser.add_argument("--data_root", type=str, default="/home/ryotaro/data/MannequinChallengeHQ/validation_frames")
+    parser.add_argument("--data_root", type=str, default="/media/ryotaro/ssd1/MannequinChallengeHQ/validation_frames")
     parser.add_argument("--scratch", action="store_true", help="If set, all the images, depth, and trajectories are re-organized and re-generated.")
     args = parser.parse_args()
 

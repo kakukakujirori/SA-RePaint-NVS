@@ -56,8 +56,9 @@ class MyUNet(UNetSpatioTemporalConditionModel):
         w = self.latent_shape_[-1] // compress_factor
 
         if mask is not None:
+            assert mask.shape[-3:] == (1,) + self.latent_shape_[-2:], f"{mask.shape=}, {self.latent_shape_=}"
+            assert mask.dtype == torch.bool, f"{mask.dtype=}, expects torch.bool"
             mask = rearrange(mask, "batch num_frames () height width -> (batch num_frames) () height width")
-            assert mask.shape[-2:] == self.latent_shape_[-2:], f"{mask.shape=}, {self.latent_shape_=}"
             mask = F.interpolate(mask.float(), size=(h, w), mode="area") > 0.5
             mask = rearrange(mask, "bf () h w -> bf () () (h w)")
 

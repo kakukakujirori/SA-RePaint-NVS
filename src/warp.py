@@ -113,7 +113,7 @@ def homography_estimation(
     ):
     batch, num_frames, channel, height, width = frames_src.shape
     assert frames_src.shape == frames_dst.shape, f"{frames_src.shape=}"
-    assert frames_dst_mask.shape == (batch, num_frames, 1, height, width), f"{frames_dst_mask.shape=}"
+    assert frames_dst_mask.shape == (batch, num_frames, 1, height, width) or frames_dst_mask.shape == (batch, num_frames, channel, height, width), f"{frames_dst_mask.shape=}"
 
     # flatten -> resize -> unflatten
     shrink_scale = process_size / max(height, width)

@@ -739,48 +739,73 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
                                 padding_mode="reflection",
                             ).reshape_as(latents).to(latents.dtype)
 
-                        # direct pasting
-                        pseudo_x0 = torch.where(
-                            warped_masks_sh > 0.5,
-                            pseudo_x0,
-                            (warped_latents[batch_size:] if self.do_classifier_free_guidance else warped_latents),
-                        )
-                        warped_latents_noisy = warped_latents + self.scheduler.sigmas[i+1] * randn_tensor(
-                            warped_latents.shape, generator=generator, device=warped_latents.device, dtype=warped_latents.dtype)
-                        latents = torch.where(
-                            warped_masks_sh > 0.5,
-                            latents,
-                            warped_latents_noisy[batch_size:] if self.do_classifier_free_guidance else warped_latents_noisy,
-                        )
-
-
                         # resampling
                         if j < repaint_iter_num - 1:
 
-                            if i < self._num_timesteps * 2 // 3:
-                                opt_std = 0.5
-                                posterior_sigma = self.scheduler.sigmas[i]**2 / opt_std
-                                latents = self.stochastic_resample(
-                                    opt_zs=pseudo_x0,
-                                    ori_zt=latents_ori,
-                                    sigma_s=0,
-                                    sigma_t=self.scheduler.sigmas[i],
-                                    posterior_sigma=posterior_sigma,
-                                    generator=generator,
-                                )
+                            # deduce optimal sigma_s for RePaint
+                            var_latents_ori, cov_latents_ori_pseudo_x0, _, var_pseudo_x0 = \
+                                torch.cov(torch.stack([latents_ori.flatten(), pseudo_x0.flatten()])).flatten()
+                            var_data = warped_latents[batch_size:, 0:1].var()
+                            coeff_A = var_latents_ori - 2 * cov_latents_ori_pseudo_x0 + var_pseudo_x0 - self.scheduler.sigmas[i]**2
+                            coeff_B = var_pseudo_x0 - cov_latents_ori_pseudo_x0
+                            coeff_C = (var_pseudo_x0 - var_data) * self.scheduler.sigmas[i]**2
+                            discriminant = max(0, coeff_B**2 - coeff_A * coeff_C)
+                            EPS = 1e-12
+                            if torch.abs(coeff_A) > EPS:
+                                s0 = (coeff_B - discriminant**0.5) / coeff_A
+                                s1 = (coeff_B + discriminant**0.5) / coeff_A
+                                s0, s1 = min(s0, s1), max(s0, s1)
+                                s0_is_valid = (0 <= s0 <= self.scheduler.sigmas[i])
+                                s1_is_valid = (0 <= s1 <= self.scheduler.sigmas[i])
+
+                                if s0_is_valid and s1_is_valid:
+                                    sigma_s = min(s0, s1)
+                                elif s0_is_valid:
+                                    sigma_s = s0
+                                elif s1_is_valid:
+                                    sigma_s = s1
+                                else:
+                                    if s1 < 0:
+                                        sigma_s = 0
+                                    elif s0 > self.scheduler.sigmas[i]:
+                                        sigma_s = self.scheduler.sigmas[i]
+                                    else:
+                                        sigma_s = 0 if 0 - s0 < s1 - self.scheduler.sigmas[i] else self.scheduler.sigmas[i]
                             else:
-                                opt_std = 0.5
-                                posterior_sigma = self.scheduler.sigmas[i]**2 / opt_std
-                                latents = self.stochastic_resample(
-                                    opt_zs=latents,
-                                    ori_zt=latents_ori,
-                                    sigma_s=self.scheduler.sigmas[i+1],
-                                    sigma_t=self.scheduler.sigmas[i],
-                                    posterior_sigma=posterior_sigma,
-                                    generator=generator,
-                                )
+                                sigma_s = coeff_C / (2 * coeff_B) if torch.abs(coeff_B) > EPS else 0
+
+                            # direct pasting
+                            latents_mid = (sigma_s / self.scheduler.sigmas[i]) * latents_ori + (1 - sigma_s / self.scheduler.sigmas[i]) * pseudo_x0
+                            warped_latents_noisy = warped_latents + sigma_s * randn_tensor(
+                                warped_latents.shape, generator=generator, device=warped_latents.device, dtype=warped_latents.dtype)
+                            latents_mid = torch.where(
+                                warped_masks_sh > 0.5,
+                                latents_mid,
+                                warped_latents_noisy[batch_size:] if self.do_classifier_free_guidance else warped_latents_noisy,
+                            )
+
+                            opt_std = 0.5
+                            posterior_sigma = self.scheduler.sigmas[i]**2 / opt_std
+                            latents = self.stochastic_resample(
+                                opt_zs=latents_mid,
+                                ori_zt=latents_ori,
+                                sigma_s=sigma_s,
+                                sigma_t=self.scheduler.sigmas[i],
+                                posterior_sigma=posterior_sigma,
+                                generator=generator,
+                            )
 
                             latents = latents.half()
+
+                        else:
+                            # direct pasting
+                            warped_latents_noisy = warped_latents + self.scheduler.sigmas[i+1] * randn_tensor(
+                                warped_latents.shape, generator=generator, device=warped_latents.device, dtype=warped_latents.dtype)
+                            latents = torch.where(
+                                warped_masks_sh > 0.5,
+                                latents,
+                                warped_latents_noisy[batch_size:] if self.do_classifier_free_guidance else warped_latents_noisy,
+                            )
 
                         del latents_ori
 

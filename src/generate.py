@@ -726,64 +726,91 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
                         # resampling
                         if j < repaint_iter_num - 1:
 
-                            # deduce optimal sigma_s for RePaint
-                            var_latents_ori, cov_latents_ori_pseudo_x0, _, var_pseudo_x0 = \
-                                torch.cov(torch.stack([latents_ori.flatten(), pseudo_x0.flatten()])).flatten()
+                            sigma_t = self.scheduler.sigmas[i]
                             var_data = warped_latents[batch_size:, 0:1].var()
-                            coeff_A = var_latents_ori - 2 * cov_latents_ori_pseudo_x0 + var_pseudo_x0 - self.scheduler.sigmas[i]**2
-                            coeff_B = var_pseudo_x0 - cov_latents_ori_pseudo_x0
-                            coeff_C = (var_pseudo_x0 - var_data) * self.scheduler.sigmas[i]**2
-                            discriminant = max(0, coeff_B**2 - coeff_A * coeff_C)
-                            EPS = 1e-12
-                            if torch.abs(coeff_A) > EPS:
-                                s0 = (coeff_B - discriminant**0.5) / coeff_A
-                                s1 = (coeff_B + discriminant**0.5) / coeff_A
-                                s0, s1 = min(s0, s1), max(s0, s1)
-                                s0_is_valid = (0 <= s0 <= self.scheduler.sigmas[i])
-                                s1_is_valid = (0 <= s1 <= self.scheduler.sigmas[i])
 
-                                if s0_is_valid and s1_is_valid:
-                                    sigma_s = min(s0, s1)
-                                elif s0_is_valid:
-                                    sigma_s = s0
-                                elif s1_is_valid:
-                                    sigma_s = s1
-                                else:
-                                    if s1 < 0:
-                                        sigma_s = 0
-                                    elif s0 > self.scheduler.sigmas[i]:
-                                        sigma_s = self.scheduler.sigmas[i]
-                                    else:
-                                        sigma_s = 0 if 0 - s0 < s1 - self.scheduler.sigmas[i] else self.scheduler.sigmas[i]
+                            if i < self._num_timesteps * 2 // 3:
+                                sigma_s = 0
                             else:
-                                sigma_s = coeff_C / (2 * coeff_B) if torch.abs(coeff_B) > EPS else 0
+                                # deduce optimal sigma_s for RePaint
+                                var_latents_ori, cov_latents_ori_pseudo_x0, _, var_pseudo_x0 = \
+                                    torch.cov(torch.stack([latents_ori.flatten(), pseudo_x0.flatten()])).flatten()
+                                coeff_A = var_latents_ori - 2 * cov_latents_ori_pseudo_x0 + var_pseudo_x0 - sigma_t**2
+                                coeff_B = (var_pseudo_x0 - cov_latents_ori_pseudo_x0) * sigma_t
+                                coeff_C = (var_pseudo_x0 - var_data) * sigma_t**2
+                                discriminant = coeff_B**2 - coeff_A * coeff_C
+                                EPS = 1e-12
+                                if torch.abs(coeff_A) > EPS:
+                                    if discriminant >= 0:
+                                        s0 = (coeff_B - discriminant**0.5) / coeff_A
+                                        s1 = (coeff_B + discriminant**0.5) / coeff_A
+                                        s0, s1 = min(s0, s1), max(s0, s1)
+                                        s0_is_valid = (0 <= s0 <= sigma_t)
+                                        s1_is_valid = (0 <= s1 <= sigma_t)
+
+                                        if s0_is_valid and s1_is_valid:
+                                            sigma_s = min(s0, s1)
+                                        elif s0_is_valid:
+                                            sigma_s = s0
+                                        elif s1_is_valid:
+                                            sigma_s = s1
+                                        else:
+                                            if s1 < 0:
+                                                sigma_s = 0
+                                            elif s0 > sigma_t:
+                                                sigma_s = sigma_t
+                                            else:
+                                                sigma_s = 0 if 0 - s0 < s1 - sigma_t else sigma_t
+                                    else:
+                                        s = coeff_B / coeff_A
+                                        if s < 0:
+                                            sigma_s = 0
+                                        elif sigma_t < s:
+                                            sigma_s = sigma_t
+                                        else:
+                                            sigma_s = s
+                                else:
+                                    sigma_s = coeff_C / (2 * coeff_B) if torch.abs(coeff_B) > EPS else 0
+
+
+                                print(f"{sigma_s=}, {sigma_t=}")
+
 
                             # direct pasting
-                            latents_mid = (sigma_s / self.scheduler.sigmas[i]) * latents_ori + (1 - sigma_s / self.scheduler.sigmas[i]) * pseudo_x0
+                            latents_mid = (sigma_s / sigma_t) * latents_ori + (1 - sigma_s / sigma_t) * pseudo_x0
                             warped_latents_noisy = warped_latents + sigma_s * randn_tensor(
                                 warped_latents.shape, generator=generator, device=warped_latents.device, dtype=warped_latents.dtype)
-                            latents_mid = torch.where(
-                                warped_masks_sh > 0.5,
-                                latents_mid,
-                                warped_latents_noisy[batch_size:] if self.do_classifier_free_guidance else warped_latents_noisy,
-                            )
+                            latents_mid_pasted = warped_masks_sh * latents_mid + \
+                                        (1 - warped_masks_sh) * (warped_latents_noisy[batch_size:] if self.do_classifier_free_guidance else warped_latents_noisy)
 
                             opt_std = 0.5
-                            posterior_sigma = self.scheduler.sigmas[i]**2 / opt_std
+                            posterior_sigma = sigma_t**2 / opt_std
                             latents = self.stochastic_resample(
-                                opt_zs=latents_mid,
+                                opt_zs=latents_mid_pasted,
                                 ori_zt=latents_ori,
                                 sigma_s=sigma_s,
-                                sigma_t=self.scheduler.sigmas[i],
+                                sigma_t=sigma_t,
                                 posterior_sigma=posterior_sigma,
                                 generator=generator,
                             )
+
+
+                            print(f"{latents_ori.var().item()=}, {(var_data + sigma_t**2).item()=}")
+                            print(f"{pseudo_x0.var().item()=}, {var_data.item()=}")
+                            print(f"{latents_mid.var().item()=}, {(var_data + sigma_s**2).item()=}")
+                            print(f"{latents_mid_pasted.var().item()=}")
+                            print(f"{latents.var().item()=}, {(var_data + sigma_t**2).item()=}")
+                            print()
+
+
+
+
                         else:
                             # direct pasting
                             warped_latents_noisy = warped_latents + self.scheduler.sigmas[i+1] * randn_tensor(
                                 warped_latents.shape, generator=generator, device=warped_latents.device, dtype=warped_latents.dtype)
-                            latents = warped_masks_sh * latents + \
-                                        (1 - warped_masks_sh) * (warped_latents_noisy[batch_size:] if self.do_classifier_free_guidance else warped_latents_noisy)
+                            # latents = warped_masks_sh * latents + \
+                            #             (1 - warped_masks_sh) * (warped_latents_noisy[batch_size:] if self.do_classifier_free_guidance else warped_latents_noisy)
 
                         latents = latents.half()
 

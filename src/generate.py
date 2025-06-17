@@ -16,6 +16,8 @@ from diffusers.utils.torch_utils import is_compiled_module, randn_tensor
 from diffusers.video_processor import VideoProcessor
 from diffusers.pipelines import DiffusionPipeline
 from einops import rearrange
+from jaxtyping import Float
+from kornia.filters import box_blur
 from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection
 
 from scheduling_euler_discrete import EulerDiscreteScheduler
@@ -23,6 +25,89 @@ from unet import MyUNet
 from warp import homography_estimation
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
+
+
+def safe_division(
+        nunom: Float[torch.Tensor, "b c h w"],
+        denom: Float[torch.Tensor, "b c h w"],
+        kernel_size: int = 1,
+        eps: float = 1e-12,
+    ) -> Float[torch.Tensor, "b c h w"]:
+    """
+    Return A/B, assuming that A/B is theoretically a continuous finite function.
+    The solution R is derived as R(p) = argmin_r Σ_{q in W(p)} (A(q) - r * B(q))^2
+    It has an analytical solution: R(p) = (Σ_{q in W(p)} A(q)B(q)) / (Σ_{q in W(p)} B(q)^2)
+    """
+    kernel_size_tupled = (kernel_size * 2 + 1, kernel_size * 2 + 1)
+    sum_numom_denom = box_blur(nunom * denom, kernel_size_tupled)
+    sum_denom_squared = box_blur(denom * denom, kernel_size_tupled)
+    return sum_numom_denom / (sum_denom_squared + eps)
+
+
+def local_covariance(
+        latents_ori: Float[torch.Tensor, "b f c h w"],
+        pseudo_x0: Float[torch.Tensor, "b f c h w"],
+        k: int,
+    ) -> Float[torch.Tensor, "b f 1 h w"]:
+    """
+    Calculates the local covariance map between two tensors over a sliding window.
+
+    Args:
+        latents_ori (torch.Tensor): The first tensor, shape (B, F, C, H, W).
+        pseudo_x0 (torch.Tensor): The second tensor, shape (B, F, C, H, W).
+        k (int): The radius of the square window. The total window size will be (2k+1)x(2k+1).
+
+    Returns:
+        torch.Tensor: A 2D tensor of shape (H, W) where each element (i, j) is the
+                      covariance between the windows of the input tensors centered at (i, j).
+    """
+    # Ensure tensors have the same shape
+    if latents_ori.shape != pseudo_x0.shape:
+        raise ValueError("Input tensors must have the same shape.")
+
+    # Get shapes and define window properties
+    B, num_frames, C, H, W = latents_ori.shape
+    kernel_size = 2 * k + 1
+
+    # The number of elements in each window for a single frame calculation.
+    # This is over channels and the spatial window.
+    n_elements_in_window = C * (kernel_size ** 2)
+
+    # Reshape to treat each frame as an independent item in a large batch.
+    # Shape changes from (B, F, C, H, W) -> (B * F, C, H, W)
+    latents_reshaped = latents_ori.reshape(B * num_frames, C, H, W)
+    pseudo_reshaped = pseudo_x0.reshape(B * num_frames, C, H, W)
+
+    # --- Step 1: Calculate E[X] and E[Y] for each local window ---
+    # `F.avg_pool2d` operates on the (B*F) batch, calculating the spatial mean
+    # for each of the C channels independently.
+    pool_latents = F.avg_pool2d(latents_reshaped, kernel_size=kernel_size, stride=1, padding=k, count_include_pad=False)
+    pool_pseudo = F.avg_pool2d(pseudo_reshaped, kernel_size=kernel_size, stride=1, padding=k, count_include_pad=False)
+    # The shape of pool_latents and pool_pseudo is (B*F, C, H, W).
+
+    # To get the mean over the window (channels + spatial), we average over the channel dim (dim=1).
+    local_mean_latents = torch.mean(pool_latents, dim=1) # Shape: (B*F, H, W)
+    local_mean_pseudo = torch.mean(pool_pseudo, dim=1)  # Shape: (B*F, H, W)
+
+    # --- Step 2: Calculate E[X * Y] for each local window ---
+    product_tensor = latents_reshaped * pseudo_reshaped # Shape: (B*F, C, H, W)
+    pool_product = F.avg_pool2d(product_tensor, kernel_size=kernel_size, stride=1, padding=k, count_include_pad=False)
+    local_mean_product = torch.mean(pool_product, dim=1) # Shape: (B*F, H, W)
+
+    # --- Step 3: Apply the population covariance formula ---
+    local_cov_map = local_mean_product - (local_mean_latents * local_mean_pseudo)
+
+    # --- Step 4: Apply unbiased correction factor ---
+    if n_elements_in_window > 1:
+        correction_factor = n_elements_in_window / (n_elements_in_window - 1)
+        local_cov_map_unbiased = local_cov_map * correction_factor
+    else:
+        local_cov_map_unbiased = local_cov_map
+
+    # --- Step 5: Reshape the output to the desired (B, F, 1, H, W) shape ---
+    final_cov_map = local_cov_map_unbiased.view(B, num_frames, 1, H, W)
+
+    return final_cov_map
 
 
 def _compute_padding(kernel_size):
@@ -732,48 +817,30 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
                             if i < self._num_timesteps * 2 // 3:
                                 sigma_s = 0
                             else:
+                                # os.makedirs("dump", exist_ok=True)
+                                # torch.save(latents_ori, f"dump/latents_ori_{i}_{j}.pt")
+                                # torch.save(pseudo_x0, f"dump/pseudo_x0_{i}_{j}.pt")
+
                                 # deduce optimal sigma_s for RePaint
-                                var_latents_ori, cov_latents_ori_pseudo_x0, _, var_pseudo_x0 = \
-                                    torch.cov(torch.stack([latents_ori.flatten(), pseudo_x0.flatten()])).flatten()
+                                kernel_size = 5
+                                var_latents_ori = local_covariance(latents_ori, latents_ori, k=kernel_size)
+                                var_pseudo_x0 = local_covariance(pseudo_x0, pseudo_x0, k=kernel_size)
+                                cov_latents_ori_pseudo_x0 = local_covariance(latents_ori, pseudo_x0, k=kernel_size)
                                 coeff_A = var_latents_ori - 2 * cov_latents_ori_pseudo_x0 + var_pseudo_x0 - sigma_t**2
                                 coeff_B = (var_pseudo_x0 - cov_latents_ori_pseudo_x0) * sigma_t
                                 coeff_C = (var_pseudo_x0 - var_data) * sigma_t**2
-                                discriminant = coeff_B**2 - coeff_A * coeff_C
-                                EPS = 1e-12
-                                if torch.abs(coeff_A) > EPS:
-                                    if discriminant >= 0:
-                                        s0 = (coeff_B - discriminant**0.5) / coeff_A
-                                        s1 = (coeff_B + discriminant**0.5) / coeff_A
-                                        s0, s1 = min(s0, s1), max(s0, s1)
-                                        s0_is_valid = (0 <= s0 <= sigma_t)
-                                        s1_is_valid = (0 <= s1 <= sigma_t)
+                                nunom = coeff_B - torch.sqrt(torch.relu(coeff_B.pow(2) - coeff_A * coeff_C))
+                                sigma_s = safe_division(nunom.flatten(0,1), coeff_A.flatten(0,1), kernel_size).unsqueeze(0)
+                                sigma_s = torch.clamp(sigma_s, 0, sigma_t)
 
-                                        if s0_is_valid and s1_is_valid:
-                                            sigma_s = min(s0, s1)
-                                        elif s0_is_valid:
-                                            sigma_s = s0
-                                        elif s1_is_valid:
-                                            sigma_s = s1
-                                        else:
-                                            if s1 < 0:
-                                                sigma_s = 0
-                                            elif s0 > sigma_t:
-                                                sigma_s = sigma_t
-                                            else:
-                                                sigma_s = 0 if 0 - s0 < s1 - sigma_t else sigma_t
-                                    else:
-                                        s = coeff_B / coeff_A
-                                        if s < 0:
-                                            sigma_s = 0
-                                        elif sigma_t < s:
-                                            sigma_s = sigma_t
-                                        else:
-                                            sigma_s = s
-                                else:
-                                    sigma_s = coeff_C / (2 * coeff_B) if torch.abs(coeff_B) > EPS else 0
+                                # zero out sigma_s where we have valid masks
+                                sigma_s *= warped_masks_sh
 
+                                # torch.save(sigma_s, f"dump/sigma_s_{i}_{j}.pt")
 
-                                print(f"{sigma_s=}, {sigma_t=}")
+                                # import lovely_tensors
+                                # lovely_tensors.monkey_patch()
+                                # print(f"{sigma_s=}, {sigma_t=}")
 
 
                             # direct pasting
@@ -797,7 +864,7 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
 
                             print(f"{latents_ori.var().item()=}, {(var_data + sigma_t**2).item()=}")
                             print(f"{pseudo_x0.var().item()=}, {var_data.item()=}")
-                            print(f"{latents_mid.var().item()=}, {(var_data + sigma_s**2).item()=}")
+                            print(f"{latents_mid.var().item()=}, var_data + sigma_s**2={var_data + (sigma_s.mean() if isinstance(sigma_s, torch.Tensor) else sigma_s)**2}")
                             print(f"{latents_mid_pasted.var().item()=}")
                             print(f"{latents.var().item()=}, {(var_data + sigma_t**2).item()=}")
                             print()
@@ -859,7 +926,7 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
             self,
             opt_zs: torch.Tensor,
             ori_zt: Optional[torch.Tensor],
-            sigma_s: float,
+            sigma_s: float | torch.Tensor,
             sigma_t: float,
             posterior_sigma: float = torch.inf,
             generator: Optional[torch.Generator] = None,
@@ -875,7 +942,10 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
             sigma_t: The noise level of ori_zt.
             posterior_sigma: p(z'_t | hat{z}_t, hat{z}_s, y) ~ N(hat{z}_s(y), posterior_sigma)
         """
-        assert 0 <= sigma_s <= sigma_t, f"{sigma_s=}, {sigma_t=}"
+        if isinstance(sigma_s, torch.Tensor):
+            assert torch.all(0 <= sigma_s) and torch.all(sigma_s <= sigma_t)
+        else:
+            assert 0 <= sigma_s <= sigma_t, f"{sigma_s=}, {sigma_t=}"
         noise = randn_tensor(opt_zs.shape, generator=generator, device=opt_zs.device, dtype=opt_zs.dtype)
 
         t_squared_minus_s_squared = sigma_t ** 2 - sigma_s ** 2

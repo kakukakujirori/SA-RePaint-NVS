@@ -395,7 +395,7 @@ def save_warped_image(
         trans_coordinates_list.append(trans_coordinates)
         trans_valid_list.append(trans_valid)
 
-        np.save(os.path.join(save_path,str(i).zfill(4)+"_flow.npy"), flow12)
+        # np.save(os.path.join(save_path,str(i).zfill(4)+"_flow.npy"), flow12)
 
         mask = 1 - mask2
         mask[mask < 0.5] = 0
@@ -416,8 +416,8 @@ def save_warped_image(
 
     trans_coordinates = np.stack(trans_coordinates_list, axis=0)
     trans_valid = np.stack(trans_valid_list, axis=0)
-    np.save(os.path.join(save_path, 'trans_coordinates.npy'), trans_coordinates)
-    np.save(os.path.join(save_path, 'trans_valid.npy'), trans_valid)
+    # np.save(os.path.join(save_path, 'trans_coordinates.npy'), trans_coordinates)
+    # np.save(os.path.join(save_path, 'trans_valid.npy'), trans_valid)
 
     return None
 

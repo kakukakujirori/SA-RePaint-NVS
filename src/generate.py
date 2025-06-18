@@ -5,6 +5,7 @@ import os
 from dataclasses import dataclass
 from tqdm import tqdm
 
+import lovely_tensors
 import numpy as np
 import PIL
 import torch
@@ -24,10 +25,41 @@ from scheduling_euler_discrete import EulerDiscreteScheduler
 from unet import MyUNet
 from warp import homography_estimation
 
+lovely_tensors.monkey_patch()
+
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 
-def safe_division(
+def box_blur_3D(
+        tensor: Float[torch.Tensor, "b f c h w"],
+        s_kernel_size: int,
+        t_kernel_size: int,
+        border_type: str = 'reflect',
+    ) -> Float[torch.Tensor, "b f c h w"]:
+    """Helper to compute the mean over a 3D spatio-temporal-channel window."""
+    assert s_kernel_size % 2 == 1
+    assert t_kernel_size % 2 == 1
+    k_temporal = t_kernel_size // 2
+    b, f, c, h, w = tensor.shape
+
+    # 1. Temporal mean pooling using 1D convolution
+    temp_tensor = rearrange(tensor, "b f c h w ->  (b c h w) () f")
+    temporal_kernel = torch.ones(1, 1, t_kernel_size, device=tensor.device, dtype=tensor.dtype) / t_kernel_size
+    padded_tensor = F.pad(temp_tensor, (k_temporal, k_temporal), mode=border_type)
+    temp_mean = F.conv1d(padded_tensor, temporal_kernel, padding='valid')
+    temp_mean = rearrange(temp_mean, "(b c h w) () f -> b f c h w", b=b, f=f, c=c, h=h, w=w)
+
+    # 2. Spatial mean pooling using kornia's box_blur
+    spatio_temporal_mean = box_blur(
+        rearrange(temp_mean, "b f c h w -> (b f) c h w"),
+        (s_kernel_size, s_kernel_size),
+        border_type='reflect',
+    ).reshape_as(temp_mean)
+
+    return spatio_temporal_mean
+
+
+def safe_division_2D(
         nunom: Float[torch.Tensor, "b c h w"],
         denom: Float[torch.Tensor, "b c h w"],
         kernel_size: int = 1,
@@ -44,29 +76,45 @@ def safe_division(
     return sum_numom_denom / (sum_denom_squared + eps)
 
 
-def local_covariance(
-        latents_ori: Float[torch.Tensor, "b f c h w"],
-        pseudo_x0: Float[torch.Tensor, "b f c h w"],
+def safe_division_3D(
+        nunom: Float[torch.Tensor, "b f c h w"],
+        denom: Float[torch.Tensor, "b f c h w"],
+        k_spatial: int = 1,
+        k_temporal: int = 1,
+        eps: float = 1e-12,
+    ) -> Float[torch.Tensor, "b c h w"]:
+    """
+    Return A/B, assuming that A/B is theoretically a continuous finite function.
+    The solution R is derived as R(p) = argmin_r Σ_{q in W(p)} (A(q) - r * B(q))^2
+    It has an analytical solution: R(p) = (Σ_{q in W(p)} A(q)B(q)) / (Σ_{q in W(p)} B(q)^2)
+    """
+    s_kernel_size = 2 * k_spatial + 1
+    t_kernel_size = 2 * k_temporal + 1
+    sum_numom_denom = box_blur_3D(nunom * denom, s_kernel_size=s_kernel_size, t_kernel_size=t_kernel_size)
+    sum_denom_squared = box_blur_3D(denom * denom, s_kernel_size=s_kernel_size, t_kernel_size=t_kernel_size)
+    return sum_numom_denom / (sum_denom_squared + eps)
+
+
+def local_covariance_2D(
+        X: Float[torch.Tensor, "b f c h w"],
+        Y: Float[torch.Tensor, "b f c h w"],
         k: int,
     ) -> Float[torch.Tensor, "b f 1 h w"]:
     """
     Calculates the local covariance map between two tensors over a sliding window.
 
     Args:
-        latents_ori (torch.Tensor): The first tensor, shape (B, F, C, H, W).
-        pseudo_x0 (torch.Tensor): The second tensor, shape (B, F, C, H, W).
+        X (torch.Tensor): The first tensor, shape (B, F, C, H, W).
+        Y (torch.Tensor): The second tensor, shape (B, F, C, H, W).
         k (int): The radius of the square window. The total window size will be (2k+1)x(2k+1).
 
     Returns:
         torch.Tensor: A 2D tensor of shape (H, W) where each element (i, j) is the
                       covariance between the windows of the input tensors centered at (i, j).
     """
-    # Ensure tensors have the same shape
-    if latents_ori.shape != pseudo_x0.shape:
+    if X.shape != Y.shape:
         raise ValueError("Input tensors must have the same shape.")
-
-    # Get shapes and define window properties
-    B, num_frames, C, H, W = latents_ori.shape
+    B, num_frames, C, H, W = X.shape
     kernel_size = 2 * k + 1
 
     # The number of elements in each window for a single frame calculation.
@@ -75,14 +123,14 @@ def local_covariance(
 
     # Reshape to treat each frame as an independent item in a large batch.
     # Shape changes from (B, F, C, H, W) -> (B * F, C, H, W)
-    latents_reshaped = latents_ori.reshape(B * num_frames, C, H, W)
-    pseudo_reshaped = pseudo_x0.reshape(B * num_frames, C, H, W)
+    X_reshaped = X.reshape(B * num_frames, C, H, W)
+    Y_reshaped = Y.reshape(B * num_frames, C, H, W)
 
     # --- Step 1: Calculate E[X] and E[Y] for each local window ---
     # `F.avg_pool2d` operates on the (B*F) batch, calculating the spatial mean
     # for each of the C channels independently.
-    pool_latents = F.avg_pool2d(latents_reshaped, kernel_size=kernel_size, stride=1, padding=k, count_include_pad=False)
-    pool_pseudo = F.avg_pool2d(pseudo_reshaped, kernel_size=kernel_size, stride=1, padding=k, count_include_pad=False)
+    pool_latents = F.avg_pool2d(X_reshaped, kernel_size=kernel_size, stride=1, padding=k, count_include_pad=False)
+    pool_pseudo = F.avg_pool2d(Y_reshaped, kernel_size=kernel_size, stride=1, padding=k, count_include_pad=False)
     # The shape of pool_latents and pool_pseudo is (B*F, C, H, W).
 
     # To get the mean over the window (channels + spatial), we average over the channel dim (dim=1).
@@ -90,7 +138,7 @@ def local_covariance(
     local_mean_pseudo = torch.mean(pool_pseudo, dim=1)  # Shape: (B*F, H, W)
 
     # --- Step 2: Calculate E[X * Y] for each local window ---
-    product_tensor = latents_reshaped * pseudo_reshaped # Shape: (B*F, C, H, W)
+    product_tensor = X_reshaped * Y_reshaped # Shape: (B*F, C, H, W)
     pool_product = F.avg_pool2d(product_tensor, kernel_size=kernel_size, stride=1, padding=k, count_include_pad=False)
     local_mean_product = torch.mean(pool_product, dim=1) # Shape: (B*F, H, W)
 
@@ -108,6 +156,59 @@ def local_covariance(
     final_cov_map = local_cov_map_unbiased.view(B, num_frames, 1, H, W)
 
     return final_cov_map
+
+
+def local_covariance_3D(
+        X: Float[torch.Tensor, "b f c h w"],
+        Y: Float[torch.Tensor, "b f c h w"],
+        k_spatial: int,
+        k_temporal: int,
+    ) -> Float[torch.Tensor, "b f 1 h w"]:
+    """
+    Calculates the local covariance map between two tensors over a sliding window.
+
+    Args:
+        X (torch.Tensor): The first tensor, shape (B, F, C, H, W).
+        Y (torch.Tensor): The second tensor, shape (B, F, C, H, W).
+        k_spatial (int): The radius of the spatial square window.
+        k_temporal (int): The radius of the temporal square window.
+
+    Returns:
+        torch.Tensor: A tensor of shape (B, F, 1, H, W) where each element (b, f, 0, i, j) is the
+                      covariance between the windows of the input tensors centered at (i, j).
+    """
+    if X.shape != Y.shape:
+        raise ValueError("Input tensors must have the same shape (B, F, C, H, W)")
+    if k_spatial < 0 or k_temporal < 0:
+        raise ValueError("Window radii k_spatial and k_temporal must be non-negative.")
+
+    _b, _f, C, _h, _w = X.shape
+    s_kernel_size = 2 * k_spatial + 1
+    t_kernel_size = 2 * k_temporal + 1
+
+    # Calculate E[X], E[Y], and E[X*Y] using the 3D mean pool helper
+    mean_x = box_blur_3D(X, s_kernel_size=s_kernel_size, t_kernel_size=t_kernel_size)
+    mean_y = box_blur_3D(Y, s_kernel_size=s_kernel_size, t_kernel_size=t_kernel_size)
+    mean_xy = box_blur_3D(X * Y, s_kernel_size=s_kernel_size, t_kernel_size=t_kernel_size)
+
+    # Channel mean
+    mean_x = torch.mean(mean_x, dim=2, keepdim=True)  # Shape: (B, F, 1, H, W)
+    mean_y = torch.mean(mean_y, dim=2, keepdim=True)  # Shape: (B, F, 1, H, W)
+    mean_xy = torch.mean(mean_xy, dim=2, keepdim=True)  # Shape: (B, F, 1, H, W)
+
+    # Apply the covariance formula: Cov(X, Y) = E[X*Y] - E[X]*E[Y]
+    covariance = mean_xy - mean_x * mean_y
+
+    # The number of elements in the 3D window (spatial, temporal, and channel dimensions).
+    n_elements_in_window = C * (s_kernel_size ** 2) * t_kernel_size
+
+    # Apply the unbiased sample covariance correction factor: N / (N-1)
+    if n_elements_in_window > 1:
+        correction_factor = n_elements_in_window / (n_elements_in_window - 1)
+        covariance = covariance * correction_factor
+
+    return covariance
+
 
 
 def _compute_padding(kernel_size):
@@ -588,6 +689,9 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
         warped_masks_sh = warped_masks_sh.mean(dim=-1)
         warped_masks_sh = torch.clip(warped_masks_sh * 5, 0, 1)
 
+        # os.makedirs("dump", exist_ok=True)
+        # torch.save(warped_masks_sh, f"dump/warped_masks_sh.pt")
+
         # To use warped_latents inside the denoising loop, it must be scaled!!!
         # NOTE: The VAE scaling is unnecessary for image_latents
         warped_latents = warped_latents * self.vae.config.scaling_factor
@@ -814,33 +918,37 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
                             sigma_t = self.scheduler.sigmas[i]
                             var_data = warped_latents[batch_size:, 0:1].var()
 
+                            # os.makedirs("dump", exist_ok=True)
+                            # torch.save(latents_ori, f"dump/latents_ori_{i}_{j}.pt")
+                            # torch.save(pseudo_x0, f"dump/pseudo_x0_{i}_{j}.pt")
+
                             if i < self._num_timesteps * 2 // 3:
                                 sigma_s = 0
                             else:
-                                # os.makedirs("dump", exist_ok=True)
-                                # torch.save(latents_ori, f"dump/latents_ori_{i}_{j}.pt")
-                                # torch.save(pseudo_x0, f"dump/pseudo_x0_{i}_{j}.pt")
-
                                 # deduce optimal sigma_s for RePaint
-                                kernel_size = 5
-                                var_latents_ori = local_covariance(latents_ori, latents_ori, k=kernel_size)
-                                var_pseudo_x0 = local_covariance(pseudo_x0, pseudo_x0, k=kernel_size)
-                                cov_latents_ori_pseudo_x0 = local_covariance(latents_ori, pseudo_x0, k=kernel_size)
+                                k_spatial = 7
+                                k_temporal = 1
+                                var_latents_ori = local_covariance_3D(latents_ori, latents_ori, k_spatial, k_temporal)
+                                var_pseudo_x0 = local_covariance_3D(pseudo_x0, pseudo_x0, k_spatial, k_temporal)
+                                cov_latents_ori_pseudo_x0 = local_covariance_3D(latents_ori, pseudo_x0, k_spatial, k_temporal)
                                 coeff_A = var_latents_ori - 2 * cov_latents_ori_pseudo_x0 + var_pseudo_x0 - sigma_t**2
                                 coeff_B = (var_pseudo_x0 - cov_latents_ori_pseudo_x0) * sigma_t
                                 coeff_C = (var_pseudo_x0 - var_data) * sigma_t**2
                                 nunom = coeff_B - torch.sqrt(torch.relu(coeff_B.pow(2) - coeff_A * coeff_C))
-                                sigma_s = safe_division(nunom.flatten(0,1), coeff_A.flatten(0,1), kernel_size).unsqueeze(0)
+                                sigma_s = safe_division_3D(nunom, coeff_A, k_spatial, k_temporal)
                                 sigma_s = torch.clamp(sigma_s, 0, sigma_t)
 
                                 # zero out sigma_s where we have valid masks
-                                sigma_s *= warped_masks_sh
+                                from kornia.contrib import distance_transform
+                                distance_thresh = 7
+                                dt = distance_transform(1 - rearrange(warped_masks_sh, "b f c h w -> (b f) c h w")).reshape_as(warped_masks_sh)
+                                dt = torch.clamp(dt / distance_thresh, 0, 1)
+                                sigma_s = sigma_s * dt
+                                sigma_s = torch.clamp(sigma_s, 0, sigma_t)
 
                                 # torch.save(sigma_s, f"dump/sigma_s_{i}_{j}.pt")
 
-                                # import lovely_tensors
-                                # lovely_tensors.monkey_patch()
-                                # print(f"{sigma_s=}, {sigma_t=}")
+                                print(f"{sigma_s=}, {sigma_t=}")
 
 
                             # direct pasting
@@ -870,18 +978,13 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
                             print()
 
 
-
-
                         else:
-                            # direct pasting
-                            warped_latents_noisy = warped_latents + self.scheduler.sigmas[i+1] * randn_tensor(
-                                warped_latents.shape, generator=generator, device=warped_latents.device, dtype=warped_latents.dtype)
-                            # latents = warped_masks_sh * latents + \
-                            #             (1 - warped_masks_sh) * (warped_latents_noisy[batch_size:] if self.do_classifier_free_guidance else warped_latents_noisy)
+                            pass
+
 
                         latents = latents.half()
 
-                        del latents_ori
+                    del latents_ori
 
                     torch.cuda.empty_cache()
 
@@ -943,7 +1046,7 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
             posterior_sigma: p(z'_t | hat{z}_t, hat{z}_s, y) ~ N(hat{z}_s(y), posterior_sigma)
         """
         if isinstance(sigma_s, torch.Tensor):
-            assert torch.all(0 <= sigma_s) and torch.all(sigma_s <= sigma_t)
+            assert torch.all(0 <= sigma_s) and torch.all(sigma_s <= sigma_t), f"{sigma_s.min()=}, {sigma_s.max()=}"
         else:
             assert 0 <= sigma_s <= sigma_t, f"{sigma_s=}, {sigma_t=}"
         noise = randn_tensor(opt_zs.shape, generator=generator, device=opt_zs.device, dtype=opt_zs.dtype)

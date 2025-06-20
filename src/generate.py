@@ -690,7 +690,8 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
         warped_masks_sh = torch.clip(warped_masks_sh * 5, 0, 1)
 
         # os.makedirs("dump", exist_ok=True)
-        # torch.save(warped_masks_sh, f"dump/warped_masks_sh.pt")
+        # torch.save(warped_latents, "dump/warped_latents.pt")
+        # torch.save(warped_masks_sh, "dump/warped_masks_sh.pt")
 
         # To use warped_latents inside the denoising loop, it must be scaled!!!
         # NOTE: The VAE scaling is unnecessary for image_latents
@@ -916,18 +917,18 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
                         if j < repaint_iter_num - 1:
 
                             sigma_t = self.scheduler.sigmas[i]
-                            var_data = warped_latents[batch_size:, 0:1].var()
+                            var_data = warped_latents[batch_size:, 0:1].var() * 0.5
 
                             # os.makedirs("dump", exist_ok=True)
                             # torch.save(latents_ori, f"dump/latents_ori_{i}_{j}.pt")
                             # torch.save(pseudo_x0, f"dump/pseudo_x0_{i}_{j}.pt")
 
-                            if i < self._num_timesteps * 2 // 3:
-                                sigma_s = 0
+                            if i < self._num_timesteps * 1 // 2:
+                                sigma_s = self.scheduler.sigmas[i+1]
                             else:
                                 # deduce optimal sigma_s for RePaint
-                                k_spatial = 7
-                                k_temporal = 1
+                                k_spatial = 5
+                                k_temporal = 3
                                 var_latents_ori = local_covariance_3D(latents_ori, latents_ori, k_spatial, k_temporal)
                                 var_pseudo_x0 = local_covariance_3D(pseudo_x0, pseudo_x0, k_spatial, k_temporal)
                                 cov_latents_ori_pseudo_x0 = local_covariance_3D(latents_ori, pseudo_x0, k_spatial, k_temporal)
@@ -937,14 +938,15 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
                                 nunom = coeff_B - torch.sqrt(torch.relu(coeff_B.pow(2) - coeff_A * coeff_C))
                                 sigma_s = safe_division_3D(nunom, coeff_A, k_spatial, k_temporal)
                                 sigma_s = torch.clamp(sigma_s, 0, sigma_t)
+                                # print(f"{var_latents_ori=}\n{var_pseudo_x0=}\n{cov_latents_ori_pseudo_x0=}\n{coeff_A=}\n{coeff_B=}\n{coeff_C=}\n{nunom=}\n{sigma_s=}")
 
                                 # zero out sigma_s where we have valid masks
-                                from kornia.contrib import distance_transform
-                                distance_thresh = 7
-                                dt = distance_transform(1 - rearrange(warped_masks_sh, "b f c h w -> (b f) c h w")).reshape_as(warped_masks_sh)
-                                dt = torch.clamp(dt / distance_thresh, 0, 1)
-                                sigma_s = sigma_s * dt
-                                sigma_s = torch.clamp(sigma_s, 0, sigma_t)
+                                # from kornia.contrib import distance_transform
+                                # distance_thresh = 7
+                                # dt = distance_transform(1 - rearrange(warped_masks_sh, "b f c h w -> (b f) c h w")).reshape_as(warped_masks_sh)
+                                # dt = torch.clamp(dt / distance_thresh, 0, 1)
+                                # sigma_s = sigma_s * dt
+                                # sigma_s = torch.clamp(sigma_s, 0, sigma_t)
 
                                 # torch.save(sigma_s, f"dump/sigma_s_{i}_{j}.pt")
 

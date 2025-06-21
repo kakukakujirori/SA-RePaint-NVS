@@ -148,7 +148,7 @@ class MyUNet(UNetSpatioTemporalConditionModel):
 
         self.record_attention_ = record_attention
         if self.record_attention_:
-            self.recor_query_ = []
+            self.record_query_ = []
             self.record_key_ = []
             self.record_value_ = []
 

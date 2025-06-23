@@ -380,6 +380,10 @@ def run_sed_calculation(mannequin_challenge_output_root: str):
             camera_paths = os.path.join(data_dir, "warped/*_pose.npy")
             poses = [np.load(p) for p in sorted(glob.glob(camera_paths))]
 
+            if not os.path.isfile(video_path):
+                missing.append(data_dir)
+                continue
+
             with tempfile.TemporaryDirectory() as colmap_root:
                 consistent_ratios, sed_summary = eval_sed(
                     colmap_root=colmap_root,

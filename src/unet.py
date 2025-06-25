@@ -92,9 +92,9 @@ class MyUNet(UNetSpatioTemporalConditionModel):
 
                 # hidden_states = F.scaled_dot_product_attention(query, key2.clone().detach(), value2.clone().detach(), attn_mask=None, dropout_p=0.0, is_causal=False)
 
-                self.record_query_.append(rearrange(query, "batch num_heads (h w) c -> batch h w (num_heads c)", h=h, w=w))
-                self.record_key_.append(rearrange(key, "batch num_heads (h w) c -> batch h w (num_heads c)", h=h, w=w))
-                self.record_value_.append(rearrange(value, "batch num_heads (h w) c -> batch h w (num_heads c)", h=h, w=w))
+                self.record_query_.append(query)
+                self.record_key_.append(key)
+                # self.record_value_.append(value)
 
 
             if attention_mask is None and mask is not None:

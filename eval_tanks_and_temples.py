@@ -7,25 +7,29 @@ import shutil
 import subprocess
 import tempfile
 from itertools import product
+from tqdm import tqdm
 
+import lpips
 import numpy as np
 import torch
 import torch_fidelity
-from diffusers.utils import load_video
+from diffusers.utils import load_image, load_video
+from torchmetrics.image import PeakSignalNoiseRatio
 
 from src.eval_trajectories import eval_trajectories
+from src.eval_sed import eval_sed
 
 
 tanks_and_temples_input_root = "./tanks_and_temples_input"
 tanks_and_temples_output_root = "./tanks_and_temples_output"
 NUM_FRAMES = 25
-NUM_INFERECE_STEPS = 25
+NUM_INFERECE_STEPS = 50
 DENOISE_START_STEP = NUM_INFERECE_STEPS // 3
-REPAINT_ITER_NUM = 5
+REPAINT_ITER_NUM = 2
 MOTION_MODES = ["horizontal", "vertical", "zoomout"]
 DEGREE_LIST = [-1.0, -0.5, 0.5, 1.0]
 MOTION_DEGREE_PAIRS = [x for x in product(MOTION_MODES, DEGREE_LIST) if x not in [('vertical', -1.0), ('vertical', 1.0)]]
-NUM_GPUS = 4
+NUM_GPUS = 3
 
 
 def organize_images_and_depth(tanks_and_temples_data_root: str):
@@ -119,13 +123,15 @@ def run_generation_task(scene: str, motion_mode: str, degree: float, gpu_id: int
     print(f"STARTING task: {task_id}")
     try:
         result = subprocess.run(["python", "src/generate.py",
+            "--output_folder", f"{tanks_and_temples_output_root}/{scene}/{motion_mode}_{degree}/generated",
             "--trajectory_folder", f"{tanks_and_temples_output_root}/{scene}/{motion_mode}_{degree}/warped",
             "--num_frames", f"{NUM_FRAMES}",
             "--num_inference_steps", f"{NUM_INFERECE_STEPS}",
             # "--enable_nvssolver",
             "--denoise_start_step", f"{DENOISE_START_STEP}",
             "--repaint_iter_num", f"{REPAINT_ITER_NUM}",
-            "--output_folder", f"{tanks_and_temples_output_root}/{scene}/{motion_mode}_{degree}/generated",
+            "--min_guidance_scale", "3.0",
+            "--max_guidance_scale", "5.0",
             "--seed", "12345",
             "--gpu", f"{gpu_id}"],
             check=True, capture_output=True, text=True, encoding='utf-8')
@@ -151,6 +157,87 @@ def run_generation_task(scene: str, motion_mode: str, degree: float, gpu_id: int
         torch.cuda.empty_cache()
 
     return msg
+
+
+def run_pixelwise_metrics_calculation(tanks_and_temples_output_root: str):
+    PSNR_MODULES = [PeakSignalNoiseRatio(data_range=1.0).eval().to(f"cuda:{i}") for i in range(NUM_GPUS)]
+    LPIPS_MODULES = [lpips.LPIPS(net='alex', spatial=True).eval().to(f"cuda:{i}") for i in range(NUM_GPUS)]
+
+    total_results = {}
+    missing = []
+
+    def run_task(data_dir: str, gpu_id: int):
+        # select evaluator
+        PSNR = PSNR_MODULES[gpu_id]
+        LPIPS = LPIPS_MODULES[gpu_id]
+        device = f"cuda:{gpu_id}"
+
+        # load warped frames and generated frames
+        mask_frames = [load_image(os.path.join(data_dir, "warped", f"{i:04d}_mask.png")) for i in range(NUM_FRAMES)]
+        warped_frames = [load_image(os.path.join(data_dir, "warped", f"{i:04d}.png")) for i in range(NUM_FRAMES)]
+        generated_frames = [load_image(os.path.join(data_dir, "generated", f"{i:04d}.png")) for i in range(NUM_FRAMES)]
+
+        # batchfy the frames
+        mask_tensor = torch.stack([torch.from_numpy(np.array(x).astype(np.float32) / 255.0).permute(2, 0, 1) for x in mask_frames], dim=0).to(device)
+        warped_tensor = torch.stack([torch.from_numpy(np.array(x).astype(np.float32) / 255.0).permute(2, 0, 1) for x in warped_frames], dim=0).to(device)
+        generated_tensor = torch.stack([torch.from_numpy(np.array(x).astype(np.float32) / 255.0).permute(2, 0, 1) for x in generated_frames], dim=0).to(device)
+
+        # binarize the mask
+        mask_tensor_bool = mask_tensor < 0.5
+        mask_tensor_float = mask_tensor_bool.float().mean(dim=1, keepdim=True)
+
+        # calculate psnr, lpips (NOTE: image range is [-1, 1] for LPIPS)
+        results = {}
+        with torch.no_grad():
+            psnr_score = PSNR(warped_tensor[mask_tensor_bool], generated_tensor[mask_tensor_bool])
+            results["psnr"] = psnr_score.item()
+
+            lpips_full = LPIPS(warped_tensor * 2 - 1, generated_tensor * 2 - 1)
+            lpips_score = torch.sum(lpips_full * mask_tensor_float) / torch.sum(mask_tensor_float)
+            results["lpips"] = lpips_score.item()
+
+        total_results[data_dir] = results
+
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=NUM_GPUS) as executor:
+        future_to_task_info = {}
+        for idx, scene in enumerate(sorted(os.listdir(tanks_and_temples_output_root))):
+            scene_path = os.path.join(tanks_and_temples_output_root, scene)
+            if not os.path.isdir(scene_path):
+                continue
+            for motion_degree in os.listdir(scene_path):
+                data_dir = os.path.join(tanks_and_temples_output_root, scene, motion_degree)
+                assert os.path.isdir(data_dir)
+
+                if not os.path.isdir(os.path.join(data_dir, "generated")):
+                    print(f"Missing {os.path.join(data_dir, 'generated')}")
+                    missing.append(data_dir)
+                    continue
+
+                future = executor.submit(run_task, data_dir, idx % NUM_GPUS)
+                future_to_task_info[future] = (data_dir, idx % NUM_GPUS)
+
+        for future in tqdm(concurrent.futures.as_completed(future_to_task_info), total=len(future_to_task_info), desc="Calculating pixelwise metrics"):
+            data_dir, gpu_id = future_to_task_info[future]
+            task_desc = f"{data_dir=}, {gpu_id=}"
+            try:
+                result_message = future.result() # This will re-raise exceptions from run_generation_task
+                # print(f"Result for {task_desc}: {result_message}")
+            except Exception as exc: # Should be caught by try/except in run_generation_task but good to have a fallback here.
+                print(f"Main loop caught exception for {task_desc}: {exc}")
+                raise exc
+
+
+    total_psnr_mean = sum([result["psnr"] for result in total_results.values()]) / len(total_results)
+    total_lpips_mean = sum([result["lpips"] for result in total_results.values()]) / len(total_results)
+    print(f"Total PSNR Mean: {total_psnr_mean}")
+    print(f"Total LPIPS Mean: {total_lpips_mean}")
+    print(f"Missing dirs: {len(missing)}")
+    total_results["total_psnr_mean"] = total_psnr_mean
+    total_results["total_lpips_mean"] = total_lpips_mean
+    total_results["missing_dirs"] = missing
+
+    return total_results, missing
 
 
 def run_fid_calculation(
@@ -253,6 +340,50 @@ def run_camera_pose_error_calculation(tanks_and_temples_output_root: str, gt_foc
     return total_results, missing_videos
 
 
+def run_sed_calculation(tanks_and_temples_output_root: str):
+    missing = []
+    total_results = {}
+    for scene in tqdm(os.listdir(tanks_and_temples_output_root), desc="Calculating SED"):
+        scene_path = os.path.join(tanks_and_temples_output_root, scene)
+        if not os.path.isdir(scene_path):
+            continue
+        for motion_degree in os.listdir(scene_path):
+            data_dir = os.path.join(tanks_and_temples_output_root, scene, motion_degree)
+            assert os.path.isdir(data_dir)
+            video_path = os.path.join(data_dir, "generated/generated.mp4")
+            camera_paths = os.path.join(data_dir, "warped/*_pose.npy")
+            poses = [np.load(p) for p in sorted(glob.glob(camera_paths))]
+
+            if not os.path.isfile(video_path):
+                missing.append(data_dir)
+                continue
+
+            with tempfile.TemporaryDirectory() as colmap_root:
+                consistent_ratios, sed_summary = eval_sed(
+                    colmap_root=colmap_root,
+                    video_path=video_path,
+                    poses=poses,
+                    gt_focal_len=260.0,
+                    save_sed_graph_to=None,
+                )
+                total_results[data_dir] = consistent_ratios
+
+    total_consistent_ratios = {}
+    for result in total_results.values():
+        for key, value in result.items():
+            if key not in total_consistent_ratios:
+                total_consistent_ratios[key] = 0
+            total_consistent_ratios[key] += value
+    for key in total_consistent_ratios:
+        total_consistent_ratios[key] /= len(total_results)
+        print(f"Total SED Mean (threshold {key:.2f}): {total_consistent_ratios[key]:.3f}")
+
+    total_results["total_sed_mean"] = total_consistent_ratios
+    total_results["missing_videos"] = missing
+
+    return total_results, missing
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Tanks and Temples Evaluation")
     parser.add_argument("--data_root", type=str, default="/home/ryotaro/data/TanksAndTemples")
@@ -326,7 +457,12 @@ if __name__ == '__main__':
                     print(f"Main loop caught exception for {task_desc}: {exc}")
                     raise exc
 
-        # 4. FID calculation
+        # 4. Pixelwise metrics calculation
+        pixelwise_results, _ = run_pixelwise_metrics_calculation(tanks_and_temples_output_root)
+        with open(os.path.join(tanks_and_temples_output_root, "pixelwise_results.txt"), "w") as f:
+            json.dump(pixelwise_results, f, indent=4)
+
+        # 5. FID calculation
         fid = run_fid_calculation(
             tanks_and_temples_data_root=args.data_root,
             tanks_and_temples_output_root=tanks_and_temples_output_root,
@@ -334,11 +470,15 @@ if __name__ == '__main__':
         with open(os.path.join(tanks_and_temples_output_root, "fid.txt"), "w") as f:
             f.write(str(fid))
 
-        # 5. Camera pose error calculation
+        # 6. Camera pose error calculation
         camera_pose_results, _ = run_camera_pose_error_calculation(tanks_and_temples_output_root)
         with open(os.path.join(tanks_and_temples_output_root, "camera_pose_results.txt"), "w") as f:
             json.dump(camera_pose_results, f, indent=4)
 
+        # 7. SED calculation
+        sed_results = run_sed_calculation(tanks_and_temples_output_root)
+        with open(os.path.join(tanks_and_temples_output_root, "sed.txt"), "w") as f:
+            json.dump(sed_results, f, indent=4)
 
     except KeyboardInterrupt:
         print("Caught KeyboardInterrupt, shutting down.")

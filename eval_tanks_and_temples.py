@@ -130,8 +130,8 @@ def run_generation_task(scene: str, motion_mode: str, degree: float, gpu_id: int
             # "--enable_nvssolver",
             "--denoise_start_step", f"{DENOISE_START_STEP}",
             "--repaint_iter_num", f"{REPAINT_ITER_NUM}",
-            "--min_guidance_scale", "3.0",
-            "--max_guidance_scale", "5.0",
+            "--min_guidance_scale", "1.0",
+            "--max_guidance_scale", "3.0",
             "--seed", "12345",
             "--gpu", f"{gpu_id}"],
             check=True, capture_output=True, text=True, encoding='utf-8')

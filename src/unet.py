@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple, Union
 
@@ -14,6 +15,7 @@ from diffusers.models.modeling_utils import ModelMixin
 from diffusers.models.unets.unet_3d_blocks import UNetMidBlockSpatioTemporal, get_down_block, get_up_block
 from diffusers.models.unets.unet_spatio_temporal_condition import UNetSpatioTemporalConditionModel, UNetSpatioTemporalConditionOutput
 from einops import rearrange
+from kornia.filters import gaussian_blur2d
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -23,7 +25,7 @@ class MyUNet(UNetSpatioTemporalConditionModel):
     Modified from SVD implementation
     https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/unets/unet_spatio_temporal_condition.py
     """
-    def inject(self, mask: Optional[torch.Tensor] = None):
+    def inject(self, weight: Optional[torch.Tensor] = None, query_blur_sigma: float = 0.0):
         # for (layer, downsample_block) in enumerate(self.down_blocks):  # ['CrossAttnDownBlockSpatioTemporal', 'CrossAttnDownBlockSpatioTemporal', 'CrossAttnDownBlockSpatioTemporal', 'DownBlockSpatioTemporal']
         #     if layer == 3:
         #         continue
@@ -40,7 +42,9 @@ class MyUNet(UNetSpatioTemporalConditionModel):
                 continue
             for (sublayer, trans) in enumerate(upsample_block.attentions):  # ['TransformerSpatioTemporalModel', 'TransformerSpatioTemporalModel', 'TransformerSpatioTemporalModel']
                 basictrans = trans.transformer_blocks[0]  # BasicTransformerBlock (spatial)
-                basictrans.attn1.processor = self.my_self_attention(layer, sublayer, mask)
+                basictrans.attn1.processor = self.my_self_attention(layer, sublayer, weight, query_blur_sigma)
+                # tmpbasictrans = trans.temporal_transformer_blocks[0]  # TemporalBasicTransformerBlock (temporal)
+                # tmpbasictrans.attn1.processor = self.my_temporal_attention(layer, sublayer, mask)
 
     record_layer_sublayer: list[tuple[int, int]] = []
 
@@ -50,21 +54,19 @@ class MyUNet(UNetSpatioTemporalConditionModel):
     record_key_ = []
     record_value_ = []
 
-    def my_self_attention(self, layer: int, sublayer: int, mask: Optional[torch.Tensor] = None) -> AttentionProcessor:
+    def my_self_attention(self, layer: int, sublayer: int, weight: Optional[torch.Tensor] = None, query_blur_sigma: float = 0.0) -> AttentionProcessor:
         compress_factor = [8, 4, 2, 1][layer]
         h = self.latent_shape_[-2] // compress_factor
         w = self.latent_shape_[-1] // compress_factor
 
-        if mask is not None:
-            assert mask.shape[-3:] == (1,) + self.latent_shape_[-2:], f"{mask.shape=}, {self.latent_shape_=}"
-            assert mask.dtype == torch.bool, f"{mask.dtype=}, expects torch.bool"
-            mask = rearrange(mask, "batch num_frames () height width -> (batch num_frames) () height width")
-            mask = F.interpolate(mask.float(), size=(h, w), mode="area") > 0.5
-            mask = rearrange(mask, "bf () h w -> bf () () (h w)")
+        if (weight is not None) and isinstance(weight, torch.Tensor):
+            weight = rearrange(weight, "batch frames () h w -> (batch frames) () h w", h=self.latent_shape_[-2], w=self.latent_shape_[-1])
+            weight = F.interpolate(weight.float(), size=(h, w), mode="bilinear")
+            weight = rearrange(weight, "bf () h w -> bf () (h w) ()")
 
         def processor(
             attn,
-            hidden_states,
+            hidden_states,  # (batch_size=num_frames(x2), height*width, channels)
             encoder_hidden_states = None,
             attention_mask = None,
             temb = None,
@@ -96,10 +98,16 @@ class MyUNet(UNetSpatioTemporalConditionModel):
                 self.record_key_.append(key)
                 # self.record_value_.append(value)
 
+            if weight is not None:
+                key *= weight.repeat(key.shape[0] // weight.shape[0], 1, 1, 1)
 
-            if attention_mask is None and mask is not None:
-                attention_mask = mask.repeat(batch_size // mask.shape[0], 1, 1, 1)
-                # print(f"[MyUNet.processor] attention_mask applied!!!")
+            if query_blur_sigma > 0.0:
+                kernel_size = math.ceil(6 * query_blur_sigma) + 1 - math.ceil(6 * query_blur_sigma) % 2
+                query_reshaped = rearrange(query, "bf heads (h w) c -> bf (heads c) h w", h=h, w=w)
+                query_blurred = gaussian_blur2d(query_reshaped, kernel_size=(kernel_size, kernel_size), sigma=(query_blur_sigma, query_blur_sigma))
+                query = rearrange(query_blurred, "bf (heads c) h w -> bf heads (h w) c", c=query.shape[-1])
+                query = query.contiguous()
+                del query_reshaped, query_blurred
 
             hidden_states = F.scaled_dot_product_attention(
                 query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False

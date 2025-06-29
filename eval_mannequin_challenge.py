@@ -29,7 +29,7 @@ REPAINT_ITER_NUM = 2
 MOTION_MODES = ["horizontal", "vertical", "zoomout"]
 DEGREE_LIST = [-1.0, -0.5, 0.5, 1.0]
 MOTION_DEGREE_PAIRS = [x for x in product(MOTION_MODES, DEGREE_LIST) if x not in [('vertical', -1.0), ('vertical', 1.0)]]
-NUM_GPUS = 2
+NUM_GPUS = 3
 
 
 def reorganize_frames(mannequin_challenge_data_root: str):
@@ -157,8 +157,8 @@ def run_generation_task(scene: str, motion_mode: str, degree: float, gpu_id: int
             # "--enable_nvssolver",
             "--denoise_start_step", f"{DENOISE_START_STEP}",
             "--repaint_iter_num", f"{REPAINT_ITER_NUM}",
-            "--min_guidance_scale", "3.0",
-            "--max_guidance_scale", "5.0",
+            "--min_guidance_scale", "1.0",
+            "--max_guidance_scale", "3.0",
             "--seed", "12345",
             "--gpu", f"{gpu_id}"],
             check=True, capture_output=True, text=True, encoding='utf-8')
@@ -265,6 +265,7 @@ def run_pixelwise_metrics_calculation(mannequin_challenge_output_root: str):
     total_results["missing_dirs"] = missing
 
     return total_results, missing
+
 
 def run_fid_calculation(
         mannequin_challenge_data_root: str,
@@ -412,7 +413,7 @@ def run_sed_calculation(mannequin_challenge_output_root: str):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Mannequin Challenge Evaluation")
-    parser.add_argument("--data_root", type=str, default="/media/ryotaro/ssd1/MannequinChallengeHQ/validation_frames")
+    parser.add_argument("--data_root", type=str, default="/home/ryotaro/data/MannequinChallengeHQ/validation_frames")
     parser.add_argument("--scratch", action="store_true", help="If set, all the images, depth, and trajectories are re-organized and re-generated.")
     args = parser.parse_args()
 

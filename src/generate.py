@@ -30,6 +30,57 @@ lovely_tensors.monkey_patch()
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 
+# >>> Adaptive Projected Guidance (APG) >>>
+class MomentumBuffer:
+    def __init__(self, momentum: float):
+        self.momentum = momentum
+        self.running_average = 0
+    def update(self, update_value: torch.Tensor):
+        new_average = self.momentum * self.running_average
+        self.running_average = update_value + new_average
+
+
+def adaptive_projected_guidance(
+        pred_uncond: torch.Tensor, # [B, F, C, H, W]
+        pred_cond: torch.Tensor, # [B, F, C, H, W]
+        guidance_scale: float,
+        momentum_buffer: MomentumBuffer = None,
+        eta: float = 0.5,
+        norm_threshold: float = 400,
+    ):
+
+    def project(
+        v0: torch.Tensor, # [B, F, C, H, W]
+        v1: torch.Tensor, # [B, F, C, H, W]
+    ):
+        dtype = v0.dtype
+        v0, v1 = v0.double(), v1.double()
+        v1 = torch.nn.functional.normalize(v1, dim=[-1, -2, -3, -4])
+        v0_parallel = (v0 * v1).sum(dim=[-1, -2, -3, -4], keepdim=True) * v1
+        v0_orthogonal = v0 - v0_parallel
+        return v0_parallel.to(dtype), v0_orthogonal.to(dtype)
+
+    diff = pred_cond - pred_uncond
+    if momentum_buffer is not None:
+        momentum_buffer.update(diff)
+        diff = momentum_buffer.running_average
+    if norm_threshold > 0:
+        ones = torch.ones_like(diff)
+        diff_norm = diff.norm(p=2, dim=[-1, -2, -3, -4], keepdim=True)
+        print(f"[adaptive_projected_guidance] {norm_threshold=}, {diff_norm=}")
+        scale_factor = torch.minimum(ones, norm_threshold / diff_norm)
+        diff = diff * scale_factor
+    diff_parallel, diff_orthogonal = project(diff, pred_cond)
+    normalized_update = diff_orthogonal + eta * diff_parallel
+    pred_guided = pred_cond + (guidance_scale - 1) * normalized_update
+    return pred_guided
+
+
+momentum_buffer = MomentumBuffer(momentum=-0.0)
+
+# <<< Adaptive Projected Guidance (APG) <<<
+
+
 @torch.no_grad()
 def get_var_data(
         q: Float[torch.Tensor, "num_frames num_heads hw c"],
@@ -711,53 +762,60 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
                         # Concatenate image_latents over channels dimension
                         latent_model_input = torch.cat([latent_model_input, image_latents], dim=2)
 
-                        # predict the noise residual
-                        if i < self._num_timesteps * 2 // 3:
-                            self.unet.latent_shape_ = (
-                                1,  # 2 if self.do_classifier_free_guidance else 1,
-                                num_frames, 8, height//8, width//8)  # NOTE: image_latents is appended so the channel num is 8
 
-                            self.unet.inject(None)
-                            noise_pred_uncond = self.unet(
-                                latent_model_input.split(batch_size, dim=0)[i%2],
-                                t,
-                                encoder_hidden_states=image_embeddings.split(batch_size, dim=0)[i%2],
-                                added_time_ids=added_time_ids.split(batch_size, dim=0)[i%2],
-                                return_dict=False,
-                                record_attention=False,
-                            )[0]
 
-                            self.unet.inject(warped_masks_sh < 0.5)
-                            noise_pred_cond = self.unet(
-                                latent_model_input[batch_size:],
-                                t,
-                                encoder_hidden_states=image_embeddings[batch_size:],
-                                added_time_ids=added_time_ids[batch_size:],
-                                return_dict=False,
-                                record_attention=True,
-                            )[0]
 
-                            noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_cond - noise_pred_uncond)
+                        # Weighted SEG + APG
+                        base_weight = min(1, 1.5 * i / self._num_timesteps)
+                        weight_map = (1 - warped_masks_sh) * (1 - base_weight) + base_weight
 
-                        else:
-                            self.unet.latent_shape_ = (
-                                2 if self.do_classifier_free_guidance else 1,
-                                num_frames, 8, height//8, width//8)  # NOTE: image_latents is appended so the channel num is 8
+                        # negative unconditional
+                        self.unet.latent_shape_ = (1, num_frames, 8, height//8, width//8)  # NOTE: image_latents is appended so the channel num is 8
+                        self.unet.inject(weight_map)
+                        noise_pred_negative_uncond = self.unet(
+                            latent_model_input[:batch_size],
+                            t,
+                            encoder_hidden_states=image_embeddings[:batch_size],
+                            added_time_ids=added_time_ids[:batch_size],
+                            return_dict=False,
+                            record_attention=False,
+                        )[0]
 
-                            self.unet.inject(None)
-                            noise_pred = self.unet(
-                                latent_model_input,
-                                t,
-                                encoder_hidden_states=image_embeddings,
-                                added_time_ids=added_time_ids,
-                                return_dict=False,
-                                record_attention=True,
-                            )[0]
+                        # negative blurred conditional
+                        self.unet.inject(weight_map, query_blur_sigma=4)
+                        noise_pred_negative_cond = self.unet(
+                            latent_model_input[batch_size:],
+                            t,
+                            encoder_hidden_states=image_embeddings[batch_size:],
+                            added_time_ids=added_time_ids[batch_size:],
+                            return_dict=False,
+                            record_attention=False,
+                        )[0]
 
-                            # perform guidance
-                            if self.do_classifier_free_guidance:
-                                noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
-                                noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_cond - noise_pred_uncond)
+                        noise_pred_negative = 0.25 * weight_map * noise_pred_negative_cond + (1 - 0.25 * weight_map) * noise_pred_negative_uncond
+
+                        # positive
+                        self.unet.latent_shape_ = (1, num_frames, 8, height//8, width//8)  # NOTE: image_latents is appended so the channel num is 8
+                        self.unet.inject(weight_map)
+                        noise_pred_positive = self.unet(
+                            latent_model_input[batch_size:],
+                            t,
+                            encoder_hidden_states=image_embeddings[batch_size:],
+                            added_time_ids=added_time_ids[batch_size:],
+                            return_dict=False,
+                            record_attention=True,
+                        )[0]
+
+                        # perform guidance
+                        noise_pred = adaptive_projected_guidance(
+                            noise_pred_negative,
+                            noise_pred_positive,
+                            self.guidance_scale,
+                            momentum_buffer,
+                        )
+
+
+
 
                         # retrieve qk
                         attn_query = self.unet.record_query_[0]
@@ -870,7 +928,7 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
                             latents_mid_pasted = warped_masks_sh * latents_mid + \
                                         (1 - warped_masks_sh) * (warped_latents_noisy[batch_size:] if self.do_classifier_free_guidance else warped_latents_noisy)
 
-                            opt_std = 0.5
+                            opt_std = 0.1
                             posterior_sigma = sigma_t**2 / opt_std
                             latents = self.stochastic_resample(
                                 opt_zs=latents_mid_pasted,

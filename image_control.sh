@@ -34,6 +34,6 @@ python src/generate.py \
   --num_inference_steps 50 \
   --denoise_start_step 16 \
   --repaint_iter_num 2 \
-  --min_guidance_scale 3.0 \
-  --max_guidance_scale 5.0 \
+  --min_guidance_scale 1.0 \
+  --max_guidance_scale 3.0 \
   --seed 12345

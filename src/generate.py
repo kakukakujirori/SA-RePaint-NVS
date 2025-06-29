@@ -961,8 +961,8 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
         opt_zs = opt_zs.float()
         ori_zt = ori_zt.float() if ori_zt is not None else ori_zt
         sigma_s = sigma_s.float() if isinstance(sigma_s, torch.Tensor) else torch.tensor(sigma_s, dtype=torch.float32)
-        sigma_t = sigma_t.float() if isinstance(sigma_s, torch.Tensor) else torch.tensor(sigma_t, dtype=torch.float32)
-        posterior_sigma = posterior_sigma.float() if isinstance(sigma_s, torch.Tensor) else torch.tensor(posterior_sigma, dtype=torch.float32)
+        sigma_t = sigma_t.float() if isinstance(sigma_t, torch.Tensor) else torch.tensor(sigma_t, dtype=torch.float32)
+        posterior_sigma = posterior_sigma.float() if isinstance(posterior_sigma, torch.Tensor) else torch.tensor(posterior_sigma, dtype=torch.float32)
 
         noise = randn_tensor(opt_zs.shape, generator=generator, device=opt_zs.device, dtype=opt_zs.dtype)
 

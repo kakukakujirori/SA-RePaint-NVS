@@ -685,7 +685,7 @@ class EulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
                 mask_ones = torch.ones_like(mask[:,0:1,:,:,:])
                 mask = torch.cat((mask_ones,mask),1)  # (1, 25, 4, h, w)
             elif mask.shape[1] != 25:
-                raise ValueError(f"Something is wrong: {mask.shape=}")
+                raise ValueError(f"Number of frames is fixed to 25, but got: {mask.shape=}")
 
             top_masks = []
             for ii, tau in enumerate(index_list):
@@ -756,7 +756,7 @@ class EulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
                 pred_original_sample,
             )
         if compute_grad:
-            return EulerDiscreteSchedulerOutput(prev_sample=prev_sample, pred_original_sample=pred_original_sample,grad = grad)
+            return EulerDiscreteSchedulerOutput(prev_sample=prev_sample, pred_original_sample=pred_original_sample, grad=grad)
         else:
             return EulerDiscreteSchedulerOutput(prev_sample=prev_sample, pred_original_sample=pred_original_sample)
 

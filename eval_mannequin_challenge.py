@@ -145,23 +145,34 @@ def run_trajectory_extraction(scene: str, motion_mode: str, degree: float):
         return f"Unexpected error for {task_id}: {e}"
 
 
-def run_generation_task(scene: str, motion_mode: str, degree: float, gpu_id: int) -> str:
+def run_generation_task(scene: str, motion_mode: str, degree: float, gpu_id: int, nvs_solver: bool = False) -> str:
     task_id = f"Scene: {scene}, Motion: {motion_mode + '_' + str(degree)}, GPU: {gpu_id}"
     print(f"STARTING task: {task_id}")
     try:
-        result = subprocess.run(["python", "src/generate.py",
-            "--output_folder", f"{mannequin_challenge_output_root}/{scene}/{motion_mode}_{degree}/generated",
-            "--trajectory_folder", f"{mannequin_challenge_output_root}/{scene}/{motion_mode}_{degree}/warped",
-            "--num_frames", f"{NUM_FRAMES}",
-            "--num_inference_steps", f"{NUM_INFERECE_STEPS}",
-            # "--enable_nvssolver",
-            "--denoise_start_step", f"{DENOISE_START_STEP}",
-            "--repaint_iter_num", f"{REPAINT_ITER_NUM}",
-            "--min_guidance_scale", "1.0",
-            "--max_guidance_scale", "3.0",
-            "--seed", "12345",
-            "--gpu", f"{gpu_id}"],
-            check=True, capture_output=True, text=True, encoding='utf-8')
+        if nvs_solver:
+            result = subprocess.run(["python", "src/generate_nvssolver.py",
+                "--output_folder", f"{mannequin_challenge_output_root}/{scene}/{motion_mode}_{degree}/generated",
+                "--trajectory_folder", f"{mannequin_challenge_output_root}/{scene}/{motion_mode}_{degree}/warped",
+                "--num_frames", f"{NUM_FRAMES}",
+                "--num_inference_steps", "100",
+                "--min_guidance_scale", "1.0",
+                "--max_guidance_scale", "3.0",
+                "--seed", "12345",
+                "--gpu", f"{gpu_id}"],
+                check=True, capture_output=True, text=True, encoding='utf-8')
+        else:
+            result = subprocess.run(["python", "src/generate.py",
+                "--output_folder", f"{mannequin_challenge_output_root}/{scene}/{motion_mode}_{degree}/generated",
+                "--trajectory_folder", f"{mannequin_challenge_output_root}/{scene}/{motion_mode}_{degree}/warped",
+                "--num_frames", f"{NUM_FRAMES}",
+                "--num_inference_steps", f"{NUM_INFERECE_STEPS}",
+                "--denoise_start_step", f"{DENOISE_START_STEP}",
+                "--repaint_iter_num", f"{REPAINT_ITER_NUM}",
+                "--min_guidance_scale", "1.0",
+                "--max_guidance_scale", "3.0",
+                "--seed", "12345",
+                "--gpu", f"{gpu_id}"],
+                check=True, capture_output=True, text=True, encoding='utf-8')
         print(f"COMPLETED task: {task_id}\nSTDOUT:\n{result.stdout.strip()}")
         if result.stderr:
             print(f"STDERR for {task_id}:\n{result.stderr.strip()}")
@@ -415,6 +426,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Mannequin Challenge Evaluation")
     parser.add_argument("--data_root", type=str, default="/home/ryotaro/data/MannequinChallengeHQ/validation_frames")
     parser.add_argument("--scratch", action="store_true", help="If set, all the images, depth, and trajectories are re-organized and re-generated.")
+    parser.add_argument("--nvs_solver", action="store_true", help="If set, NVS-Solver is used for generation.")
     args = parser.parse_args()
 
     # 1. Organize RGB images & Depth estimation
@@ -470,7 +482,7 @@ if __name__ == '__main__':
             future_to_task_info = {}
             for scene, motion, degree in scene_motion_degree_pairs:
                 gpu_id_for_task = job_idx_for_gpu_assignment % NUM_GPUS
-                future = executor.submit(run_generation_task, scene, motion, degree, gpu_id_for_task)
+                future = executor.submit(run_generation_task, scene, motion, degree, gpu_id_for_task, args.nvs_solver)
                 future_to_task_info[future] = (scene, motion, degree, gpu_id_for_task)
                 job_idx_for_gpu_assignment += 1 # This ensures round-robin submission to GPUs
 

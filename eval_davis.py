@@ -20,8 +20,8 @@ from src.eval_trajectories import eval_trajectories
 from src.eval_sed import eval_sed
 
 
-tanks_and_temples_input_root = "./tanks_and_temples_input"
-tanks_and_temples_output_root = "./tanks_and_temples_output"
+davis_input_root = "./davis_input"
+davis_output_root = "./davis_output"
 NUM_FRAMES = 25
 NUM_INFERECE_STEPS = 50
 DENOISE_START_STEP = NUM_INFERECE_STEPS // 3
@@ -32,16 +32,43 @@ MOTION_DEGREE_PAIRS = [x for x in product(MOTION_MODES, DEGREE_LIST) if x not in
 NUM_GPUS = 3
 
 
-def organize_images_and_depth(tanks_and_temples_data_root: str):
-    if os.path.isdir(tanks_and_temples_input_root):
-        shutil.rmtree(tanks_and_temples_input_root)
-    if os.path.isdir(tanks_and_temples_output_root):
-        shutil.rmtree(tanks_and_temples_output_root)
-    os.makedirs(tanks_and_temples_input_root)
-    os.makedirs(tanks_and_temples_output_root)
+def reorganize_frames(davis_data_root: str):
+    """This script is expected to be run after
+    `python download_extract.py` is executed."""
+    for split in ["validation", "test", "train"]:
+        split_root = os.path.join(davis_data_root, split, "data")
+        output_root = os.path.join(davis_data_root, f"{split}_frames")
+        assert os.path.isdir(split_root), f"Directory {split_root} does not exist."
+
+        if os.path.isdir(output_root):
+            shutil.rmtree(output_root)
+        os.makedirs(output_root)
+
+        cnt = 0
+        for uid in os.listdir(split_root):
+            frame_dir = os.path.join(split_root, uid, "frames")
+            if not os.path.isdir(frame_dir):
+                continue
+
+            dst_dir = os.path.join(output_root, uid)
+            if os.path.isdir(dst_dir):
+                shutil.rmtree(dst_dir)
+            shutil.copytree(frame_dir, dst_dir)
+            cnt += 1
+
+        print(f"[extract_frames] Finished reorganizing '{split}' ({cnt}/{len(os.listdir(split_root))})")
+
+
+def organize_images_and_depth(davis_data_root: str):
+    if os.path.isdir(davis_input_root):
+        shutil.rmtree(davis_input_root)
+    if os.path.isdir(davis_output_root):
+        shutil.rmtree(davis_output_root)
+    os.makedirs(davis_input_root)
+    os.makedirs(davis_output_root)
 
     # extract keyframes from each scene
-    for i, scene in enumerate(glob.glob(os.path.join(tanks_and_temples_data_root, "*"))):
+    for i, scene in enumerate(glob.glob(os.path.join(davis_data_root, "*"))):
         if not os.path.isdir(scene):
             continue
 
@@ -52,15 +79,15 @@ def organize_images_and_depth(tanks_and_temples_data_root: str):
             # pool images
             if cnt % NUM_FRAMES == 0:
                 img_num = os.path.basename(imgpath).split(".")[0]
-                dst_path = os.path.join(tanks_and_temples_input_root, scene_name + "_" + img_num + ".jpg")
+                dst_path = os.path.join(davis_input_root, scene_name + "_" + img_num + ".jpg")
                 shutil.copy(imgpath, dst_path)
 
     # resize to 1024x576
-    subprocess.run(["magick", "mogrify", "-resize", "1024x576!", os.path.join(tanks_and_temples_input_root, "*.jpg")])
+    subprocess.run(["magick", "mogrify", "-resize", "1024x576!", os.path.join(davis_input_root, "*.jpg")])
 
     # depth estimation
-    imglist = glob.glob(os.path.join(tanks_and_temples_input_root, "*.jpg"))
-    imglist_path = os.path.join(tanks_and_temples_input_root, "tmp.txt")
+    imglist = glob.glob(os.path.join(davis_input_root, "*.jpg"))
+    imglist_path = os.path.join(davis_input_root, "tmp.txt")
     with open(imglist_path, "a") as f:
         for imgpath in imglist:
             f.write(imgpath + "\n")
@@ -68,20 +95,20 @@ def organize_images_and_depth(tanks_and_temples_data_root: str):
     subprocess.run(["python", "tools/Depth-Anything-V2/run.py",
         "--encoder", "vitl",
         "--img-path", imglist_path,
-        "--outdir", tanks_and_temples_output_root])  # TEMPORAL USE
+        "--outdir", davis_output_root])  # TEMPORAL USE
 
     os.remove(imglist_path)
 
     # store in each folder
-    for imgpath in glob.glob(os.path.join(tanks_and_temples_input_root, "*.jpg")):
+    for imgpath in glob.glob(os.path.join(davis_input_root, "*.jpg")):
         imgname = os.path.basename(imgpath).split(".")[0]
-        image_folder_path = os.path.join(tanks_and_temples_input_root, imgname, "images")
-        depth_folder_path = os.path.join(tanks_and_temples_input_root, imgname, "depth")
+        image_folder_path = os.path.join(davis_input_root, imgname, "images")
+        depth_folder_path = os.path.join(davis_input_root, imgname, "depth")
         os.makedirs(image_folder_path)
         os.makedirs(depth_folder_path)
         shutil.move(imgpath, image_folder_path)
-        shutil.move(os.path.join(tanks_and_temples_output_root, imgname + ".png"), depth_folder_path)
-        shutil.move(os.path.join(tanks_and_temples_output_root, imgname + ".npy"), depth_folder_path)
+        shutil.move(os.path.join(davis_output_root, imgname + ".png"), depth_folder_path)
+        shutil.move(os.path.join(davis_output_root, imgname + ".npy"), depth_folder_path)
 
 
 def run_trajectory_extraction(scene: str, motion_mode: str, degree: float):
@@ -89,9 +116,9 @@ def run_trajectory_extraction(scene: str, motion_mode: str, degree: float):
     print(f"STARTING task: {task_id}")
     try:
         result = subprocess.run(["python", "src/trajectory_extraction.py",
-            "--image_folder", f"{tanks_and_temples_input_root}/{scene}/images/",
-            "--depth_folder", f"{tanks_and_temples_input_root}/{scene}/depth/",
-            "--output_folder", f"{tanks_and_temples_output_root}/{scene}/{motion_mode}_{degree}/warped",
+            "--image_folder", f"{davis_input_root}/{scene}/images/",
+            "--depth_folder", f"{davis_input_root}/{scene}/depth/",
+            "--output_folder", f"{davis_output_root}/{scene}/{motion_mode}_{degree}/warped",
             "--degrees_per_frame", f"{degree}",
             "--camera_motion_mode", f"{motion_mode}",
             "--major_radius", "80",
@@ -124,8 +151,8 @@ def run_generation_task(scene: str, motion_mode: str, degree: float, gpu_id: int
     try:
         if nvs_solver:
             result = subprocess.run(["python", "src/generate_nvssolver.py",
-                "--output_folder", f"{tanks_and_temples_output_root}/{scene}/{motion_mode}_{degree}/generated",
-                "--trajectory_folder", f"{tanks_and_temples_output_root}/{scene}/{motion_mode}_{degree}/warped",
+                "--output_folder", f"{davis_output_root}/{scene}/{motion_mode}_{degree}/generated",
+                "--trajectory_folder", f"{davis_output_root}/{scene}/{motion_mode}_{degree}/warped",
                 "--num_frames", f"{NUM_FRAMES}",
                 "--num_inference_steps", "100",
                 "--min_guidance_scale", "1.0",
@@ -135,8 +162,8 @@ def run_generation_task(scene: str, motion_mode: str, degree: float, gpu_id: int
                 check=True, capture_output=True, text=True, encoding='utf-8')
         else:
             result = subprocess.run(["python", "src/generate.py",
-                "--output_folder", f"{tanks_and_temples_output_root}/{scene}/{motion_mode}_{degree}/generated",
-                "--trajectory_folder", f"{tanks_and_temples_output_root}/{scene}/{motion_mode}_{degree}/warped",
+                "--output_folder", f"{davis_output_root}/{scene}/{motion_mode}_{degree}/generated",
+                "--trajectory_folder", f"{davis_output_root}/{scene}/{motion_mode}_{degree}/warped",
                 "--num_frames", f"{NUM_FRAMES}",
                 "--num_inference_steps", f"{NUM_INFERECE_STEPS}",
                 "--denoise_start_step", f"{DENOISE_START_STEP}",
@@ -170,7 +197,7 @@ def run_generation_task(scene: str, motion_mode: str, degree: float, gpu_id: int
     return msg
 
 
-def run_pixelwise_metrics_calculation(tanks_and_temples_output_root: str):
+def run_pixelwise_metrics_calculation(davis_output_root: str):
     PSNR_MODULES = [PeakSignalNoiseRatio(data_range=1.0).eval().to(f"cuda:{i}") for i in range(NUM_GPUS)]
     LPIPS_MODULES = [lpips.LPIPS(net='alex', spatial=True).eval().to(f"cuda:{i}") for i in range(NUM_GPUS)]
 
@@ -212,12 +239,12 @@ def run_pixelwise_metrics_calculation(tanks_and_temples_output_root: str):
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=NUM_GPUS) as executor:
         future_to_task_info = {}
-        for idx, scene in enumerate(sorted(os.listdir(tanks_and_temples_output_root))):
-            scene_path = os.path.join(tanks_and_temples_output_root, scene)
+        for idx, scene in enumerate(sorted(os.listdir(davis_output_root))):
+            scene_path = os.path.join(davis_output_root, scene)
             if not os.path.isdir(scene_path):
                 continue
             for motion_degree in os.listdir(scene_path):
-                data_dir = os.path.join(tanks_and_temples_output_root, scene, motion_degree)
+                data_dir = os.path.join(davis_output_root, scene, motion_degree)
                 assert os.path.isdir(data_dir)
 
                 if not os.path.isdir(os.path.join(data_dir, "generated")):
@@ -252,8 +279,8 @@ def run_pixelwise_metrics_calculation(tanks_and_temples_output_root: str):
 
 
 def run_fid_calculation(
-        tanks_and_temples_data_root: str,
-        tanks_and_temples_output_root: str,
+        davis_data_root: str,
+        davis_output_root: str,
     ):
     with tempfile.TemporaryDirectory() as td:
         print(f"[run_fid_calculation] Images are copied to {td} for FID calculation.")
@@ -263,19 +290,19 @@ def run_fid_calculation(
         os.mkdir(generated_folder)
 
         # Copy GT images
-        for scene in os.listdir(tanks_and_temples_data_root):
-            for imgpath in glob.glob(os.path.join(tanks_and_temples_data_root, scene, "*.jpg")):
+        for scene in os.listdir(davis_data_root):
+            for imgpath in glob.glob(os.path.join(davis_data_root, scene, "*.jpg")):
                 imgpath = os.path.normpath(imgpath)
                 shutil.copy(imgpath, os.path.join(gt_folder, imgpath.replace("/", "_")))
         print(f"[run_fid_calculation] Number of GT images: {len(os.listdir(gt_folder))}")
 
         # Copy generated images
-        for scene in os.listdir(tanks_and_temples_output_root):
-            scene_path = os.path.join(tanks_and_temples_output_root, scene)
+        for scene in os.listdir(davis_output_root):
+            scene_path = os.path.join(davis_output_root, scene)
             if not os.path.isdir(scene_path):
                 continue
             for motion_degree in os.listdir(scene_path):
-                for imgpath in glob.glob(os.path.join(tanks_and_temples_output_root, scene, motion_degree, "generated", "*.png")):
+                for imgpath in glob.glob(os.path.join(davis_output_root, scene, motion_degree, "generated", "*.png")):
                     imgpath = os.path.normpath(imgpath)  # delete the leading ./
                     dst_path = os.path.join(generated_folder, imgpath.replace("/", "_"))
                     shutil.copy(imgpath, dst_path)
@@ -297,18 +324,18 @@ def run_fid_calculation(
         return fid
 
 
-def run_camera_pose_error_calculation(tanks_and_temples_output_root: str, gt_focal_len: float = 260.0):
+def run_camera_pose_error_calculation(davis_output_root: str, gt_focal_len: float = 260.0):
     # NOTE: AnyCam only accepts cuda:0
     AnyCam = torch.hub.load('Brummi/anycam', 'AnyCam', version="1.0", training_variant="seq8", pretrained=True).to("cuda:0")
 
     total_results = {}
     missing_videos = []
-    for scene in sorted(os.listdir(tanks_and_temples_output_root)):
-        scene_path = os.path.join(tanks_and_temples_output_root, scene)
+    for scene in sorted(os.listdir(davis_output_root)):
+        scene_path = os.path.join(davis_output_root, scene)
         if not os.path.isdir(scene_path):
             continue
         for motion_degree in os.listdir(scene_path):
-            data_dir = os.path.join(tanks_and_temples_output_root, scene, motion_degree)
+            data_dir = os.path.join(davis_output_root, scene, motion_degree)
             assert os.path.isdir(data_dir)
 
             # Load the video frames and ground truth poses
@@ -351,15 +378,15 @@ def run_camera_pose_error_calculation(tanks_and_temples_output_root: str, gt_foc
     return total_results, missing_videos
 
 
-def run_sed_calculation(tanks_and_temples_output_root: str):
+def run_sed_calculation(davis_output_root: str):
     missing = []
     total_results = {}
-    for scene in tqdm(os.listdir(tanks_and_temples_output_root), desc="Calculating SED"):
-        scene_path = os.path.join(tanks_and_temples_output_root, scene)
+    for scene in tqdm(os.listdir(davis_output_root), desc="Calculating SED"):
+        scene_path = os.path.join(davis_output_root, scene)
         if not os.path.isdir(scene_path):
             continue
         for motion_degree in os.listdir(scene_path):
-            data_dir = os.path.join(tanks_and_temples_output_root, scene, motion_degree)
+            data_dir = os.path.join(davis_output_root, scene, motion_degree)
             assert os.path.isdir(data_dir)
             video_path = os.path.join(data_dir, "generated/generated.mp4")
             camera_paths = os.path.join(data_dir, "warped/*_pose.npy")
@@ -396,18 +423,18 @@ def run_sed_calculation(tanks_and_temples_output_root: str):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Tanks and Temples Evaluation")
-    parser.add_argument("--data_root", type=str, default="/home/ryotaro/data/TanksAndTemples")
+    parser = argparse.ArgumentParser(description="DAVIS Evaluation")
+    parser.add_argument("--data_root", type=str, default="/home/ryotaro/data/DAVIS/JPEGImages/Full-Resolution")
     parser.add_argument("--scratch", action="store_true", help="If set, all the images, depth, and trajectories are re-organized and re-generated.")
     parser.add_argument("--nvs_solver", action="store_true", help="If set, NVS-Solver is used for generation.")
     args = parser.parse_args()
 
     # 1. Organize RGB images & Depth estimation
     if args.scratch:
-        organize_images_and_depth(tanks_and_temples_data_root=args.data_root)
+        organize_images_and_depth(davis_data_root=args.data_root)
 
         scene_motion_degree_pairs = []
-        for i, scene in enumerate(sorted(os.listdir(tanks_and_temples_input_root))):
+        for i, scene in enumerate(sorted(os.listdir(davis_input_root))):
             motion_mode, degree = MOTION_DEGREE_PAIRS[i % len(MOTION_DEGREE_PAIRS)]
             scene_motion_degree_pairs.append((scene, motion_mode, degree))
 
@@ -431,16 +458,16 @@ if __name__ == '__main__':
                     print(f"Main loop caught exception for {task_desc}: {exc}")
 
     else:
-        assert os.path.isdir(tanks_and_temples_output_root)
+        assert os.path.isdir(davis_output_root)
 
         scene_motion_degree_pairs = []
-        for scene in sorted(os.listdir(tanks_and_temples_output_root)):
-            scene_path = os.path.join(tanks_and_temples_output_root, scene)
+        for scene in sorted(os.listdir(davis_output_root)):
+            scene_path = os.path.join(davis_output_root, scene)
             if not os.path.isdir(scene_path):
                 continue
             for motion_degree in os.listdir(scene_path):
-                assert os.path.isdir(os.path.join(tanks_and_temples_output_root, scene, motion_degree, "warped"))
-                if os.path.isdir(os.path.join(tanks_and_temples_output_root, scene, motion_degree, "generated")):
+                assert os.path.isdir(os.path.join(davis_output_root, scene, motion_degree, "warped"))
+                if os.path.isdir(os.path.join(davis_output_root, scene, motion_degree, "generated")):
                     continue
                 motion_mode, degree = motion_degree.split("_")
                 scene_motion_degree_pairs.append((scene, motion_mode, degree))
@@ -470,26 +497,26 @@ if __name__ == '__main__':
                     raise exc
 
         # 4. Pixelwise metrics calculation
-        pixelwise_results, _ = run_pixelwise_metrics_calculation(tanks_and_temples_output_root)
-        with open(os.path.join(tanks_and_temples_output_root, "pixelwise_results.txt"), "w") as f:
+        pixelwise_results, _ = run_pixelwise_metrics_calculation(davis_output_root)
+        with open(os.path.join(davis_output_root, "pixelwise_results.txt"), "w") as f:
             json.dump(pixelwise_results, f, indent=4)
 
         # 5. FID calculation
         fid = run_fid_calculation(
-            tanks_and_temples_data_root=args.data_root,
-            tanks_and_temples_output_root=tanks_and_temples_output_root,
+            davis_data_root=args.data_root,
+            davis_output_root=davis_output_root,
         )
-        with open(os.path.join(tanks_and_temples_output_root, "fid.txt"), "w") as f:
+        with open(os.path.join(davis_output_root, "fid.txt"), "w") as f:
             f.write(str(fid))
 
         # 6. Camera pose error calculation
-        camera_pose_results, _ = run_camera_pose_error_calculation(tanks_and_temples_output_root)
-        with open(os.path.join(tanks_and_temples_output_root, "camera_pose_results.txt"), "w") as f:
+        camera_pose_results, _ = run_camera_pose_error_calculation(davis_output_root)
+        with open(os.path.join(davis_output_root, "camera_pose_results.txt"), "w") as f:
             json.dump(camera_pose_results, f, indent=4)
 
         # 7. SED calculation
-        sed_results = run_sed_calculation(tanks_and_temples_output_root)
-        with open(os.path.join(tanks_and_temples_output_root, "sed.txt"), "w") as f:
+        sed_results = run_sed_calculation(davis_output_root)
+        with open(os.path.join(davis_output_root, "sed.txt"), "w") as f:
             json.dump(sed_results, f, indent=4)
 
     except KeyboardInterrupt:

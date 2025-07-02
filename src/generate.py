@@ -115,11 +115,11 @@ def get_var_data(
         # attention masking
         mask = rearrange(warped_masks_sh < 0.5, "batch num_frames () height width -> (batch num_frames) () height width")
         mask = F.interpolate(mask.float(), size=(h, w), mode="area") > 0.5
-        mask = rearrange(mask, "bf () h w -> bf () () (h w)")
+        mask = rearrange(mask, "bf () h w -> bf () () (h w)").contiguous()
 
     # variance
     var_data_sh = F.scaled_dot_product_attention(
-        q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False
+        q.contiguous(), k.contiguous(), v.contiguous(), attn_mask=mask, dropout_p=0.0, is_causal=False
     )
     var_data_sh = rearrange(var_data_sh, "num_frames num_heads (h w) c2 -> num_frames num_heads c2 h w", h=h, w=w)
     var_data_sh = var_data_sh.mean(dim=1)
@@ -766,33 +766,20 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
 
 
                         # Weighted SEG + APG
-                        base_weight = min(1, 1.5 * i / self._num_timesteps)
+                        base_weight = min(0.999, i / self._num_timesteps)  # NOTE: MUST BE 0.999 TO RECOVER warped_masks_sh IN self.unet
                         weight_map = (1 - warped_masks_sh) * (1 - base_weight) + base_weight
 
-                        # negative unconditional
+                        # negative
                         self.unet.latent_shape_ = (1, num_frames, 8, height//8, width//8)  # NOTE: image_latents is appended so the channel num is 8
-                        self.unet.inject(weight_map)
-                        noise_pred_negative_uncond = self.unet(
-                            latent_model_input[:batch_size],
+                        self.unet.inject(weight_map, query_blur_sigma=4 if i % 2 == 0 else 0.0)
+                        noise_pred_negative = self.unet(
+                            latent_model_input.chunk(2)[i%2],
                             t,
-                            encoder_hidden_states=image_embeddings[:batch_size],
-                            added_time_ids=added_time_ids[:batch_size],
+                            encoder_hidden_states=image_embeddings.chunk(2)[i%2],
+                            added_time_ids=added_time_ids.chunk(2)[i%2],
                             return_dict=False,
                             record_attention=False,
                         )[0]
-
-                        # negative blurred conditional
-                        self.unet.inject(weight_map, query_blur_sigma=4)
-                        noise_pred_negative_cond = self.unet(
-                            latent_model_input[batch_size:],
-                            t,
-                            encoder_hidden_states=image_embeddings[batch_size:],
-                            added_time_ids=added_time_ids[batch_size:],
-                            return_dict=False,
-                            record_attention=False,
-                        )[0]
-
-                        noise_pred_negative = 0.25 * weight_map * noise_pred_negative_cond + (1 - 0.25 * weight_map) * noise_pred_negative_uncond
 
                         # positive
                         self.unet.latent_shape_ = (1, num_frames, 8, height//8, width//8)  # NOTE: image_latents is appended so the channel num is 8
@@ -871,7 +858,7 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
                             )  # warped_latents[batch_size:, 0:1].var()
 
 
-                            var_data *= 2  # NOTE: MAGIC NUMBER!!!!!!!!!!!!
+                            var_data *= 1  # NOTE: MAGIC NUMBER!!!!!!!!!!!!
 
 
                             if i < self._num_timesteps // 2:

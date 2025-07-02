@@ -62,7 +62,7 @@ class MyUNet(UNetSpatioTemporalConditionModel):
         if (weight is not None) and isinstance(weight, torch.Tensor):
             weight = rearrange(weight, "batch frames () h w -> (batch frames) () h w", h=self.latent_shape_[-2], w=self.latent_shape_[-1])
             weight = F.interpolate(weight.float(), size=(h, w), mode="bilinear")
-            weight = rearrange(weight, "bf () h w -> bf () (h w) ()")
+            weight_reshaped = rearrange(weight, "bf () h w -> bf () (h w) ()")
 
         def processor(
             attn,
@@ -86,25 +86,21 @@ class MyUNet(UNetSpatioTemporalConditionModel):
             value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
 
             if self.record_attention_ and (layer, sublayer) in self.record_layer_sublayer:
-                # Modified self-attention computation
-                # inject key and value from the first frame to obtain semantically aligned fieature maps
-                # frame = query.shape[0]
-                # key2 = (key.reshape((1, frame)+key.shape[1:]))[:,:1].repeat((1,frame,1,1,1)).reshape(key.shape)
-                # value2 = (value.reshape((1, frame)+value.shape[1:]))[:,:1].repeat((1,frame,1,1,1)).reshape(value.shape)
-
-                # hidden_states = F.scaled_dot_product_attention(query, key2.clone().detach(), value2.clone().detach(), attn_mask=None, dropout_p=0.0, is_causal=False)
-
                 self.record_query_.append(query)
                 self.record_key_.append(key)
                 # self.record_value_.append(value)
 
             if weight is not None:
-                key *= weight.repeat(key.shape[0] // weight.shape[0], 1, 1, 1)
+                key *= weight_reshaped.repeat(key.shape[0] // weight_reshaped.shape[0], 1, 1, 1)
 
             if query_blur_sigma > 0.0:
                 kernel_size = math.ceil(6 * query_blur_sigma) + 1 - math.ceil(6 * query_blur_sigma) % 2
                 query_reshaped = rearrange(query, "bf heads (h w) c -> bf (heads c) h w", h=h, w=w)
-                query_blurred = gaussian_blur2d(query_reshaped, kernel_size=(kernel_size, kernel_size), sigma=(query_blur_sigma, query_blur_sigma))
+                query_blurred = torch.where(
+                    weight > 0.999,
+                    gaussian_blur2d(query_reshaped, kernel_size=(kernel_size, kernel_size), sigma=(query_blur_sigma, query_blur_sigma)),
+                    gaussian_blur2d(query_reshaped, kernel_size=(3, 3), sigma=(0.5, 0.5))
+                )
                 query = rearrange(query_blurred, "bf (heads c) h w -> bf heads (h w) c", c=query.shape[-1])
                 query = query.contiguous()
                 del query_reshaped, query_blurred

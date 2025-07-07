@@ -490,8 +490,9 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
         # NOTE: The VAE scaling is unnecessary for image_latents
         warped_latents = warped_latents * self.vae.config.scaling_factor
 
-        # For later convenience
-        warped_images = rearrange(warped_images, "f c h w -> () f c h w")
+        # To save memory
+        self.vae.to("cpu")
+        del warped_images, warped_masks
 
         # 5. Get Added Time IDs
         added_time_ids = self._get_add_time_ids(
@@ -599,6 +600,9 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
                         grad = output.grad
                         grads.append(grad)
 
+                        del output
+                        torch.cuda.empty_cache()
+
                 grads1 = torch.cat((grads[0],grads[1][:,:,:,8:,:]),-2)
                 grads2 = torch.cat((grads[2],grads[3][:,:,:,8:,:]),-2)
                 grads3 = torch.cat((grads1,grads2[:,:,:,:,16:]),-1)
@@ -648,6 +652,7 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
 
 
         if not output_type == "latent":
+            self.vae.to(device)
             # cast back to fp16 if needed
             if needs_upcasting:
                 self.vae.to(dtype=torch.float16)

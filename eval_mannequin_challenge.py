@@ -29,7 +29,7 @@ REPAINT_ITER_NUM = 2
 MOTION_MODES = ["horizontal", "vertical", "zoomout"]
 DEGREE_LIST = [-1.0, -0.5, 0.5, 1.0]
 MOTION_DEGREE_PAIRS = [x for x in product(MOTION_MODES, DEGREE_LIST) if x not in [('vertical', -1.0), ('vertical', 1.0)]]
-NUM_GPUS = 3
+NUM_GPUS = 4
 
 
 def reorganize_frames(mannequin_challenge_data_root: str):
@@ -111,7 +111,7 @@ def organize_images_and_depth(mannequin_challenge_data_root: str):
         shutil.move(os.path.join(mannequin_challenge_output_root, imgname + ".npy"), depth_folder_path)
 
 
-def run_trajectory_extraction(scene: str, motion_mode: str, degree: float):
+def run_trajectory_extraction(scene: str, motion_mode: str, degree: float, no_occlusion_revealing: bool = True, save_trajectory: bool = False) -> str:
     task_id = f"Scene: {scene}, Motion: {motion_mode + '_' + str(degree)}"
     print(f"STARTING task: {task_id}")
     try:
@@ -124,7 +124,11 @@ def run_trajectory_extraction(scene: str, motion_mode: str, degree: float):
             "--major_radius", "80",
             "--minor_radius", "70",
             "--num_frames", f"{NUM_FRAMES}",
-            "--no_occlusion_revealing"],
+            ] + (
+                ["--no_occlusion_revealing"] if no_occlusion_revealing else []
+            ) + (
+                ["--save_trajectory"] if save_trajectory else []
+            ),
             check=True, capture_output=True, text=True, encoding='utf-8')
         print(f"COMPLETED task: {task_id}\nSTDOUT:\n{result.stdout.strip()}")
         if result.stderr:
@@ -145,11 +149,13 @@ def run_trajectory_extraction(scene: str, motion_mode: str, degree: float):
         return f"Unexpected error for {task_id}: {e}"
 
 
-def run_generation_task(scene: str, motion_mode: str, degree: float, gpu_id: int, nvs_solver: bool = False) -> str:
+def run_generation_task(scene: str, motion_mode: str, degree: float, gpu_id: int, method: str = "mine") -> str:
     task_id = f"Scene: {scene}, Motion: {motion_mode + '_' + str(degree)}, GPU: {gpu_id}"
     print(f"STARTING task: {task_id}")
+    with torch.cuda.device(f'cuda:{gpu_id}'):
+        torch.cuda.empty_cache()
     try:
-        if nvs_solver:
+        if method == "nvssolver":
             result = subprocess.run(["python", "src/generate_nvssolver.py",
                 "--output_folder", f"{mannequin_challenge_output_root}/{scene}/{motion_mode}_{degree}/generated",
                 "--trajectory_folder", f"{mannequin_challenge_output_root}/{scene}/{motion_mode}_{degree}/warped",
@@ -160,7 +166,18 @@ def run_generation_task(scene: str, motion_mode: str, degree: float, gpu_id: int
                 "--seed", "12345",
                 "--gpu", f"{gpu_id}"],
                 check=True, capture_output=True, text=True, encoding='utf-8')
-        else:
+        elif method == "trajattn":
+            result = subprocess.run(["python", "src/generate_trajattn.py",
+                "--output_folder", f"{mannequin_challenge_output_root}/{scene}/{motion_mode}_{degree}/generated",
+                "--trajectory_folder", f"{mannequin_challenge_output_root}/{scene}/{motion_mode}_{degree}/warped",
+                "--num_frames", f"{NUM_FRAMES}",
+                "--num_inference_steps", "25",
+                "--min_guidance_scale", "1.0",
+                "--max_guidance_scale", "3.0",
+                "--seed", "12345",
+                "--gpu", f"{gpu_id}"],
+                check=True, capture_output=True, text=True, encoding='utf-8')
+        elif method == "mine":
             result = subprocess.run(["python", "src/generate.py",
                 "--output_folder", f"{mannequin_challenge_output_root}/{scene}/{motion_mode}_{degree}/generated",
                 "--trajectory_folder", f"{mannequin_challenge_output_root}/{scene}/{motion_mode}_{degree}/warped",
@@ -173,6 +190,8 @@ def run_generation_task(scene: str, motion_mode: str, degree: float, gpu_id: int
                 "--seed", "12345",
                 "--gpu", f"{gpu_id}"],
                 check=True, capture_output=True, text=True, encoding='utf-8')
+        else:
+            raise NotImplementedError(f"Method '{method}' is not implemented.")
         print(f"COMPLETED task: {task_id}\nSTDOUT:\n{result.stdout.strip()}")
         if result.stderr:
             print(f"STDERR for {task_id}:\n{result.stderr.strip()}")
@@ -325,12 +344,36 @@ def run_fid_calculation(
 
 
 def run_camera_pose_error_calculation(mannequin_challenge_output_root: str, gt_focal_len: float = 260.0):
-    # NOTE: AnyCam only accepts cuda:0
-    AnyCam = torch.hub.load('Brummi/anycam', 'AnyCam', version="1.0", training_variant="seq8", pretrained=True).to("cuda:0")
+    ANYCAM_MODULES = [torch.hub.load('Brummi/anycam', 'AnyCam', version="1.0", training_variant="seq8", pretrained=True).eval().to(f"cuda:{i}") for i in range(1)]
 
     total_results = {}
     missing_videos = []
-    for scene in sorted(os.listdir(mannequin_challenge_output_root)):
+
+    def run_task(data_dir: str, gpu_id: int):
+        AnyCam = ANYCAM_MODULES[gpu_id]
+        frames = load_video(os.path.join(data_dir, "generated/generated.mp4"))
+        frames = [np.array(x).astype(np.float32) / 255.0 for x in frames]
+        height, width, _ = frames[0].shape
+        gt_poses_w2c = [np.load(os.path.join(data_dir, f"warped/{i:04d}_pose.npy")) for i in range(len(frames))]
+        gt_poses_c2w = [np.linalg.inv(p) for p in gt_poses_w2c]
+        gt_K = np.array([
+            [gt_focal_len, 0, width/2],
+            [0, gt_focal_len, height/2],
+            [0, 0, 1],
+        ], dtype=np.float32)
+
+        # Estimate the camera poses and intrinsics from the generated video
+        anycam_ret = AnyCam.process_video(frames, ba_refinement=True)
+        estimated_poses_c2w = [p.cpu().numpy() for p in anycam_ret["trajectory"]]  # Camera poses
+        estimated_K = anycam_ret["projection_matrix"].cpu().numpy()  # Camera intrinsics
+
+        # compute errors
+        results, estimated_abs_poses_c2w, gt_abs_poses_c2w = eval_trajectories(estimated_poses_c2w, gt_poses_c2w, estimated_K, gt_K)
+        total_results[data_dir] = results
+
+
+    # NOTE: AnyCam somehow doesn't support multi-GPU inference, so we use only one GPU.
+    for idx, scene in enumerate(sorted(os.listdir(mannequin_challenge_output_root))):
         scene_path = os.path.join(mannequin_challenge_output_root, scene)
         if not os.path.isdir(scene_path):
             continue
@@ -343,25 +386,8 @@ def run_camera_pose_error_calculation(mannequin_challenge_output_root: str, gt_f
                 print(f"Missing video for {data_dir}")
                 missing_videos.append(data_dir)
                 continue
-            frames = load_video(os.path.join(data_dir, "generated/generated.mp4"))
-            frames = [np.array(x).astype(np.float32) / 255.0 for x in frames]
-            height, width, _ = frames[0].shape
-            gt_poses_w2c = [np.load(os.path.join(data_dir, f"warped/{i:04d}_pose.npy")) for i in range(len(frames))]
-            gt_poses_c2w = [np.linalg.inv(p) for p in gt_poses_w2c]
-            gt_K = np.array([
-                [gt_focal_len, 0, width/2],
-                [0, gt_focal_len, height/2],
-                [0, 0, 1],
-            ], dtype=np.float32)
 
-            # Estimate the camera poses and intrinsics from the generated video
-            anycam_ret = AnyCam.process_video(frames, ba_refinement=True)
-            estimated_poses_c2w = [p.cpu().numpy() for p in anycam_ret["trajectory"]]  # Camera poses
-            estimated_K = anycam_ret["projection_matrix"].cpu().numpy()  # Camera intrinsics
-
-            # compute errors
-            results, estimated_abs_poses_c2w, gt_abs_poses_c2w = eval_trajectories(estimated_poses_c2w, gt_poses_c2w, estimated_K, gt_K)
-            total_results[data_dir] = results
+            run_task(data_dir, 0)
 
     total_ape_mean = sum([result["ape_mean"] for result in total_results.values()]) / len(total_results)
     total_rre_mean = sum([result["rre_mean"] for result in total_results.values()]) / len(total_results)
@@ -426,7 +452,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Mannequin Challenge Evaluation")
     parser.add_argument("--data_root", type=str, default="/home/ryotaro/data/MannequinChallengeHQ/validation_frames")
     parser.add_argument("--scratch", action="store_true", help="If set, all the images, depth, and trajectories are re-organized and re-generated.")
-    parser.add_argument("--nvs_solver", action="store_true", help="If set, NVS-Solver is used for generation.")
+    parser.add_argument("--method", type=str, default="mine", choices=["nvssolver", "trajattn", "mine"], help="Method to use for generation. 'nvssolver' uses NVS-Solver, 'trajattn' uses Trajectory Attention, and 'mine' uses the custom method.")
     args = parser.parse_args()
 
     # 1. Organize RGB images & Depth estimation
@@ -444,7 +470,7 @@ if __name__ == '__main__':
         with concurrent.futures.ThreadPoolExecutor(max_workers=31) as executor:
             future_to_task_info = {}
             for scene, motion, degree in scene_motion_degree_pairs:
-                future = executor.submit(run_trajectory_extraction, scene, motion, degree)
+                future = executor.submit(run_trajectory_extraction, scene, motion, degree, save_trajectory=(args.method == "trajattn"))
                 future_to_task_info[future] = (scene, motion, degree, None)
                 job_idx += 1 # This ensures round-robin submission to GPUs
 
@@ -482,7 +508,7 @@ if __name__ == '__main__':
             future_to_task_info = {}
             for scene, motion, degree in scene_motion_degree_pairs:
                 gpu_id_for_task = job_idx_for_gpu_assignment % NUM_GPUS
-                future = executor.submit(run_generation_task, scene, motion, degree, gpu_id_for_task, args.nvs_solver)
+                future = executor.submit(run_generation_task, scene, motion, degree, gpu_id_for_task, args.method)
                 future_to_task_info[future] = (scene, motion, degree, gpu_id_for_task)
                 job_idx_for_gpu_assignment += 1 # This ensures round-robin submission to GPUs
 

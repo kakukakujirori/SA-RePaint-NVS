@@ -338,6 +338,7 @@ def save_warped_image(
         minor_radius: float = 70,
         camera_motion_mode: str = "horizontal",
         no_occlusion_revealing: bool = False,
+        save_trajectory: bool = False,
     ) -> None:
     """
     The images will be center cropped after each warp.
@@ -347,8 +348,8 @@ def save_warped_image(
 
     poses = generate_camera_poses(num_frames, degrees_per_frame,major_radius, minor_radius,camera_motion_mode)
 
-    near=0.0001
-    far=10000.
+    near = 0.0001
+    far = 10000.
     focal = 260.
     K = np.eye(3)
     K[0,0] = focal; K[1,1] = focal; K[0,2] = width/2.0; K[1,2] = height/2.0
@@ -360,7 +361,7 @@ def save_warped_image(
     trans_valid_list = []
 
     for i, pose_t in enumerate(poses):
-        np.save(os.path.join(save_path,str(i).zfill(4)+"_pose.npy"), pose_t)
+        np.save(os.path.join(save_path, str(i).zfill(4)+"_pose.npy"), pose_t)
 
         image = Image.open(images_lists[i])
         image = np.array(image)
@@ -400,24 +401,28 @@ def save_warped_image(
         mask = 1 - mask2
         mask[mask < 0.5] = 0
         mask[mask >= 0.5] = 1
-        mask = np.repeat(mask[:,:,np.newaxis]*255.,repeats=3,axis=2)
+        mask = np.repeat(mask[:,:,np.newaxis]*255., repeats=3, axis=2)
 
         kernel = np.ones((5,5), np.uint8)
         mask_erosion = cv2.dilate(np.array(mask), kernel)
         mask_erosion = Image.fromarray(np.uint8(mask_erosion))
-        mask_erosion.save(os.path.join(save_path,str(i).zfill(4)+"_mask.png"))
+        mask_erosion.save(os.path.join(save_path, str(i).zfill(4)+"_mask.png"))
 
         mask_erosion_ = np.array(mask_erosion)/255.
         mask_erosion_[mask_erosion_ < 0.5] = 0
         mask_erosion_[mask_erosion_ >= 0.5] = 1
-        warped_frame2 = Image.fromarray(np.uint8(warped_frame2))
         warped_frame2 = Image.fromarray(np.uint8(warped_frame2 * (1-mask_erosion_)))
-        warped_frame2.save(os.path.join(save_path,str(i).zfill(4)+".png"))
+        warped_frame2.save(os.path.join(save_path, str(i).zfill(4)+".png"))
 
-    trans_coordinates = np.stack(trans_coordinates_list, axis=0)
-    trans_valid = np.stack(trans_valid_list, axis=0)
-    # np.save(os.path.join(save_path, 'trans_coordinates.npy'), trans_coordinates)
-    # np.save(os.path.join(save_path, 'trans_valid.npy'), trans_valid)
+    # overwrite the first frame trans coordinates and valid (just in case)
+    trans_coordinates_list[0] = create_grid(crop_height, crop_width)
+    trans_valid_list[0] = trans_valid_list[0] + True
+
+    if save_trajectory:
+        trans_coordinates = np.stack(trans_coordinates_list, axis=0)
+        trans_valid = np.stack(trans_valid_list, axis=0)
+        np.save(os.path.join(save_path, 'trans_coordinates.npy'), trans_coordinates)
+        np.save(os.path.join(save_path, 'trans_valid.npy'), trans_valid)
 
     return None
 
@@ -484,10 +489,17 @@ if __name__== '__main__':
         type=str,
         default='image'
     )
+
     parser.add_argument(
         "--no_occlusion_revealing",
         action="store_true",
         help="If set, the pixels once occluded in the past frames never show up in the latter frames."
+    )
+
+    parser.add_argument(
+        "--save_trajectory",
+        action="store_true",
+        help="If set, the trajectory will be saved as a numpy file."
     )
 
     args = parser.parse_args()
@@ -525,5 +537,7 @@ if __name__== '__main__':
         args.major_radius,
         args.minor_radius,
         args.camera_motion_mode,
-        args.no_occlusion_revealing)
+        args.no_occlusion_revealing,
+        args.save_trajectory,
+    )
     print(f"Trajectory extraction finished, saved to {args.output_folder}")

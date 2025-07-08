@@ -29,7 +29,7 @@ REPAINT_ITER_NUM = 2
 MOTION_MODES = ["horizontal", "vertical", "zoomout"]
 DEGREE_LIST = [-1.0, -0.5, 0.5, 1.0]
 MOTION_DEGREE_PAIRS = [x for x in product(MOTION_MODES, DEGREE_LIST) if x not in [('vertical', -1.0), ('vertical', 1.0)]]
-NUM_GPUS = 4
+GPUS = [0, 1, 2, 3]
 
 
 def reorganize_frames(davis_data_root: str):
@@ -177,6 +177,15 @@ def run_generation_task(scene: str, motion_mode: str, degree: float, gpu_id: int
                 "--seed", "12345",
                 "--gpu", f"{gpu_id}"],
                 check=True, capture_output=True, text=True, encoding='utf-8')
+        elif method == "trajcrafter":
+            result = subprocess.run(["python", "src/generate_trajcrafter.py",
+                "--output_folder", f"{davis_output_root}/{scene}/{motion_mode}_{degree}/generated",
+                "--trajectory_folder", f"{davis_output_root}/{scene}/{motion_mode}_{degree}/warped",
+                "--num_frames", f"{NUM_FRAMES}",
+                "--num_inference_steps", "50",
+                "--seed", "12345",
+                "--gpu", f"{gpu_id}"],
+                check=True, capture_output=True, text=True, encoding='utf-8')
         elif method == "mine":
             result = subprocess.run(["python", "src/generate.py",
                 "--output_folder", f"{davis_output_root}/{scene}/{motion_mode}_{degree}/generated",
@@ -217,8 +226,8 @@ def run_generation_task(scene: str, motion_mode: str, degree: float, gpu_id: int
 
 
 def run_pixelwise_metrics_calculation(davis_output_root: str):
-    PSNR_MODULES = [PeakSignalNoiseRatio(data_range=1.0).eval().to(f"cuda:{i}") for i in range(NUM_GPUS)]
-    LPIPS_MODULES = [lpips.LPIPS(net='alex', spatial=True).eval().to(f"cuda:{i}") for i in range(NUM_GPUS)]
+    PSNR_MODULES = [PeakSignalNoiseRatio(data_range=1.0).eval().to(f"cuda:{i}") for i in GPUS]
+    LPIPS_MODULES = [lpips.LPIPS(net='alex', spatial=True).eval().to(f"cuda:{i}") for i in GPUS]
 
     total_results = {}
     missing = []
@@ -256,7 +265,7 @@ def run_pixelwise_metrics_calculation(davis_output_root: str):
         total_results[data_dir] = results
 
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=NUM_GPUS) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(GPUS)) as executor:
         future_to_task_info = {}
         for idx, scene in enumerate(sorted(os.listdir(davis_output_root))):
             scene_path = os.path.join(davis_output_root, scene)
@@ -271,16 +280,16 @@ def run_pixelwise_metrics_calculation(davis_output_root: str):
                     missing.append(data_dir)
                     continue
 
-                future = executor.submit(run_task, data_dir, idx % NUM_GPUS)
-                future_to_task_info[future] = (data_dir, idx % NUM_GPUS)
+                future = executor.submit(run_task, data_dir, GPUS[idx % len(GPUS)])
+                future_to_task_info[future] = (data_dir, GPUS[idx % len(GPUS)])
 
         for future in tqdm(concurrent.futures.as_completed(future_to_task_info), total=len(future_to_task_info), desc="Calculating pixelwise metrics"):
             data_dir, gpu_id = future_to_task_info[future]
             task_desc = f"{data_dir=}, {gpu_id=}"
             try:
-                result_message = future.result() # This will re-raise exceptions from run_generation_task
+                result_message = future.result()
                 # print(f"Result for {task_desc}: {result_message}")
-            except Exception as exc: # Should be caught by try/except in run_generation_task but good to have a fallback here.
+            except Exception as exc:
                 print(f"Main loop caught exception for {task_desc}: {exc}")
                 raise exc
 
@@ -452,7 +461,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="DAVIS Evaluation")
     parser.add_argument("--data_root", type=str, default="/home/ryotaro/data/DAVIS/JPEGImages/Full-Resolution")
     parser.add_argument("--scratch", action="store_true", help="If set, all the images, depth, and trajectories are re-organized and re-generated.")
-    parser.add_argument("--method", type=str, default="mine", choices=["nvssolver", "trajattn", "mine"], help="Method to use for generation. 'nvssolver' uses NVS-Solver, 'trajattn' uses Trajectory Attention, and 'mine' uses the custom method.")
+    parser.add_argument("--method", type=str, default="mine", choices=["nvssolver", "trajattn", "trajcrafter", "mine"], help="Method to use for generation. 'nvssolver' uses NVS-Solver, 'trajattn' uses Trajectory Attention, and 'mine' uses the custom method.")
     args = parser.parse_args()
 
     # 1. Organize RGB images & Depth estimation
@@ -478,9 +487,9 @@ if __name__ == '__main__':
                 scene, motion, degree, gpu_id = future_to_task_info[future]
                 task_desc = f"Scene: {scene}, Motion: {motion + '_' + str(degree)}, GPU: {gpu_id}"
                 try:
-                    result_message = future.result() # This will re-raise exceptions from run_generation_task
+                    result_message = future.result()
                     # print(f"Result for {task_desc}: {result_message}")
-                except Exception as exc: # Should be caught by try/except in run_generation_task but good to have a fallback here.
+                except Exception as exc:
                     print(f"Main loop caught exception for {task_desc}: {exc}")
 
     else:
@@ -503,10 +512,10 @@ if __name__ == '__main__':
     try:
         # 3. Generation
         job_idx_for_gpu_assignment = 0
-        with concurrent.futures.ThreadPoolExecutor(max_workers=NUM_GPUS) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(GPUS)) as executor:
             future_to_task_info = {}
             for scene, motion, degree in scene_motion_degree_pairs:
-                gpu_id_for_task = job_idx_for_gpu_assignment % NUM_GPUS
+                gpu_id_for_task = GPUS[job_idx_for_gpu_assignment % len(GPUS)]
                 future = executor.submit(run_generation_task, scene, motion, degree, gpu_id_for_task, args.method)
                 future_to_task_info[future] = (scene, motion, degree, gpu_id_for_task)
                 job_idx_for_gpu_assignment += 1 # This ensures round-robin submission to GPUs

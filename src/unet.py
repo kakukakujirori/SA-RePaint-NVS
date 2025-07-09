@@ -20,12 +20,68 @@ from kornia.filters import gaussian_blur2d
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 
+@torch.jit.script
+def spatially_variable_gaussian_blur2d(
+        input: torch.Tensor,
+        sigma_map: torch.Tensor,
+        kernel_size: int,
+    ) -> torch.Tensor:
+    """
+    Applies a spatially-variable Gaussian blur to an image tensor 'input' based on 'sigma_map'.
+
+    Args:
+        input (torch.Tensor): Input RGB image tensor of shape (B, C, H, W).
+        sigma_map (torch.Tensor): Grayscale map tensor of shape (B, 1, H, W).
+        kernel_size (int): The maximum size of the Gaussian kernel. Must be an odd number.
+
+    Returns:
+        torch.Tensor: The blurred image tensor of shape (B, C, H, W).
+    """
+    B, C, H, W = input.shape
+    assert sigma_map.shape == (B, 1, H, W)
+    assert input.dtype == sigma_map.dtype
+    assert kernel_size % 2 == 1
+
+    # generate 1D gaussian kernel
+    kernel_half_size = kernel_size // 2
+    kernel_coords = torch.arange(-kernel_half_size, kernel_half_size + 1, dtype=input.dtype, device=input.device)
+    kernel_coords = kernel_coords.view(1, 1, 1, 1, kernel_size)
+
+    # generate a 1D kernel per pixel
+    sigma_map_expanded = sigma_map.unsqueeze(-1)
+    kernels_1d = torch.exp(-0.5 * (kernel_coords / (sigma_map_expanded + 1e-6))**2)
+    kernels_1d = kernels_1d / kernels_1d.sum(dim=-1, keepdim=True)
+    # kernels_1d shape: (B, 1, H, W, kernel_size)
+
+    # horizontal blur
+    padding_h = (kernel_size - 1) // 2
+    input_padded_h = F.pad(input, (padding_h, padding_h, 0, 0), mode='reflect')
+    unfolded_input_h = input_padded_h.unfold(3, kernel_size, 1)
+
+    kernels_h = kernels_1d.expand(-1, C, -1, -1, -1)
+    blurred_input_h = (unfolded_input_h * kernels_h).sum(dim=-1)
+    # blurred_input_h shape: (B, C, H, W)
+
+    # vertical blur
+    padding_v = (kernel_size - 1) // 2
+    input_padded_v = F.pad(blurred_input_h, (0, 0, padding_v, padding_v), mode='reflect')
+    unfolded_input_v = input_padded_v.permute(0, 1, 3, 2).unfold(3, kernel_size, 1)
+
+    kernels_v = kernels_1d.permute(0, 1, 3, 2, 4).expand(-1, C, -1, -1, -1)
+
+    blurred_input_v_permuted = (unfolded_input_v * kernels_v).sum(dim=-1)
+    blurred_input = blurred_input_v_permuted.permute(0, 1, 3, 2)
+    # blurred_input shape: (B, C, H, W)
+
+    return blurred_input
+
+
 class MyUNet(UNetSpatioTemporalConditionModel):
     """
     Modified from SVD implementation
     https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/unets/unet_spatio_temporal_condition.py
     """
-    def inject(self, weight: Optional[torch.Tensor] = None, query_blur_sigma: float = 0.0):
+    def inject(self, kv_weight: Optional[torch.Tensor] = None, query_blur_sigma: Optional[torch.Tensor] = None):
         # for (layer, downsample_block) in enumerate(self.down_blocks):  # ['CrossAttnDownBlockSpatioTemporal', 'CrossAttnDownBlockSpatioTemporal', 'CrossAttnDownBlockSpatioTemporal', 'DownBlockSpatioTemporal']
         #     if layer == 3:
         #         continue
@@ -42,7 +98,7 @@ class MyUNet(UNetSpatioTemporalConditionModel):
                 continue
             for (sublayer, trans) in enumerate(upsample_block.attentions):  # ['TransformerSpatioTemporalModel', 'TransformerSpatioTemporalModel', 'TransformerSpatioTemporalModel']
                 basictrans = trans.transformer_blocks[0]  # BasicTransformerBlock (spatial)
-                basictrans.attn1.processor = self.my_self_attention(layer, sublayer, weight, query_blur_sigma)
+                basictrans.attn1.processor = self.my_self_attention(layer, sublayer, kv_weight, query_blur_sigma)
                 # tmpbasictrans = trans.temporal_transformer_blocks[0]  # TemporalBasicTransformerBlock (temporal)
                 # tmpbasictrans.attn1.processor = self.my_temporal_attention(layer, sublayer, mask)
 
@@ -54,15 +110,20 @@ class MyUNet(UNetSpatioTemporalConditionModel):
     record_key_ = []
     record_value_ = []
 
-    def my_self_attention(self, layer: int, sublayer: int, weight: Optional[torch.Tensor] = None, query_blur_sigma: float = 0.0) -> AttentionProcessor:
+    def my_self_attention(self, layer: int, sublayer: int, kv_weight: Optional[torch.Tensor] = None, query_blur_sigma: Optional[torch.Tensor] = None) -> AttentionProcessor:
         compress_factor = [8, 4, 2, 1][layer]
         h = self.latent_shape_[-2] // compress_factor
         w = self.latent_shape_[-1] // compress_factor
 
-        if (weight is not None) and isinstance(weight, torch.Tensor):
-            weight = rearrange(weight, "batch frames () h w -> (batch frames) () h w", h=self.latent_shape_[-2], w=self.latent_shape_[-1])
-            weight = F.interpolate(weight.float(), size=(h, w), mode="bilinear")
-            weight_reshaped = rearrange(weight, "bf () h w -> bf () (h w) ()")
+        if (kv_weight is not None) and isinstance(kv_weight, torch.Tensor):
+            kv_weight = rearrange(kv_weight, "batch frames () h w -> (batch frames) () h w", h=self.latent_shape_[-2], w=self.latent_shape_[-1])
+            kv_weight = F.interpolate(kv_weight.float(), size=(h, w), mode="bilinear")
+            kv_weight_reshaped = rearrange(kv_weight, "bf () h w -> bf () (h w) ()")
+
+        if (query_blur_sigma is not None) and isinstance(query_blur_sigma, torch.Tensor):
+            query_blur_sigma = rearrange(query_blur_sigma, "batch frames () h w -> (batch frames) () h w", h=self.latent_shape_[-2], w=self.latent_shape_[-1])
+            query_blur_sigma = F.interpolate(query_blur_sigma.float(), size=(h, w), mode="bilinear")
+            # query_blur_sigma /= compress_factor
 
         def processor(
             attn,
@@ -90,17 +151,24 @@ class MyUNet(UNetSpatioTemporalConditionModel):
                 self.record_key_.append(key)
                 # self.record_value_.append(value)
 
-            if weight is not None:
-                key *= weight_reshaped.repeat(key.shape[0] // weight_reshaped.shape[0], 1, 1, 1)
+            if kv_weight is not None:
+                key *= kv_weight_reshaped.repeat(key.shape[0] // kv_weight_reshaped.shape[0], 1, 1, 1)
 
-            if query_blur_sigma > 0.0:
-                kernel_size = math.ceil(6 * query_blur_sigma) + 1 - math.ceil(6 * query_blur_sigma) % 2
+            if query_blur_sigma is not None:
                 query_reshaped = rearrange(query, "bf heads (h w) c -> bf (heads c) h w", h=h, w=w)
-                query_blurred = torch.where(
-                    weight > 0.999,
-                    gaussian_blur2d(query_reshaped, kernel_size=(kernel_size, kernel_size), sigma=(query_blur_sigma, query_blur_sigma)),
-                    gaussian_blur2d(query_reshaped, kernel_size=(3, 3), sigma=(0.5, 0.5))
-                )
+
+                if isinstance(query_blur_sigma, int | float):
+                    kernel_size = min(math.ceil(6 * query_blur_sigma), min(query_reshaped.shape[-2:]))
+                    kernel_size = kernel_size + 1 - kernel_size % 2  # ensure kernel size is odd
+                    query_blurred = gaussian_blur2d(query_reshaped, kernel_size, (query_blur_sigma, query_blur_sigma))
+                elif isinstance(query_blur_sigma, torch.Tensor):
+                    query_blur_sigma_max = query_blur_sigma.max()
+                    kernel_size = min(math.ceil(6 * query_blur_sigma_max), min(query_reshaped.shape[-2:]))
+                    kernel_size = kernel_size + 1 - kernel_size % 2  # ensure kernel size is odd
+                    query_blurred = spatially_variable_gaussian_blur2d(query_reshaped, query_blur_sigma.to(query_reshaped), kernel_size)
+                else:
+                    raise NotImplementedError(f"Invalid data type: {type(query_blur_sigma)=}")
+
                 query = rearrange(query_blurred, "bf (heads c) h w -> bf heads (h w) c", c=query.shape[-1])
                 query = query.contiguous()
                 del query_reshaped, query_blurred

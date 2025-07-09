@@ -67,7 +67,7 @@ def adaptive_projected_guidance(
     if norm_threshold > 0:
         ones = torch.ones_like(diff)
         diff_norm = diff.norm(p=2, dim=[-1, -2, -3, -4], keepdim=True)
-        print(f"[adaptive_projected_guidance] {norm_threshold=}, {diff_norm=}")
+        print(f"[adaptive_projected_guidance] {norm_threshold=}, {diff_norm.item()=}")
         scale_factor = torch.minimum(ones, norm_threshold / diff_norm)
         diff = diff * scale_factor
     diff_parallel, diff_orthogonal = project(diff, pred_cond)
@@ -686,21 +686,26 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
                         # Concatenate image_latents over channels dimension
                         latent_model_input = torch.cat([latent_model_input, image_latents], dim=2)
 
-
-
-
                         # Weighted SEG + APG
-                        base_weight = min(0.999, i / self._num_timesteps)  # NOTE: MUST BE 0.999 TO RECOVER warped_masks_sh IN self.unet
+                        base_weight = min(0.999, i / self._num_timesteps)
                         weight_map = (1 - warped_masks_sh) * (1 - base_weight) + base_weight
 
                         # negative
+                        query_blur_sigma_invalid_max = 4  # TODO: MAGIC NUMBER!!!
+                        query_blur_sigma_invalid_min = 0  # TODO: MAGIC NUMBER!!!
+                        query_blur_sigma_invalid = query_blur_sigma_invalid_min + (query_blur_sigma_invalid_max - query_blur_sigma_invalid_min) * i / self._num_timesteps
+                        query_blur_sigma_valid = 4  # TODO: MAGIC NUMBER!!!
+                        query_blur_sigma = (1 - warped_masks_sh) * query_blur_sigma_valid + warped_masks_sh * query_blur_sigma_invalid
+
+                        use_seg = i % 2 != 0
+
                         self.unet.latent_shape_ = (1, num_frames, 8, height//8, width//8)  # NOTE: image_latents is appended so the channel num is 8
-                        self.unet.inject(weight_map, query_blur_sigma=4 if i % 2 == 0 else 0.0)
+                        self.unet.inject(weight_map, query_blur_sigma=query_blur_sigma if use_seg else None)
                         noise_pred_negative = self.unet(
-                            latent_model_input.chunk(2)[i%2],
+                            latent_model_input.chunk(2)[1 if use_seg else 0],
                             t,
-                            encoder_hidden_states=image_embeddings.chunk(2)[i%2],
-                            added_time_ids=added_time_ids.chunk(2)[i%2],
+                            encoder_hidden_states=image_embeddings.chunk(2)[1 if use_seg else 0],
+                            added_time_ids=added_time_ids.chunk(2)[1 if use_seg else 0],
                             return_dict=False,
                             record_attention=False,
                         )[0]
@@ -724,9 +729,6 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
                             self.guidance_scale,
                             momentum_buffer,
                         )
-
-
-
 
                         # retrieve qk
                         attn_query = self.unet.record_query_[0]
@@ -781,8 +783,11 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
                                 use_first_frame=True,
                             )  # warped_latents[batch_size:, 0:1].var()
 
+                            # os.makedirs("dump", exist_ok=True)
+                            # torch.save(var_data, f"dump/var_data_{i}_{j}.pt")
 
-                            var_data *= 1  # NOTE: MAGIC NUMBER!!!!!!!!!!!!
+
+                            var_data *= 2  # NOTE: MAGIC NUMBER!!!!!!!!!!!!
 
 
                             if i < self._num_timesteps // 2:
@@ -805,22 +810,22 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
                                 cov_pseudo_x0_derivative = guided_blur_2D(var_data, cov_pseudo_x0_derivative)
 
                                 coeff_A = var_derivative - identity
-                                coeff_B = (-1) * cov_pseudo_x0_derivative
+                                coeff_B = cov_pseudo_x0_derivative
                                 coeff_C = (var_pseudo_x0 - var_data)
 
-                                nunom = coeff_B - torch.sqrt(torch.relu(coeff_B.pow(2) - coeff_A * coeff_C))
+                                nunom = (-1) * coeff_B + torch.sign(coeff_B) * torch.sqrt(torch.relu(coeff_B.pow(2) - coeff_A * coeff_C))
                                 sigma_s = safe_division_3D(nunom, coeff_A, k_spatial, k_temporal)
                                 sigma_s = guided_blur_2D(var_data, sigma_s)
                                 sigma_s = torch.clamp(sigma_s, 0, sigma_t)
 
+                                var_data = var_data[:, :, [0, 5, 10, 15], :, :]
+                                sigma_s = sigma_s[:, :, [0, 5, 10, 15], :, :]
+
+
                                 # torch.save(sigma_s, f"dump/sigma_s_{i}_{j}.pt")
 
 
-
-
-                            var_data = var_data[:, :, [0, 5, 10, 15], :, :]
-                            sigma_s = sigma_s[:, :, [0, 5, 10, 15], :, :] if isinstance(sigma_s, torch.Tensor) else sigma_s
-                            print(f"{sigma_s=}, {sigma_t=}")
+                            # print(f"{sigma_s=}, {sigma_t=}")
 
 
                             # direct pasting
@@ -840,14 +845,6 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
                                 posterior_sigma=posterior_sigma,
                                 generator=generator,
                             )
-
-
-                            print(f"{latents_ori=}, {(var_data + sigma_t**2)=}")
-                            print(f"{pseudo_x0=}, {var_data=}")
-                            print(f"{latents_mid=}, {var_data + sigma_s**2=}")
-                            print(f"{latents=}, {(var_data + sigma_t**2)=}")
-                            print()
-
 
                         else:
                             pass

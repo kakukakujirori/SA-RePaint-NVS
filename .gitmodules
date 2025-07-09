@@ -1,0 +1,9 @@
+[submodule "tools/TrajectoryAttention"]
+	path = tools/TrajectoryAttention
+	url = https://github.com/xizaoqu/TrajectoryAttention.git
+[submodule "tools/TrajectoryCrafter"]
+	path = tools/TrajectoryCrafter
+	url = https://github.com/TrajectoryCrafter/TrajectoryCrafter.git
+[submodule "tools/FVD"]
+	path = tools/FVD
+	url = https://github.com/zhizhou57/FVD.git

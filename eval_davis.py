@@ -12,12 +12,15 @@ from tqdm import tqdm
 import lpips
 import numpy as np
 import torch
+import torch.nn.functional as F
 import torch_fidelity
 from diffusers.utils import load_image, load_video
+from fvdcal import FVDCalculation
 from torchmetrics.image import PeakSignalNoiseRatio
 
-from src.eval_trajectories import eval_trajectories
 from src.eval_sed import eval_sed
+from src.eval_ssim import ssim
+from src.eval_trajectories import eval_trajectories
 
 
 davis_input_root = "./davis_input"
@@ -225,9 +228,9 @@ def run_generation_task(scene: str, motion_mode: str, degree: float, gpu_id: int
     return msg
 
 
-def run_pixelwise_metrics_calculation(davis_output_root: str):
-    PSNR_MODULES = [PeakSignalNoiseRatio(data_range=1.0).eval().to(f"cuda:{i}") for i in GPUS]
-    LPIPS_MODULES = [lpips.LPIPS(net='alex', spatial=True).eval().to(f"cuda:{i}") for i in GPUS]
+def run_pixelwise_metrics_calculation(davis_output_root: str, allow_resize: bool = False):
+    PSNR_MODULES = {i: PeakSignalNoiseRatio(data_range=1.0).eval().to(f"cuda:{i}") for i in GPUS}
+    LPIPS_MODULES = {i: lpips.LPIPS(net='alex', spatial=True).eval().to(f"cuda:{i}") for i in GPUS}
 
     total_results = {}
     missing = []
@@ -248,15 +251,25 @@ def run_pixelwise_metrics_calculation(davis_output_root: str):
         warped_tensor = torch.stack([torch.from_numpy(np.array(x).astype(np.float32) / 255.0).permute(2, 0, 1) for x in warped_frames], dim=0).to(device)
         generated_tensor = torch.stack([torch.from_numpy(np.array(x).astype(np.float32) / 255.0).permute(2, 0, 1) for x in generated_frames], dim=0).to(device)
 
+        # align shapes (generated tensor may be smaller than warped_tensor)
+        if allow_resize:
+            print(f"[run_pixelwise_metrics_calculation] WARNING: Resizing input videos to match the generated video shapes.")
+            _, _, h_generated, w_generated = generated_tensor.shape
+            mask_tensor = F.interpolate(mask_tensor, (h_generated, w_generated), mode="area")
+            warped_tensor = F.interpolate(warped_tensor, (h_generated, w_generated), mode="bilinear")
+
         # binarize the mask
         mask_tensor_bool = mask_tensor < 0.5
         mask_tensor_float = mask_tensor_bool.float().mean(dim=1, keepdim=True)
 
-        # calculate psnr, lpips (NOTE: image range is [-1, 1] for LPIPS)
+        # calculate psnr, ssim, lpips (NOTE: image range is [-1, 1] for LPIPS)
         results = {}
         with torch.no_grad():
             psnr_score = PSNR(warped_tensor[mask_tensor_bool], generated_tensor[mask_tensor_bool])
             results["psnr"] = psnr_score.item()
+
+            ssim_score = ssim(warped_tensor, generated_tensor, mask=mask_tensor_bool, data_range=1.0, size_average=True)
+            results["ssim"] = ssim_score.item()
 
             lpips_full = LPIPS(warped_tensor * 2 - 1, generated_tensor * 2 - 1)
             lpips_score = torch.sum(lpips_full * mask_tensor_float) / torch.sum(mask_tensor_float)
@@ -295,11 +308,14 @@ def run_pixelwise_metrics_calculation(davis_output_root: str):
 
 
     total_psnr_mean = sum([result["psnr"] for result in total_results.values()]) / len(total_results)
+    total_ssim_mean = sum([result["ssim"] for result in total_results.values()]) / len(total_results)
     total_lpips_mean = sum([result["lpips"] for result in total_results.values()]) / len(total_results)
     print(f"Total PSNR Mean: {total_psnr_mean}")
+    print(f"Total SSIM Mean: {total_ssim_mean}")
     print(f"Total LPIPS Mean: {total_lpips_mean}")
     print(f"Missing dirs: {len(missing)}")
     total_results["total_psnr_mean"] = total_psnr_mean
+    total_results["total_ssim_mean"] = total_ssim_mean
     total_results["total_lpips_mean"] = total_lpips_mean
     total_results["missing_dirs"] = missing
 
@@ -350,6 +366,101 @@ def run_fid_calculation(
         fid = metrics_dict.get("frechet_inception_distance", None)
         print(f"FID: {fid}")
         return fid
+
+
+def run_fvd_calculation(
+        davis_data_root: str,
+        davis_output_root: str,
+    ):
+
+    # Taken from https://github.com/ZGCTroy/CamI2V/blob/main/evaluation/fvd_test.py
+    class MyFVDCalculation(FVDCalculation):
+        def calculate_fvd_by_video_list(
+            self,
+            real_videos: torch.Tensor,
+            generated_videos: torch.Tensor,
+            model_path: str = "tools/FVD/model",
+            device: str = "cuda:0",
+        ):
+            model = self._load_model(model_path, device)
+            fvd = self._compute_fvd_between_video(model, real_videos, generated_videos, device)
+            return fvd.detach().cpu().numpy()
+
+    # load models
+    fvd_videogpt = MyFVDCalculation(method="videogpt")
+    fvd_stylegan = MyFVDCalculation(method="stylegan")
+
+    # load videos
+    start_frames_per_scene = {}
+    for scene_imgname in os.listdir(davis_output_root):
+        if not os.path.isdir(os.path.join(davis_output_root, scene_imgname)):
+            continue
+        scene, imgname = scene_imgname.split("_")
+        if scene not in start_frames_per_scene:
+            start_frames_per_scene[scene] = []
+        start_frames_per_scene[scene].append(imgname)
+
+    gt_video_list = []
+    sample_video_list = []
+
+    def run_task(scene: str, start_frames: list[str]):
+        gt_frames = sorted(glob.glob(os.path.join(davis_data_root, scene, "*.jpg")))
+
+        for start in sorted(start_frames):
+            scene_imgname = f"{scene}_{start}"
+
+            # find the start frame
+            indices = [i for i, s in enumerate(gt_frames) if os.path.basename(s).startswith(start)]
+            assert len(indices) == 1, f"Found multiple indices for {scene=}, {start=}, {indices=}"
+            idx = indices[0]
+
+            # load gt video
+            gt_video = gt_frames[idx:idx+NUM_FRAMES]
+            if len(gt_video) < NUM_FRAMES:
+                gt_video += [gt_video[-1]] * (NUM_FRAMES - len(gt_video))
+            gt_video = [load_image(p) for p in gt_video]
+
+            # load sample video
+            for motion in os.listdir(os.path.join(davis_output_root, scene_imgname)):
+                sample_video = [os.path.join(davis_output_root, scene_imgname, motion, f"generated/{i:04d}.png") for i in range(25)]
+                sample_video = [load_image(p) for p in sample_video]
+
+            # NOTE: FDV inputs are uint8
+            gt_video = [torch.from_numpy(np.array(x)) for x in gt_video]
+            sample_video = [torch.from_numpy(np.array(x)) for x in sample_video]
+
+            gt_video_list.append(torch.stack(gt_video, dim=0).permute(0, 3, 1, 2))  # (T, C, H, W)
+            sample_video_list.append(torch.stack(sample_video, dim=0).permute(0, 3, 1, 2))  # (T, C, H, W)
+
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=31) as executor:
+        future_to_task_info = {}
+        for scene, start_frames in start_frames_per_scene.items():
+            future = executor.submit(run_task,  scene, start_frames)
+            future_to_task_info[future] = (scene, start_frames)
+
+        for future in tqdm(concurrent.futures.as_completed(future_to_task_info), total=len(future_to_task_info), desc="Loading videos for FVD calculation"):
+            scene, start_frames = future_to_task_info[future]
+            task_desc = f"{scene=}, {start_frames=}"
+            try:
+                result_message = future.result()
+                # print(f"Result for {task_desc}: {result_message}")
+            except Exception as exc:
+                print(f"Main loop caught exception for {task_desc}: {exc}")
+                raise exc
+
+    # align size to samples and batchfy
+    assert len(gt_video_list) == len(sample_video_list), f"Length mismatch: {len(gt_video_list)} vs {len(sample_video_list)}"
+    gt_video_list = [F.interpolate(gt_vid, size=sample_vid.shape[-2:], mode='bilinear', align_corners=False) for gt_vid, sample_vid in zip(gt_video_list, sample_video_list)]
+    gt_video_batch = torch.stack(gt_video_list, dim=0)  # (N, T, C, H, W)
+    sample_video_batch = torch.stack(sample_video_list, dim=0)  # (N, T, C, H, W)
+
+    # calculate
+    score_videogpt = fvd_videogpt.calculate_fvd_by_video_list(gt_video_batch, sample_video_batch).item()
+    score_stylegan = fvd_stylegan.calculate_fvd_by_video_list(gt_video_batch, sample_video_batch).item()
+    print(f"FVD: {score_videogpt=}, {score_stylegan=}")
+
+    return score_videogpt, score_stylegan
 
 
 def run_camera_pose_error_calculation(davis_output_root: str, gt_focal_len: float = 260.0):
@@ -532,17 +643,21 @@ if __name__ == '__main__':
                     raise exc
 
         # 4. Pixelwise metrics calculation
-        pixelwise_results, _ = run_pixelwise_metrics_calculation(davis_output_root)
+        pixelwise_results, _ = run_pixelwise_metrics_calculation(davis_output_root, allow_resize=(args.method == "trajcrafter"))
         with open(os.path.join(davis_output_root, "pixelwise_results.txt"), "w") as f:
             json.dump(pixelwise_results, f, indent=4)
 
-        # 5. FID calculation
+        # 5. FID/FVD calculation
         fid = run_fid_calculation(
             davis_data_root=args.data_root,
             davis_output_root=davis_output_root,
         )
-        with open(os.path.join(davis_output_root, "fid.txt"), "w") as f:
-            f.write(str(fid))
+        fvd_videogpt, fvd_stylegan = run_fvd_calculation(
+            davis_data_root=args.data_root,
+            davis_output_root=davis_output_root,
+        )
+        with open(os.path.join(davis_output_root, "fid_fvd.txt"), "w") as f:
+            f.write("FID: " + str(fid) + "\nFVD (VideoGPT): " + str(fvd_videogpt) + "\nFVD (StyleGAN): " + str(fvd_stylegan) + "\n")
 
         # 6. Camera pose error calculation
         camera_pose_results, _ = run_camera_pose_error_calculation(davis_output_root)

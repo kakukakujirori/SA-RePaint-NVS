@@ -80,7 +80,8 @@ def eval_trajectories(
     rte = metrics.RPE(pose_relation=metrics.PoseRelation.translation_part)
 
     rre_all = metrics.RPE(pose_relation=metrics.PoseRelation.rotation_angle_deg, all_pairs=True)
-    rte_all = RTE(pose_relation=metrics.PoseRelation.translation_part, all_pairs=True)
+    # rte_all = RTE(pose_relation=metrics.PoseRelation.translation_part, all_pairs=True) # This computes the relative angle between the translations rather than the translation error
+    rte_all = metrics.RPE(pose_relation=metrics.PoseRelation.translation_part, all_pairs=True)
 
     try:
         pred_traj.align(gt_traj, correct_scale=True)
@@ -133,15 +134,15 @@ def eval_trajectories(
     all_rre_15 = (all_rre_errors < 15).mean()
     all_rte_15 = (all_rte_errors < 15).mean()
 
-    pred_fx = pred_proj[0, 0].item()
-    pred_fy = pred_proj[1, 1].item()
-    pred_cx = pred_proj[0, 2].item()
-    pred_cy = pred_proj[1, 2].item()
+    pred_fx = pred_proj[..., 0, 0].mean().item()
+    pred_fy = pred_proj[..., 1, 1].mean().item()
+    pred_cx = pred_proj[..., 0, 2].mean().item()
+    pred_cy = pred_proj[..., 1, 2].mean().item()
 
-    gt_fx = gt_proj[0, 0].item()
-    gt_fy = gt_proj[1, 1].item()
-    gt_cx = gt_proj[0, 2].item()
-    gt_cy = gt_proj[1, 2].item()
+    gt_fx = gt_proj[..., 0, 0].mean().item()
+    gt_fy = gt_proj[..., 1, 1].mean().item()
+    gt_cx = gt_proj[..., 0, 2].mean().item()
+    gt_cy = gt_proj[..., 1, 2].mean().item()
 
     mean_fx_error = np.abs(pred_fx - gt_fx)
     mean_fy_error = np.abs(pred_fy - gt_fy)
@@ -216,6 +217,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("data_dir", type=str, help="Directory containing the 'warped' folder and the 'generated' folder")
     parser.add_argument("--gt_focal_len", type=float, default=260.0, help="Focal length of the ground truth camera")
+    parser.add_argument("--model", type=str, default="anycam", choices=["anycam", "vggt"], help="Model to use for pose estimation")
     parser.add_argument("--gpu", type=int, default=0, help="GPU to use")
     parser.add_argument("--visualize", action="store_true", help="Visualize the trajectories using viser")
 
@@ -225,8 +227,6 @@ if __name__ == '__main__':
     if args.visualize:
         server = viser.ViserServer(port=8080)
         server.gui.configure_theme(dark_mode=True)
-
-    AnyCam = torch.hub.load('Brummi/anycam', 'AnyCam', version="1.0", training_variant="seq8", pretrained=True).cuda()
 
     # Load the video frames and ground truth poses
     frames = load_video(os.path.join(args.data_dir, "generated/generated.mp4"))
@@ -241,9 +241,46 @@ if __name__ == '__main__':
     ], dtype=np.float32)
 
     # Estimate the camera poses and intrinsics from the generated video
-    anycam_ret = AnyCam.process_video(frames, ba_refinement=True)
-    estimated_poses_c2w = [p.cpu().numpy() for p in anycam_ret["trajectory"]]  # Camera poses
-    estimated_K = anycam_ret["projection_matrix"].cpu().numpy()  # Camera intrinsics
+    if args.model.lower() == "anycam":
+        AnyCam = torch.hub.load('Brummi/anycam', 'AnyCam', version="1.0", training_variant="seq8", pretrained=True).cuda()
+
+        anycam_ret = AnyCam.process_video(frames, ba_refinement=True)
+        estimated_poses_c2w = [p.cpu().numpy() for p in anycam_ret["trajectory"]]  # Camera poses
+        estimated_K = anycam_ret["projection_matrix"].cpu().numpy()  # Camera intrinsics
+    elif args.model.lower() == "vggt":
+        from vggt.models.vggt import VGGT
+        from vggt.utils.load_fn import load_and_preprocess_images
+        from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        # bfloat16 is supported on Ampere GPUs (Compute Capability 8.0+)
+        dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+
+        # Initialize the model and load the pretrained weights.
+        # This will automatically download the model weights the first time it's run, which may take a while.
+        model = VGGT.from_pretrained("facebook/VGGT-1B").to(device)
+
+        # Load and preprocess example images
+        image_names = [os.path.join(args.data_dir, f"generated/{i:04d}.png") for i in range(len(frames))]
+        images = load_and_preprocess_images(image_names).to(device)
+
+        with torch.no_grad():
+            with torch.amp.autocast(device, dtype=dtype):
+                images = images[None]  # add batch dimension
+                aggregated_tokens_list, ps_idx = model.aggregator(images)
+
+            # Predict Cameras
+            pose_enc = model.camera_head(aggregated_tokens_list)[-1]
+            # Extrinsic and intrinsic matrices, following OpenCV convention (camera from world)
+            extrinsic, intrinsic = pose_encoding_to_extri_intri(pose_enc, images.shape[-2:])
+            extrinsic, intrinsic = extrinsic[0], intrinsic[0]
+            extrinsic = torch.cat([extrinsic, torch.tensor([[[0, 0, 0, 1]]]).expand(extrinsic.shape[0], 1, 4).to(extrinsic)], dim=-2)
+
+        # convert to c2w
+        estimated_poses_c2w =torch.linalg.inv(extrinsic).cpu().numpy()
+        estimated_K = intrinsic.cpu().numpy()
+    else:
+        raise NotImplementedError(f"Model {args.model} is not implemented.")
 
     # compute errors
     results, estimated_abs_poses_c2w, gt_abs_poses_c2w = eval_trajectories(estimated_poses_c2w, gt_poses_c2w, estimated_K, gt_K)

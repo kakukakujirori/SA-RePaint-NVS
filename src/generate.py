@@ -744,6 +744,9 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
                         pseudo_x0 = out.pred_original_sample
                         latents = out.prev_sample
 
+                        # os.makedirs("dump", exist_ok=True)
+                        # torch.save(pseudo_x0, f"dump/pseudo_x0_ori_{i}_{j}.pt")
+
                         # alignment
                         if i < self._num_timesteps // 2:
                             M, pseudo_x0 = homography_estimation(

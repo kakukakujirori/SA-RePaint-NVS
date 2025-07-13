@@ -756,7 +756,7 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
                                 process_size=128,
                                 lr=1e-2,
                                 max_iters=100,
-                                num_control_points=num_frames//3,
+                                num_control_points=None,#num_frames//3,
                                 fix_first_frame=True,
                                 acceleration_penalty_weight=0.5,
                                 padding_mode="border",

@@ -1,16 +1,24 @@
 import argparse
+import glob
 import os
+import shutil
+import subprocess
 import time
+import tempfile
 
+import imagesize
 import numpy as np
+import pycolmap
 import torch
 import viser
 import viser.transforms as tf
-from diffusers.utils import load_video
+from diffusers.utils import load_image
 from evo.core import metrics
+from evo.core.geometry import GeometryException
 from evo.core.trajectory import PosePath3D
 from evo.core import lie_algebra as lie
 from jaxtyping import Float
+from scipy.spatial.transform import Rotation
 from tabulate import tabulate
 
 
@@ -63,6 +71,102 @@ class RTE(metrics.RPE):
         return E
 
 
+def align_linear_trajectories(traj_query_posepath3d: PosePath3D, traj_ref_posepath3d: PosePath3D):
+    """
+    Aligns two linear camera trajectories (traj_query to traj_ref).
+
+    Args:
+        traj_query (list): A list of N 4x4 numpy arrays for the query trajectory.
+        traj_ref   (list): A list of N 4x4 numpy arrays for the reference trajectory.
+
+    Returns:
+        tuple: A tuple (s, R, t) for the similarity transformation.
+               s: scale, R: 3x3 rotation matrix, t: 3x1 translation vector.
+    """
+    traj_query: list[Float[np.ndarray, "4 4"]] = traj_query_posepath3d.poses_se3
+    traj_ref: list[Float[np.ndarray, "4 4"]] = traj_ref_posepath3d.poses_se3
+
+    # --- Step 1: Parameter extraction ---
+    # translation vectors
+    t_query_list = np.array([m[:3, 3] for m in traj_query])
+    t_ref_list = np.array([m[:3, 3] for m in traj_ref])
+
+    # origin
+    p_query_start = t_query_list[0]
+    p_ref_start = t_ref_list[0]
+
+    # direction
+    dir_query = t_query_list[-1] - p_query_start
+    dir_ref = t_ref_list[-1] - p_ref_start
+
+    # scale
+    len_query = np.linalg.norm(dir_query)
+    len_ref = np.linalg.norm(dir_ref)
+    if len_query == 0:
+        raise ValueError("traj_query has zero length.")
+    scale = len_ref / len_query
+
+    dir_query_norm = dir_query / len_query
+    dir_ref_norm = dir_ref / len_ref
+
+    # --- Step 2: R_motion to align the motion direction ---
+    dot_product = np.dot(dir_query_norm, dir_ref_norm).clip(-1.0, 1.0)
+
+    if np.allclose(dot_product, 1.0):  # same direction
+        R_motion = np.identity(3)
+    elif np.allclose(dot_product, -1.0):  # opposite direction
+        # 回転軸はdir_ref_normに直交する任意のベクトルでよい
+        # 頑健な方法として、単位ベクトルとの外積で直交ベクトルを求める
+        axis_vec = np.array([1.0, 0.0, 0.0])
+        if np.allclose(np.abs(np.dot(axis_vec, dir_ref_norm)), 1.0):
+            axis_vec = np.array([0.0, 1.0, 0.0])
+        rot_axis = np.cross(dir_ref_norm, axis_vec)
+        rot_axis /= np.linalg.norm(rot_axis)
+        R_motion = Rotation.from_rotvec(np.pi * rot_axis).as_matrix()
+    else:
+        rot_axis = np.cross(dir_query_norm, dir_ref_norm)
+        rot_angle = np.arccos(dot_product)
+        R_motion = Rotation.from_rotvec(rot_angle * rot_axis / np.linalg.norm(rot_axis)).as_matrix()
+
+    # --- Step 3: resolve unknown roll by the camera up direction ---
+    R_query_start = traj_query[0][:3, :3]
+    R_ref_start = traj_ref[0][:3, :3]
+
+    R_query_aligned = R_motion @ R_query_start
+
+    # get "up" vectors
+    up_ref = R_ref_start[:, 1]
+    up_query_aligned = R_query_aligned[:, 1]
+
+    # project these "up" vectors to a plane orthogonal to the movind direction
+    proj_up_ref = up_ref - np.dot(up_ref, dir_ref_norm) * dir_ref_norm
+    proj_up_query = up_query_aligned - np.dot(up_query_aligned, dir_ref_norm) * dir_ref_norm
+
+    proj_up_ref /= np.linalg.norm(proj_up_ref)
+    proj_up_query /= np.linalg.norm(proj_up_query)
+
+    # get the roll angle
+    dot_product_roll = np.dot(proj_up_query, proj_up_ref).clip(-1.0, 1.0)
+    roll_angle = np.arccos(dot_product_roll)
+
+    # get roll direction
+    cross_product_roll = np.cross(proj_up_query, proj_up_ref)
+    if np.dot(cross_product_roll, dir_ref_norm) < 0:
+        roll_angle = -roll_angle
+
+    # rotation matrix for roll alignment
+    R_roll = Rotation.from_rotvec(roll_angle * dir_ref_norm).as_matrix()
+
+    # --- Step 4: Synthesize the final transformation (scale, R, t) ---
+    R = R_roll @ R_motion
+    t = p_ref_start - scale * (R @ p_query_start)
+
+    traj_query_posepath3d.scale(scale)
+    traj_query_posepath3d.transform(lie.se3(R, t))
+
+    return traj_query_posepath3d
+
+
 def eval_trajectories(
         pred_traj: list[Float[np.ndarray, "4 4"]],  # MUST BE c2w
         gt_traj: list[Float[np.ndarray, "4 4"]],  # MUST BE c2w
@@ -85,8 +189,11 @@ def eval_trajectories(
 
     try:
         pred_traj.align(gt_traj, correct_scale=True)
-    except:
-        print("Could not align trajectories")
+    except GeometryException:
+        print("[eval_trajectories] Umeyama alignment failed. Assuming that the trajectories are straight lines.")
+        pred_traj = align_linear_trajectories(pred_traj, gt_traj)
+    except Exception as e:
+        raise e
 
     ape.process_data((pred_traj, gt_traj))
     rre.process_data((pred_traj, gt_traj))
@@ -217,7 +324,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("data_dir", type=str, help="Directory containing the 'warped' folder and the 'generated' folder")
     parser.add_argument("--gt_focal_len", type=float, default=260.0, help="Focal length of the ground truth camera")
-    parser.add_argument("--model", type=str, default="anycam", choices=["anycam", "vggt"], help="Model to use for pose estimation")
+    parser.add_argument("--model", type=str, default="glomap", choices=["anycam", "glomap", "vggt"], help="Model to use for pose estimation")
     parser.add_argument("--gpu", type=int, default=0, help="GPU to use")
     parser.add_argument("--visualize", action="store_true", help="Visualize the trajectories using viser")
 
@@ -228,15 +335,19 @@ if __name__ == '__main__':
         server = viser.ViserServer(port=8080)
         server.gui.configure_theme(dark_mode=True)
 
-    # Load the video frames and ground truth poses
-    frames = load_video(os.path.join(args.data_dir, "generated/generated.mp4"))
-    frames = [np.array(x).astype(np.float32) / 255.0 for x in frames]
-    height, width, _ = frames[0].shape
-    gt_poses_w2c = [np.load(os.path.join(args.data_dir, f"warped/{i:04d}_pose.npy")) for i in range(len(frames))]
+    # Load the generated frames
+    image_names = sorted(glob.glob(os.path.join(args.data_dir, f"generated/0*.png")))
+    num_frames = len(image_names)
+
+    # Load the gt image size
+    gt_width, gt_height = imagesize.get(os.path.join(args.data_dir, f"warped/0000.png"))
+
+    # Load the camera poses
+    gt_poses_w2c = [np.load(os.path.join(args.data_dir, f"warped/{i:04d}_pose.npy")) for i in range(num_frames)]
     gt_poses_c2w = [np.linalg.inv(p) for p in gt_poses_w2c]
     gt_K = np.array([
-        [args.gt_focal_len, 0, width/2],
-        [0, args.gt_focal_len, height/2],
+        [args.gt_focal_len, 0, gt_width/2],
+        [0, args.gt_focal_len, gt_height/2],
         [0, 0, 1],
     ], dtype=np.float32)
 
@@ -244,9 +355,51 @@ if __name__ == '__main__':
     if args.model.lower() == "anycam":
         AnyCam = torch.hub.load('Brummi/anycam', 'AnyCam', version="1.0", training_variant="seq8", pretrained=True).cuda()
 
+        frames = [np.array(load_image(x)).astype(np.float32) / 255.0 for x in image_names]
+
         anycam_ret = AnyCam.process_video(frames, ba_refinement=True)
         estimated_poses_c2w = [p.cpu().numpy() for p in anycam_ret["trajectory"]]  # Camera poses
         estimated_K = anycam_ret["projection_matrix"].cpu().numpy()  # Camera intrinsics
+
+    elif args.model.lower() == "glomap":
+        with tempfile.TemporaryDirectory() as td:
+            os.mkdir(os.path.join(td, "images"))
+
+            # copy images
+            for i in range(num_frames):
+                dst_path = os.path.join(td, f"images/{i:04d}.png")
+                shutil.copy(os.path.join(args.data_dir, f"generated/{i:04d}.png"), dst_path)
+                subprocess.run(["convert", dst_path, "-resize", "1024x576!", dst_path])
+
+            # run glomap (NOTE: intrinsic parameters are set to the ground truth values)
+            subprocess.run(["colmap", "feature_extractor",
+                            "--image_path", os.path.join(td, "images"),
+                            "--database_path", os.path.join(td, "database.db"),
+                            "--ImageReader.single_camera", "1",
+                            "--ImageReader.camera_model", "SIMPLE_PINHOLE",
+                            "--ImageReader.camera_params", f"{args.gt_focal_len},{gt_width/2},{gt_height/2}"])
+            subprocess.run(["colmap", "exhaustive_matcher",
+                            "--database_path", os.path.join(td, "database.db")])
+            subprocess.run(["glomap", "mapper",
+                            "--database_path", os.path.join(td, "database.db"),
+                            "--image_path", os.path.join(td, "images"),
+                            "--output_path", os.path.join(td, "sparse"),
+                            "--GlobalPositioning.use_gpu", "1",
+                            "--BundleAdjustment.use_gpu", "1",
+                            "--BundleAdjustment.optimize_intrinsics", "0",
+                            "--skip_view_graph_calibration", "1"])
+
+            # read estimated poses (NOTE: intrinsic parameters are set to the ground truth values)
+            estimated_K = gt_K
+            estimated_poses_c2w = [None for _ in range(num_frames)]
+            recon = pycolmap.Reconstruction(os.path.join(td, "sparse/0"))
+            for img in recon.images.values():
+                rig: pycolmap.Rigid3d = img.frame.rig_from_world
+                c2w = rig.inverse().matrix()
+                c2w = np.concatenate([c2w, np.array([[0,0,0,1]], dtype=c2w.dtype)], axis=0)
+                estimated_poses_c2w[int(img.name.split(".")[0])] = c2w
+            assert all([x.shape == (4,4) for x in estimated_poses_c2w])
+
     elif args.model.lower() == "vggt":
         from vggt.models.vggt import VGGT
         from vggt.utils.load_fn import load_and_preprocess_images
@@ -261,7 +414,6 @@ if __name__ == '__main__':
         model = VGGT.from_pretrained("facebook/VGGT-1B").to(device)
 
         # Load and preprocess example images
-        image_names = [os.path.join(args.data_dir, f"generated/{i:04d}.png") for i in range(len(frames))]
         images = load_and_preprocess_images(image_names).to(device)
 
         with torch.no_grad():
@@ -292,8 +444,8 @@ if __name__ == '__main__':
         for i, c2w in enumerate(gt_abs_poses_c2w.poses_se3):
             server.scene.add_camera_frustum(
                 f"/frames/gt{i}/frustum",
-                fov=2*np.arctan((height / 2.0) / gt_K[1, 1]),
-                aspect=width/float(height),
+                fov=2*np.arctan((gt_height / 2.0) / gt_K[1, 1]),
+                aspect=gt_width/float(gt_height),
                 scale=0.5,
                 color=(255, 255, 255),
                 #image=np.array(warped_frames[i]),
@@ -304,8 +456,8 @@ if __name__ == '__main__':
         for i, c2w in enumerate(estimated_abs_poses_c2w.poses_se3):
             server.scene.add_camera_frustum(
                 f"/frames/estimated{i}/frustum",
-                fov=2*np.arctan((height / 2.0) / estimated_K[1, 1]),
-                aspect=width/float(height),
+                fov=2*np.arctan((gt_height / 2.0) / estimated_K[1, 1]),
+                aspect=gt_width/float(gt_height),
                 scale=0.5,
                 color=(255, 0, 0),
                 #image=np.array(warped_frames[i]),

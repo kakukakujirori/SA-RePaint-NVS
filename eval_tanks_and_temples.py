@@ -402,8 +402,16 @@ def run_fvd_calculation(
             gt_video = [torch.from_numpy(np.array(x)) for x in gt_video]
             sample_video = [torch.from_numpy(np.array(x)) for x in sample_video]
 
-            gt_video_list.append(torch.stack(gt_video, dim=0).permute(0, 3, 1, 2))  # (T, C, H, W)
-            sample_video_list.append(torch.stack(sample_video, dim=0).permute(0, 3, 1, 2))  # (T, C, H, W)
+            gt_video = torch.stack(gt_video, dim=0).permute(0, 3, 1, 2)
+            sample_video = torch.stack(sample_video, dim=0).permute(0, 3, 1, 2)
+
+            if max(gt_video.shape[-2:]) >= 1024:
+                gt_video = F.interpolate(gt_video, scale_factor=0.5, mode='bilinear', align_corners=False)
+            if max(sample_video.shape[-2:]) >= 1024:
+                sample_video = F.interpolate(sample_video, scale_factor=0.5, mode='bilinear', align_corners=False)
+
+            gt_video_list.append(gt_video)  # (T, C, H, W)
+            sample_video_list.append(sample_video)  # (T, C, H, W)
 
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=31) as executor:

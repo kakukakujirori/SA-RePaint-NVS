@@ -9,18 +9,20 @@ import tempfile
 from itertools import product
 from tqdm import tqdm
 
+import imagesize
 import lpips
 import numpy as np
 import torch
 import torch.nn.functional as F
 import torch_fidelity
-from diffusers.utils import load_image, load_video
+from diffusers.utils import load_image
 from fvdcal import FVDCalculation
+from pathos.multiprocessing import ProcessingPool
 from torchmetrics.image import PeakSignalNoiseRatio
 
 from src.eval_sed import eval_sed
 from src.eval_ssim import ssim
-from src.eval_trajectories import eval_trajectories
+from src.eval_trajectories import eval_trajectories, run_glomap
 
 
 davis_input_root = "./davis_input"
@@ -228,7 +230,7 @@ def run_generation_task(scene: str, motion_mode: str, degree: float, gpu_id: int
     return msg
 
 
-def run_pixelwise_metrics_calculation(davis_output_root: str, allow_resize: bool = False):
+def run_pixelwise_metrics_calculation(output_root: str, allow_resize: bool = False):
     PSNR_MODULES = {i: PeakSignalNoiseRatio(data_range=1.0).eval().to(f"cuda:{i}") for i in GPUS}
     LPIPS_MODULES = {i: lpips.LPIPS(net='alex', spatial=True).eval().to(f"cuda:{i}") for i in GPUS}
 
@@ -280,12 +282,12 @@ def run_pixelwise_metrics_calculation(davis_output_root: str, allow_resize: bool
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(GPUS)) as executor:
         future_to_task_info = {}
-        for idx, scene in enumerate(sorted(os.listdir(davis_output_root))):
-            scene_path = os.path.join(davis_output_root, scene)
+        for idx, scene in enumerate(sorted(os.listdir(output_root))):
+            scene_path = os.path.join(output_root, scene)
             if not os.path.isdir(scene_path):
                 continue
             for motion_degree in os.listdir(scene_path):
-                data_dir = os.path.join(davis_output_root, scene, motion_degree)
+                data_dir = os.path.join(output_root, scene, motion_degree)
                 assert os.path.isdir(data_dir)
 
                 if not os.path.isdir(os.path.join(data_dir, "generated")):
@@ -471,51 +473,66 @@ def run_fvd_calculation(
     return score_videogpt, score_stylegan
 
 
-def run_camera_pose_error_calculation(davis_output_root: str, gt_focal_len: float = 260.0):
-    ANYCAM_MODULES = [torch.hub.load('Brummi/anycam', 'AnyCam', version="1.0", training_variant="seq8", pretrained=True).eval().to(f"cuda:{i}") for i in range(1)]
+def run_camera_pose_error_calculation(output_root: str, gt_focal_len: float = 260.0):
 
-    total_results = {}
-    missing_videos = []
+    def run_task(args: tuple[str, int]):
+        data_dir, gpu_id = args
 
-    def run_task(data_dir: str, gpu_id: int):
-        AnyCam = ANYCAM_MODULES[gpu_id]
-        frames = load_video(os.path.join(data_dir, "generated/generated.mp4"))
-        frames = [np.array(x).astype(np.float32) / 255.0 for x in frames]
-        height, width, _ = frames[0].shape
-        gt_poses_w2c = [np.load(os.path.join(data_dir, f"warped/{i:04d}_pose.npy")) for i in range(len(frames))]
+        if not os.path.isfile(os.path.join(data_dir, "generated/generated.mp4")):
+            print(f"Missing video for {data_dir}")
+            return (data_dir, None)
+
+        # Load the generated frames
+        image_names = sorted(glob.glob(os.path.join(data_dir, f"generated/0*.png")))
+        num_frames = len(image_names)
+
+        # Load the gt image size
+        gt_width, gt_height = imagesize.get(os.path.join(data_dir, f"warped/0000.png"))
+
+        # Load the camera poses
+        gt_poses_w2c = [np.load(os.path.join(data_dir, f"warped/{i:04d}_pose.npy")) for i in range(num_frames)]
         gt_poses_c2w = [np.linalg.inv(p) for p in gt_poses_w2c]
         gt_K = np.array([
-            [gt_focal_len, 0, width/2],
-            [0, gt_focal_len, height/2],
+            [gt_focal_len, 0, gt_width/2],
+            [0, gt_focal_len, gt_height/2],
             [0, 0, 1],
         ], dtype=np.float32)
 
-        # Estimate the camera poses and intrinsics from the generated video
-        anycam_ret = AnyCam.process_video(frames, ba_refinement=True)
-        estimated_poses_c2w = [p.cpu().numpy() for p in anycam_ret["trajectory"]]  # Camera poses
-        estimated_K = anycam_ret["projection_matrix"].cpu().numpy()  # Camera intrinsics
+        # Estimate the camera poses from the generated video
+        estimated_poses_c2w = run_glomap(image_names, gt_width=gt_width, gt_height=gt_height, gt_focal_len=gt_focal_len, gpu_id=gpu_id)
+        estimated_K = gt_K
 
-        # compute errors
+        # Filter out missing poses
+        missing_estimated_poses_ids = [i for (i, pose) in enumerate(estimated_poses_c2w) if pose is None]
+        estimated_poses_c2w = [pose for (i, pose) in enumerate(estimated_poses_c2w) if i not in missing_estimated_poses_ids]
+        gt_poses_c2w = [pose for (i, pose) in enumerate(gt_poses_c2w) if i not in missing_estimated_poses_ids]
+        if len(estimated_K) == num_frames:
+            estimated_K = np.array([estimated_K[i] for i in range(num_frames) if i not in missing_estimated_poses_ids])
+
+        # Compute errors
         results, estimated_abs_poses_c2w, gt_abs_poses_c2w = eval_trajectories(estimated_poses_c2w, gt_poses_c2w, estimated_K, gt_K)
-        total_results[data_dir] = results
+        return (data_dir, results)
 
-
-    # NOTE: AnyCam somehow doesn't support multi-GPU inference, so we use only one GPU.
-    for idx, scene in enumerate(sorted(os.listdir(davis_output_root))):
-        scene_path = os.path.join(davis_output_root, scene)
+    tasks = []
+    for idx, scene in enumerate(os.listdir(output_root)):
+        scene_path = os.path.join(output_root, scene)
         if not os.path.isdir(scene_path):
             continue
         for motion_degree in os.listdir(scene_path):
-            data_dir = os.path.join(davis_output_root, scene, motion_degree)
+            data_dir = os.path.join(output_root, scene, motion_degree)
             assert os.path.isdir(data_dir)
+            tasks.append((data_dir, GPUS[idx % len(GPUS)]))
 
-            # Load the video frames and ground truth poses
-            if not os.path.isfile(os.path.join(data_dir, "generated/generated.mp4")):
-                print(f"Missing video for {data_dir}")
-                missing_videos.append(data_dir)
-                continue
+    with ProcessingPool(nodes=32) as pool:
+        results = list(tqdm(pool.imap(run_task, tasks), total=len(tasks), desc="Calculating camera pose errors"))
 
-            run_task(data_dir, 0)
+    total_results = {}
+    missing = []
+    for data_dir, result in results:
+        if result is None:
+            missing.append(data_dir)
+        else:
+            total_results[data_dir] = result
 
     total_ape_mean = sum([result["ape_mean"] for result in total_results.values()]) / len(total_results)
     total_rre_mean = sum([result["rre_mean"] for result in total_results.values()]) / len(total_results)
@@ -523,42 +540,62 @@ def run_camera_pose_error_calculation(davis_output_root: str, gt_focal_len: floa
     print(f"Total APE Mean: {total_ape_mean}")
     print(f"Total RRE Mean: {total_rre_mean}")
     print(f"Total RTE Mean: {total_rte_mean}")
-    print(f"Missing videos: {len(missing_videos)}")
+    print(f"Missing videos: {len(missing)}")
     total_results["total_ape_mean"] = total_ape_mean
     total_results["total_rre_mean"] = total_rre_mean
     total_results["total_rte_mean"] = total_rte_mean
-    total_results["missing_videos"] = missing_videos
+    total_results["missing_videos"] = missing
 
-    return total_results, missing_videos
+    return total_results, missing
 
 
-def run_sed_calculation(davis_output_root: str):
-    missing = []
-    total_results = {}
-    for scene in tqdm(os.listdir(davis_output_root), desc="Calculating SED"):
-        scene_path = os.path.join(davis_output_root, scene)
+def run_sed_calculation(output_root: str):
+
+    def run_task(args: tuple[str, float, int]):
+        data_dir, gt_focal_len, gpu_id = args
+
+        video_path = os.path.join(data_dir, "generated/generated.mp4")
+        if not os.path.isfile(video_path):
+            return (data_dir, None)
+
+        # Load the gt image size and camera poses
+        gt_width, gt_height = imagesize.get(os.path.join(data_dir, f"warped/0000.png"))
+        camera_paths = os.path.join(data_dir, "warped/*_pose.npy")
+        poses = [np.load(p) for p in sorted(glob.glob(camera_paths))]
+
+        with tempfile.TemporaryDirectory() as colmap_root:
+            consistent_ratios, sed_summary = eval_sed(
+                colmap_root=colmap_root,
+                video_path=video_path,
+                poses=poses,
+                gt_width=gt_width,
+                gt_height=gt_height,
+                gt_focal_len=gt_focal_len,
+                save_sed_graph_to=None,
+                gpu_id=gpu_id,
+            )
+            return (data_dir, consistent_ratios)
+
+    tasks = []
+    for idx, scene in enumerate(os.listdir(output_root)):
+        scene_path = os.path.join(output_root, scene)
         if not os.path.isdir(scene_path):
             continue
         for motion_degree in os.listdir(scene_path):
-            data_dir = os.path.join(davis_output_root, scene, motion_degree)
+            data_dir = os.path.join(output_root, scene, motion_degree)
             assert os.path.isdir(data_dir)
-            video_path = os.path.join(data_dir, "generated/generated.mp4")
-            camera_paths = os.path.join(data_dir, "warped/*_pose.npy")
-            poses = [np.load(p) for p in sorted(glob.glob(camera_paths))]
+            tasks.append((data_dir, 260.0, GPUS[idx % len(GPUS)]))
 
-            if not os.path.isfile(video_path):
-                missing.append(data_dir)
-                continue
+    with ProcessingPool(nodes=32) as pool:
+        results = list(tqdm(pool.imap(run_task, tasks), total=len(tasks), desc="Calculating SED"))
 
-            with tempfile.TemporaryDirectory() as colmap_root:
-                consistent_ratios, sed_summary = eval_sed(
-                    colmap_root=colmap_root,
-                    video_path=video_path,
-                    poses=poses,
-                    gt_focal_len=260.0,
-                    save_sed_graph_to=None,
-                )
-                total_results[data_dir] = consistent_ratios
+    total_results = {}
+    missing = []
+    for data_dir, result in results:
+        if result is None:
+            missing.append(data_dir)
+        else:
+            total_results[data_dir] = result
 
     total_consistent_ratios = {}
     for result in total_results.values():

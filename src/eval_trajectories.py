@@ -172,6 +172,7 @@ def eval_trajectories(
         gt_traj: list[Float[np.ndarray, "4 4"]],  # MUST BE c2w
         pred_proj: Float[np.ndarray, "3 3"],
         gt_proj: Float[np.ndarray, "3 3"]):
+    assert len(pred_traj) == len(gt_traj), "The number of poses in the predicted and ground truth trajectories must be the same."
     pred_traj = np.stack(pred_traj).astype(np.float64)
     gt_traj = np.stack(gt_traj).astype(np.float64)
 
@@ -190,7 +191,7 @@ def eval_trajectories(
     try:
         pred_traj.align(gt_traj, correct_scale=True)
     except GeometryException:
-        print("[eval_trajectories] Umeyama alignment failed. Assuming that the trajectories are straight lines.")
+        # print("[eval_trajectories] Umeyama alignment failed. Assuming that the trajectories are straight lines.")
         pred_traj = align_linear_trajectories(pred_traj, gt_traj)
     except Exception as e:
         raise e
@@ -320,6 +321,104 @@ def eval_trajectories(
     return result, pred_traj, gt_traj  # the latter two has the same scale
 
 
+def run_anycam(image_paths: list[str], gpu_id: int = 0):
+    assert gpu_id == 0, "AnyCam only supports GPU 0 somehow."
+    AnyCam = torch.hub.load('Brummi/anycam', 'AnyCam', version="1.0", training_variant="seq8", pretrained=True).t0(f"cuda:{gpu_id}")
+    frames = [np.array(load_image(x)).astype(np.float32) / 255.0 for x in image_paths]
+    anycam_ret = AnyCam.process_video(frames, ba_refinement=True)
+    estimated_poses_c2w = [p.cpu().numpy() for p in anycam_ret["trajectory"]]  # Camera poses
+    estimated_K = anycam_ret["projection_matrix"].cpu().numpy()  # Camera intrinsics
+    return estimated_poses_c2w, estimated_K
+
+
+def run_glomap(image_paths: list[str], gt_width: int, gt_height: int, gt_focal_len: float, gpu_id: int = 0, verbose: bool = False):
+    with tempfile.TemporaryDirectory() as td:
+        img_dir = os.path.join(td, "images")
+        os.mkdir(img_dir)
+
+        # copy images
+        for p in image_paths:
+            shutil.copy(p, img_dir)
+        subprocess.run(["mogrify", "-resize", f"{gt_width}x{gt_height}!", os.path.join(img_dir, "*")])
+
+        # run glomap (NOTE: intrinsic parameters are set to the ground truth values)
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+        try:
+            _ = subprocess.run(["colmap", "feature_extractor",
+                                    "--image_path", img_dir,
+                                    "--database_path", os.path.join(td, "database.db"),
+                                    "--ImageReader.single_camera", "1",
+                                    "--ImageReader.camera_model", "SIMPLE_PINHOLE",
+                                    "--ImageReader.camera_params", f"{gt_focal_len},{gt_width/2},{gt_height/2}"],
+                                    check=True, capture_output=not verbose, text=True, encoding='utf-8', env=env)
+            _ = subprocess.run(["colmap", "exhaustive_matcher",
+                                    "--database_path", os.path.join(td, "database.db")],
+                                    check=True, capture_output=not verbose, text=True, encoding='utf-8', env=env)
+            _ = subprocess.run(["glomap", "mapper",
+                                    "--database_path", os.path.join(td, "database.db"),
+                                    "--image_path", img_dir,
+                                    "--output_path", os.path.join(td, "sparse"),
+                                    "--GlobalPositioning.use_gpu", "1",
+                                    "--BundleAdjustment.use_gpu", "1",
+                                    "--BundleAdjustment.optimize_intrinsics", "0",
+                                    "--skip_view_graph_calibration", "1"],
+                                    check=True, capture_output=not verbose, text=True, encoding='utf-8', env=env)
+        except subprocess.CalledProcessError as e:
+            import sys
+            print(f"\n❌ command failed: {e.cmd}")
+            print(f"📤 stdout:\n{e.stdout}")
+            print(f"📥 stderr:\n{e.stderr}")
+            sys.exit(1)
+
+        # read estimated poses (NOTE: intrinsic parameters are set to the ground truth values)
+        estimated_poses_c2w = [None for _ in range(len(image_paths))]
+        recon = pycolmap.Reconstruction(os.path.join(td, "sparse/0"))
+        for img in recon.images.values():
+            rig: pycolmap.Rigid3d = img.frame.rig_from_world
+            c2w = rig.inverse().matrix()
+            c2w = np.concatenate([c2w, np.array([[0,0,0,1]], dtype=c2w.dtype)], axis=0)
+            estimated_poses_c2w[int(img.name.split(".")[0])] = c2w
+        # assert all([x.shape == (4,4) for x in estimated_poses_c2w])  # NOTE: In some cases, the pose may not be estimated for some frames, so we cannot assert this.
+
+        return estimated_poses_c2w
+
+
+def run_vggt(image_paths: list[str], gpu_id: int = 0):
+    from vggt.models.vggt import VGGT
+    from vggt.utils.load_fn import load_and_preprocess_images
+    from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+
+    device = f"cuda:{gpu_id}"
+    # bfloat16 is supported on Ampere GPUs (Compute Capability 8.0+)
+    dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+
+    # Initialize the model and load the pretrained weights.
+    # This will automatically download the model weights the first time it's run, which may take a while.
+    model = VGGT.from_pretrained("facebook/VGGT-1B").to(device)
+
+    # Load and preprocess example images
+    images = load_and_preprocess_images(image_paths).to(device)
+
+    with torch.no_grad():
+        with torch.amp.autocast(device, dtype=dtype):
+            images = images[None]  # add batch dimension
+            aggregated_tokens_list, ps_idx = model.aggregator(images)
+
+        # Predict Cameras
+        pose_enc = model.camera_head(aggregated_tokens_list)[-1]
+        # Extrinsic and intrinsic matrices, following OpenCV convention (camera from world)
+        extrinsic, intrinsic = pose_encoding_to_extri_intri(pose_enc, images.shape[-2:])
+        extrinsic, intrinsic = extrinsic[0], intrinsic[0]
+        extrinsic = torch.cat([extrinsic, torch.tensor([[[0, 0, 0, 1]]]).expand(extrinsic.shape[0], 1, 4).to(extrinsic)], dim=-2)
+
+    # convert to c2w
+    estimated_poses_c2w =torch.linalg.inv(extrinsic).cpu().numpy()
+    estimated_K = intrinsic.cpu().numpy()
+
+    return estimated_poses_c2w, estimated_K
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("data_dir", type=str, help="Directory containing the 'warped' folder and the 'generated' folder")
@@ -327,9 +426,7 @@ if __name__ == '__main__':
     parser.add_argument("--model", type=str, default="glomap", choices=["anycam", "glomap", "vggt"], help="Model to use for pose estimation")
     parser.add_argument("--gpu", type=int, default=0, help="GPU to use")
     parser.add_argument("--visualize", action="store_true", help="Visualize the trajectories using viser")
-
     args = parser.parse_args()
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
 
     if args.visualize:
         server = viser.ViserServer(port=8080)
@@ -353,86 +450,25 @@ if __name__ == '__main__':
 
     # Estimate the camera poses and intrinsics from the generated video
     if args.model.lower() == "anycam":
-        AnyCam = torch.hub.load('Brummi/anycam', 'AnyCam', version="1.0", training_variant="seq8", pretrained=True).cuda()
-
-        frames = [np.array(load_image(x)).astype(np.float32) / 255.0 for x in image_names]
-
-        anycam_ret = AnyCam.process_video(frames, ba_refinement=True)
-        estimated_poses_c2w = [p.cpu().numpy() for p in anycam_ret["trajectory"]]  # Camera poses
-        estimated_K = anycam_ret["projection_matrix"].cpu().numpy()  # Camera intrinsics
+        estimated_poses_c2w, estimated_K = run_anycam(image_names, gpu_id=args.gpu)
 
     elif args.model.lower() == "glomap":
-        with tempfile.TemporaryDirectory() as td:
-            os.mkdir(os.path.join(td, "images"))
-
-            # copy images
-            for i in range(num_frames):
-                dst_path = os.path.join(td, f"images/{i:04d}.png")
-                shutil.copy(os.path.join(args.data_dir, f"generated/{i:04d}.png"), dst_path)
-                subprocess.run(["convert", dst_path, "-resize", "1024x576!", dst_path])
-
-            # run glomap (NOTE: intrinsic parameters are set to the ground truth values)
-            subprocess.run(["colmap", "feature_extractor",
-                            "--image_path", os.path.join(td, "images"),
-                            "--database_path", os.path.join(td, "database.db"),
-                            "--ImageReader.single_camera", "1",
-                            "--ImageReader.camera_model", "SIMPLE_PINHOLE",
-                            "--ImageReader.camera_params", f"{args.gt_focal_len},{gt_width/2},{gt_height/2}"])
-            subprocess.run(["colmap", "exhaustive_matcher",
-                            "--database_path", os.path.join(td, "database.db")])
-            subprocess.run(["glomap", "mapper",
-                            "--database_path", os.path.join(td, "database.db"),
-                            "--image_path", os.path.join(td, "images"),
-                            "--output_path", os.path.join(td, "sparse"),
-                            "--GlobalPositioning.use_gpu", "1",
-                            "--BundleAdjustment.use_gpu", "1",
-                            "--BundleAdjustment.optimize_intrinsics", "0",
-                            "--skip_view_graph_calibration", "1"])
-
-            # read estimated poses (NOTE: intrinsic parameters are set to the ground truth values)
-            estimated_K = gt_K
-            estimated_poses_c2w = [None for _ in range(num_frames)]
-            recon = pycolmap.Reconstruction(os.path.join(td, "sparse/0"))
-            for img in recon.images.values():
-                rig: pycolmap.Rigid3d = img.frame.rig_from_world
-                c2w = rig.inverse().matrix()
-                c2w = np.concatenate([c2w, np.array([[0,0,0,1]], dtype=c2w.dtype)], axis=0)
-                estimated_poses_c2w[int(img.name.split(".")[0])] = c2w
-            assert all([x.shape == (4,4) for x in estimated_poses_c2w])
+        # NOTE: intrinsic parameters are set to the ground truth values
+        estimated_poses_c2w = run_glomap(image_names, gt_width=gt_width, gt_height=gt_height, gt_focal_len=args.gt_focal_len, gpu_id=args.gpu, verbose=True)
+        estimated_K = gt_K
 
     elif args.model.lower() == "vggt":
-        from vggt.models.vggt import VGGT
-        from vggt.utils.load_fn import load_and_preprocess_images
-        from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+        estimated_poses_c2w, estimated_K = run_vggt(image_names, gpu_id=args.gpu)
 
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        # bfloat16 is supported on Ampere GPUs (Compute Capability 8.0+)
-        dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
-
-        # Initialize the model and load the pretrained weights.
-        # This will automatically download the model weights the first time it's run, which may take a while.
-        model = VGGT.from_pretrained("facebook/VGGT-1B").to(device)
-
-        # Load and preprocess example images
-        images = load_and_preprocess_images(image_names).to(device)
-
-        with torch.no_grad():
-            with torch.amp.autocast(device, dtype=dtype):
-                images = images[None]  # add batch dimension
-                aggregated_tokens_list, ps_idx = model.aggregator(images)
-
-            # Predict Cameras
-            pose_enc = model.camera_head(aggregated_tokens_list)[-1]
-            # Extrinsic and intrinsic matrices, following OpenCV convention (camera from world)
-            extrinsic, intrinsic = pose_encoding_to_extri_intri(pose_enc, images.shape[-2:])
-            extrinsic, intrinsic = extrinsic[0], intrinsic[0]
-            extrinsic = torch.cat([extrinsic, torch.tensor([[[0, 0, 0, 1]]]).expand(extrinsic.shape[0], 1, 4).to(extrinsic)], dim=-2)
-
-        # convert to c2w
-        estimated_poses_c2w =torch.linalg.inv(extrinsic).cpu().numpy()
-        estimated_K = intrinsic.cpu().numpy()
     else:
         raise NotImplementedError(f"Model {args.model} is not implemented.")
+
+    # Filter out missing poses
+    missing_estimated_poses_ids = [i for (i, pose) in enumerate(estimated_poses_c2w) if pose is None]
+    estimated_poses_c2w = [pose for (i, pose) in enumerate(estimated_poses_c2w) if i not in missing_estimated_poses_ids]
+    gt_poses_c2w = [pose for (i, pose) in enumerate(gt_poses_c2w) if i not in missing_estimated_poses_ids]
+    if len(estimated_K) == num_frames:
+        estimated_K = np.array([estimated_K[i] for i in range(num_frames) if i not in missing_estimated_poses_ids])
 
     # compute errors
     results, estimated_abs_poses_c2w, gt_abs_poses_c2w = eval_trajectories(estimated_poses_c2w, gt_poses_c2w, estimated_K, gt_K)

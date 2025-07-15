@@ -12,6 +12,7 @@ kornia
 lovely_tensors
 lpips
 numba
+pathos
 pycolmap
 pytorch-ignite
 tabulate

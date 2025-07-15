@@ -226,8 +226,11 @@ def eval_sed(
         colmap_root: str,
         video_path: str,
         poses: list[np.ndarray],
+        gt_width: int = 1024,
+        gt_height: int = 576,
         gt_focal_len: float = 260.0,
         save_sed_graph_to: Optional[str] = None,
+        gpu_id: int = 0,
     ):
     colmap_image_dir = os.path.join(colmap_root, "images")
     colmap_database_path = os.path.join(colmap_root, "colmap.db")
@@ -244,7 +247,7 @@ def eval_sed(
         ret, frame = cap.read()
         if not ret:
             break
-        resized_frame = cv2.resize(frame, (1024, 576))
+        resized_frame = cv2.resize(frame, (gt_width, gt_height))
         cv2.imwrite(os.path.join(colmap_image_dir, f"{num_frames:04d}.png"), resized_frame)
         num_frames += 1
         video_frames.append(resized_frame[:,:,::-1])
@@ -252,18 +255,21 @@ def eval_sed(
     # Define camera matrices
     assert len(poses) == num_frames, f"{len(poses)=}, {num_frames=}"
     intrinsic = np.array([
-        [gt_focal_len, 0, 512],
-        [0, gt_focal_len, 288],
+        [gt_focal_len, 0, gt_width/2],
+        [0, gt_focal_len, gt_height/2],
         [0, 0, 1],
     ], dtype=np.float32)
 
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+
     # feature extraction
     cmd = f'colmap feature_extractor --SiftExtraction.use_gpu 1 --SiftExtraction.edge_threshold 30 --ImageReader.camera_model PINHOLE --ImageReader.single_camera 1 --database_path {colmap_database_path} --image_path {colmap_image_dir}'
-    subprocess.run(cmd, shell=True, capture_output=True)
+    subprocess.run(cmd, shell=True, capture_output=True, env=env)
 
     # feature matcher
     cmd = f'colmap exhaustive_matcher --database_path {colmap_database_path}'
-    subprocess.run(cmd, shell=True, capture_output=True)
+    subprocess.run(cmd, shell=True, capture_output=True, env=env)
 
     # Read COLMAP database
     reader = DB_reader(colmap_database_path)

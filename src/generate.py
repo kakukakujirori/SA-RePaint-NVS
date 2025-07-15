@@ -5,6 +5,7 @@ import os
 from dataclasses import dataclass
 from tqdm import tqdm
 
+import cv2
 import lovely_tensors
 import numpy as np
 import PIL
@@ -546,12 +547,13 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
 
         # 1.5 preprocess: inpaint the holes with the mean color
         assert len(warped_images) == len(warped_masks)
-        print("Warning: The void regions in the warped images are filled with the mean color of the non-void regions.")
+        print("Warning: The void regions in the warped images are filled by cv2.INPAINT_NS.")
         for i, (img, msk) in enumerate(zip(warped_images, warped_masks)):
             img = np.array(img)
-            msk = np.array(msk).mean(axis=-1)
-            img[msk >= 128] = np.mean(img[msk < 128], axis=0)
+            msk = np.array(msk).mean(axis=-1, keepdims=True).astype(np.uint8)
+            img = cv2.inpaint(img, msk, 5, cv2.INPAINT_NS)
             warped_images[i] = PIL.Image.fromarray(img)
+            # warped_images[i].save(f"inpainted_{i}.png")
 
         # 2. Define call parameters
         batch_size = 1  # NOTE: Modified

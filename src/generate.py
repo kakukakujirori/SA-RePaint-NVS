@@ -688,18 +688,18 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
                         # Concatenate image_latents over channels dimension
                         latent_model_input = torch.cat([latent_model_input, image_latents], dim=2)
 
-                        # Weighted SEG + APG
-                        base_weight = min(0.999, i / self._num_timesteps)
+                        # Attention weighting
+                        base_weight = min(1, 0.5 + 0.5 * i / self._num_timesteps)
                         weight_map = (1 - warped_masks_sh) * (1 - base_weight) + base_weight
 
                         # negative
-                        query_blur_sigma_invalid_max = 4  # TODO: MAGIC NUMBER!!!
-                        query_blur_sigma_invalid_min = 0  # TODO: MAGIC NUMBER!!!
+                        query_blur_sigma_invalid_max = 2  # TODO: MAGIC NUMBER!!!
+                        query_blur_sigma_invalid_min = 2  # TODO: MAGIC NUMBER!!!
                         query_blur_sigma_invalid = query_blur_sigma_invalid_min + (query_blur_sigma_invalid_max - query_blur_sigma_invalid_min) * i / self._num_timesteps
                         query_blur_sigma_valid = 4  # TODO: MAGIC NUMBER!!!
                         query_blur_sigma = (1 - warped_masks_sh) * query_blur_sigma_valid + warped_masks_sh * query_blur_sigma_invalid
 
-                        use_seg = i % 2 != 0
+                        use_seg = i % 3 == 0
 
                         self.unet.latent_shape_ = (1, num_frames, 8, height//8, width//8)  # NOTE: image_latents is appended so the channel num is 8
                         self.unet.inject(weight_map, query_blur_sigma=query_blur_sigma if use_seg else None)
@@ -725,12 +725,13 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
                         )[0]
 
                         # perform guidance
-                        noise_pred = adaptive_projected_guidance(
-                            noise_pred_negative,
-                            noise_pred_positive,
-                            self.guidance_scale,
-                            momentum_buffer,
-                        )
+                        noise_pred = noise_pred_negative + self.guidance_scale * (noise_pred_positive - noise_pred_negative)
+                        # noise_pred = adaptive_projected_guidance(
+                        #     noise_pred_negative,
+                        #     noise_pred_positive,
+                        #     self.guidance_scale,
+                        #     momentum_buffer,
+                        # )
 
                         # retrieve qk
                         attn_query = self.unet.record_query_[0]
@@ -745,6 +746,11 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
                         out = self.scheduler.step_single(noise_pred, t, latents, None, None, None, step_i=i, compute_grad=False)
                         pseudo_x0 = out.pred_original_sample
                         latents = out.prev_sample
+
+                        if i >= self._num_timesteps * 4//5:
+                            # This avoids flickering around small masks
+                            print(f"SKIP REPAINT!!! {i=}, {j=}")
+                            break
 
                         # os.makedirs("dump", exist_ok=True)
                         # torch.save(pseudo_x0, f"dump/pseudo_x0_ori_{i}_{j}.pt")
@@ -841,7 +847,7 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
                                         (1 - warped_masks_sh) * (warped_latents_noisy[batch_size:] if self.do_classifier_free_guidance else warped_latents_noisy)
 
                             opt_std = 0.1
-                            posterior_sigma = sigma_t**2 / opt_std
+                            posterior_sigma = torch.inf #sigma_t**2 / opt_std
                             latents = self.stochastic_resample(
                                 opt_zs=latents_mid_pasted,
                                 ori_zt=latents_ori,

@@ -689,7 +689,7 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
                         latent_model_input = torch.cat([latent_model_input, image_latents], dim=2)
 
                         # Attention weighting
-                        base_weight = min(1, 0.5 + 0.5 * i / self._num_timesteps)
+                        base_weight = min(1, i / self._num_timesteps)
                         weight_map = (1 - warped_masks_sh) * (1 - base_weight) + base_weight
 
                         # negative
@@ -756,7 +756,7 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
                         # torch.save(pseudo_x0, f"dump/pseudo_x0_ori_{i}_{j}.pt")
 
                         # alignment
-                        if i < self._num_timesteps // 2:
+                        if i < self._num_timesteps * 3 // 5:
                             M, pseudo_x0 = homography_estimation(
                                 pseudo_x0,
                                 warped_latents[batch_size:] if self.do_classifier_free_guidance else warped_latents,
@@ -798,7 +798,7 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
                             # torch.save(var_data, f"dump/var_data_{i}_{j}.pt")
 
 
-                            var_data *= 2  # NOTE: MAGIC NUMBER!!!!!!!!!!!!
+                            var_data *= 5  # NOTE: MAGIC NUMBER!!!!!!!!!!!!
 
 
                             if i < self._num_timesteps // 2:

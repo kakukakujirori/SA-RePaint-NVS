@@ -125,7 +125,6 @@ def compute_transformed_points(
     depth_4d = depth1[:, :, None, None]
     trans_4d = transformation[None, None]
 
-
     unnormalized_pos = np.matmul(intrinsic1_inv_4d, pos_vectors_homo)
     world_points = depth_4d * unnormalized_pos
     world_points_homo = np.concatenate([world_points, ones_4d], axis=2)
@@ -133,7 +132,7 @@ def compute_transformed_points(
     trans_world = trans_world_homo[:, :, :3]
     trans_norm_points = np.matmul(intrinsic2_4d, trans_world)
 
-    return trans_norm_points,world_points
+    return trans_norm_points, world_points
 
 
 @njit
@@ -331,8 +330,6 @@ def save_warped_image(
         images_lists: list[str],
         depth_lists: list[str],
         num_frames: int = 25,
-        crop_height: int = 576,
-        crop_width: int = 1024,
         degrees_per_frame: float = 1.0,
         major_radius: float = 80,
         minor_radius: float = 70,
@@ -344,8 +341,6 @@ def save_warped_image(
     The images will be center cropped after each warp.
     """
     width, height = Image.open(images_lists[0]).size
-    assert width >= crop_width and height >= crop_height, f"{width=}, {height=}, {crop_width=}, {crop_height=}"
-
     poses = generate_camera_poses(num_frames, degrees_per_frame,major_radius, minor_radius,camera_motion_mode)
 
     near = 0.0001
@@ -377,22 +372,6 @@ def save_warped_image(
         if no_occlusion_revealing:
             never_occluded *= trans_valid
 
-        # center crop
-        if height > crop_height or width > crop_width:
-            sy = (height - crop_height) // 2
-            sx = (width - crop_width) // 2
-            warped_frame2 = warped_frame2[sy:sy+crop_height, sx:sx+crop_width]
-            mask2 = mask2[sy:sy+crop_height, sx:sx+crop_width]
-            depth2 = depth2[sy:sy+crop_height, sx:sx+crop_width]
-            flow12 = flow12[sy:sy+crop_height, sx:sx+crop_width]
-            trans_coordinates = trans_coordinates[sy:sy+crop_height, sx:sx+crop_width]
-            trans_valid = trans_valid[sy:sy+crop_height, sx:sx+crop_width]
-
-            trans_coordinates[:, :, 0] -= sx
-            trans_coordinates[:, :, 1] -= sy
-            trans_valid *= (trans_coordinates[:, :, 0] < 0) * (trans_coordinates[:, :, 0] >= crop_width)
-            trans_valid *= (trans_coordinates[:, :, 1] < 0) * (trans_coordinates[:, :, 1] >= crop_height)
-
         trans_coordinates_list.append(trans_coordinates)
         trans_valid_list.append(trans_valid)
 
@@ -415,7 +394,7 @@ def save_warped_image(
         warped_frame2.save(os.path.join(save_path, str(i).zfill(4)+".png"))
 
     # overwrite the first frame trans coordinates and valid (just in case)
-    trans_coordinates_list[0] = create_grid(crop_height, crop_width)
+    trans_coordinates_list[0] = create_grid(height, width)
     trans_valid_list[0] = trans_valid_list[0] + True
 
     if save_trajectory:
@@ -473,18 +452,6 @@ if __name__== '__main__':
     )
 
     parser.add_argument(
-        "--crop_height",
-        type=int,
-        default=576
-    )
-
-    parser.add_argument(
-        "--crop_width",
-        type=int,
-        default=1024
-    )
-
-    parser.add_argument(
         "--control_mode",
         type=str,
         default='image'
@@ -531,8 +498,6 @@ if __name__== '__main__':
         image_path,
         depth_path,
         args.num_frames,
-        args.crop_height,
-        args.crop_width,
         args.degrees_per_frame,
         args.major_radius,
         args.minor_radius,

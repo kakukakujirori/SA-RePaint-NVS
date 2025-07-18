@@ -38,6 +38,7 @@ GPUS = [0, 1, 2, 3]
 
 
 def organize_images_and_depth(tanks_and_temples_data_root: str):
+    assert os.path.isdir(tanks_and_temples_data_root), f"Folder not found: {tanks_and_temples_data_root}"
     if os.path.isdir(tanks_and_temples_input_root):
         shutil.rmtree(tanks_and_temples_input_root)
     if os.path.isdir(tanks_and_temples_output_root):

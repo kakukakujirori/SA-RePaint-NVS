@@ -65,6 +65,7 @@ def reorganize_frames(mannequin_challenge_data_root: str):
 
 
 def organize_images_and_depth(mannequin_challenge_data_root: str):
+    assert os.path.isdir(mannequin_challenge_data_root), f"Folder not found: {mannequin_challenge_data_root}"
     if os.path.isdir(mannequin_challenge_input_root):
         shutil.rmtree(mannequin_challenge_input_root)
     if os.path.isdir(mannequin_challenge_output_root):

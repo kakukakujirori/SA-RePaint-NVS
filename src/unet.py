@@ -158,9 +158,12 @@ class MyUNet(UNetSpatioTemporalConditionModel):
                 query_reshaped = rearrange(query, "bf heads (h w) c -> bf (heads c) h w", h=h, w=w)
 
                 if isinstance(query_blur_sigma, int | float):
-                    kernel_size = min(math.ceil(6 * query_blur_sigma), min(query_reshaped.shape[-2:]))
-                    kernel_size = kernel_size + 1 - kernel_size % 2  # ensure kernel size is odd
-                    query_blurred = gaussian_blur2d(query_reshaped, kernel_size, (query_blur_sigma, query_blur_sigma))
+                    if query_blur_sigma == torch.inf:
+                        query_blurred = query_reshaped.mean(dim=(-1, -2), keepdim=True).broadcast_to(query_reshaped.shape)
+                    else:
+                        kernel_size = min(math.ceil(6 * query_blur_sigma), min(query_reshaped.shape[-2:]))
+                        kernel_size = kernel_size + 1 - kernel_size % 2  # ensure kernel size is odd
+                        query_blurred = gaussian_blur2d(query_reshaped, kernel_size, (query_blur_sigma, query_blur_sigma))
                 elif isinstance(query_blur_sigma, torch.Tensor):
                     query_blur_sigma_max = query_blur_sigma.max()
                     kernel_size = min(math.ceil(6 * query_blur_sigma_max), min(query_reshaped.shape[-2:]))

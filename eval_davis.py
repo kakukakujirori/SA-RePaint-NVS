@@ -37,34 +37,8 @@ MOTION_DEGREE_PAIRS = [x for x in product(MOTION_MODES, DEGREE_LIST) if x not in
 GPUS = [0, 1, 2, 3]
 
 
-def reorganize_frames(davis_data_root: str):
-    """This script is expected to be run after
-    `python download_extract.py` is executed."""
-    for split in ["validation", "test", "train"]:
-        split_root = os.path.join(davis_data_root, split, "data")
-        output_root = os.path.join(davis_data_root, f"{split}_frames")
-        assert os.path.isdir(split_root), f"Directory {split_root} does not exist."
-
-        if os.path.isdir(output_root):
-            shutil.rmtree(output_root)
-        os.makedirs(output_root)
-
-        cnt = 0
-        for uid in os.listdir(split_root):
-            frame_dir = os.path.join(split_root, uid, "frames")
-            if not os.path.isdir(frame_dir):
-                continue
-
-            dst_dir = os.path.join(output_root, uid)
-            if os.path.isdir(dst_dir):
-                shutil.rmtree(dst_dir)
-            shutil.copytree(frame_dir, dst_dir)
-            cnt += 1
-
-        print(f"[extract_frames] Finished reorganizing '{split}' ({cnt}/{len(os.listdir(split_root))})")
-
-
 def organize_images_and_depth(davis_data_root: str):
+    assert os.path.isdir(davis_data_root), f"Folder not found: {davis_data_root}"
     if os.path.isdir(davis_input_root):
         shutil.rmtree(davis_input_root)
     if os.path.isdir(davis_output_root):

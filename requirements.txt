@@ -1,4 +1,5 @@
 accelerate
+clean-fid
 diffusers==0.32.2
 decord
 dotdict
@@ -17,7 +18,6 @@ pycolmap
 pytorch-ignite
 tabulate
 timm
-torch_fidelity
 torchmetrics
 transformers
 rerun-sdk

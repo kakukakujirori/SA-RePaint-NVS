@@ -14,7 +14,7 @@ import lpips
 import numpy as np
 import torch
 import torch.nn.functional as F
-import torch_fidelity
+from cleanfid import fid
 from diffusers.utils import load_image
 from fvdcal import FVDCalculation
 from pathos.multiprocessing import ProcessingPool
@@ -34,6 +34,8 @@ REPAINT_ITER_NUM = 2
 MOTION_MODES = ["horizontal", "vertical", "zoomout"]
 DEGREE_LIST = [-1.0, -0.5, 0.5, 1.0]
 MOTION_DEGREE_PAIRS = [x for x in product(MOTION_MODES, DEGREE_LIST) if x not in [('vertical', -1.0), ('vertical', 1.0)]]
+MAJOR_RADIUS = 80
+MINOR_RADIUS = 70
 GPUS = [0, 1, 2, 3]
 
 
@@ -100,8 +102,8 @@ def run_trajectory_extraction(scene: str, motion_mode: str, degree: float, no_oc
             "--output_folder", f"{davis_output_root}/{scene}/{motion_mode}_{degree}/warped",
             "--degrees_per_frame", f"{degree}",
             "--camera_motion_mode", f"{motion_mode}",
-            "--major_radius", "80",
-            "--minor_radius", "70",
+            "--major_radius", f"{MAJOR_RADIUS}",
+            "--minor_radius", f"{MINOR_RADIUS}",
             "--num_frames", f"{NUM_FRAMES}",
             ] + (
                 ["--no_occlusion_revealing"] if no_occlusion_revealing else []
@@ -299,8 +301,8 @@ def run_pixelwise_metrics_calculation(output_root: str, allow_resize: bool = Fal
 
 
 def run_fid_calculation(
-        davis_data_root: str,
-        davis_output_root: str,
+        data_root: str,
+        output_root: str,
     ):
     with tempfile.TemporaryDirectory() as td:
         print(f"[run_fid_calculation] Images are copied to {td} for FID calculation.")
@@ -310,38 +312,26 @@ def run_fid_calculation(
         os.mkdir(generated_folder)
 
         # Copy GT images
-        for scene in os.listdir(davis_data_root):
-            for imgpath in glob.glob(os.path.join(davis_data_root, scene, "*.jpg")):
-                imgpath = os.path.normpath(imgpath)
+        for scene in os.listdir(data_root):
+            for imgpath in glob.glob(os.path.join(data_root, scene, "*.jpg")):
+                imgpath = os.path.abspath(imgpath)
                 shutil.copy(imgpath, os.path.join(gt_folder, imgpath.replace("/", "_")))
-        print(f"[run_fid_calculation] Number of GT images: {len(os.listdir(gt_folder))}")
 
         # Copy generated images
-        for scene in os.listdir(davis_output_root):
-            scene_path = os.path.join(davis_output_root, scene)
+        for scene in os.listdir(output_root):
+            scene_path = os.path.join(output_root, scene)
             if not os.path.isdir(scene_path):
                 continue
             for motion_degree in os.listdir(scene_path):
-                for imgpath in glob.glob(os.path.join(davis_output_root, scene, motion_degree, "generated", "*.png")):
-                    imgpath = os.path.normpath(imgpath)  # delete the leading ./
+                for imgpath in glob.glob(os.path.join(output_root, scene, motion_degree, "generated", "*.png")):
+                    imgpath = os.path.abspath(imgpath)
                     dst_path = os.path.join(generated_folder, imgpath.replace("/", "_"))
                     shutil.copy(imgpath, dst_path)
-        print(f"[run_fid_calculation] Number of generated images: {len(os.listdir(generated_folder))}")
-
-        # Resize images to 1024x576
-        subprocess.run(f"ls {os.path.join(gt_folder, '*.jpg')} | xargs -n1 -P32 mogrify -resize 1024x576!", shell=True)
 
         # calculate FID
-        metrics_dict = torch_fidelity.calculate_metrics(
-            input1=gt_folder,
-            input2=generated_folder,
-            cuda=True,
-            fid=True,
-            verbose=False,
-        )
-        fid = metrics_dict.get("frechet_inception_distance", None)
-        print(f"FID: {fid}")
-        return fid
+        score = fid.compute_fid(gt_folder, generated_folder)
+        print(f"FID: {score}")
+        return score.item()
 
 
 def run_fvd_calculation(
@@ -667,16 +657,16 @@ if __name__ == '__main__':
             json.dump(pixelwise_results, f, indent=4)
 
         # 5. FID/FVD calculation
-        fid = run_fid_calculation(
-            davis_data_root=args.data_root,
-            davis_output_root=davis_output_root,
+        fid_score = run_fid_calculation(
+            data_root=args.data_root,
+            output_root=davis_output_root,
         )
         fvd_videogpt, fvd_stylegan = run_fvd_calculation(
             davis_data_root=args.data_root,
             davis_output_root=davis_output_root,
         )
         with open(os.path.join(davis_output_root, "fid_fvd.txt"), "w") as f:
-            f.write("FID: " + str(fid) + "\nFVD (VideoGPT): " + str(fvd_videogpt) + "\nFVD (StyleGAN): " + str(fvd_stylegan) + "\n")
+            f.write("FID: " + str(fid_score) + "\nFVD (VideoGPT): " + str(fvd_videogpt) + "\nFVD (StyleGAN): " + str(fvd_stylegan) + "\n")
 
         # 6. Camera pose error calculation
         camera_pose_results, _ = run_camera_pose_error_calculation(davis_output_root)

@@ -11,7 +11,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Run VBench evaluation")
     parser.add_argument("--output_dir", type=str, help="Directory to save output files")
     parser.add_argument("--gpu", type=int, default=0, help="GPU device ID to use")
-    parser.add_argument("--cuda_home", type=str, default="/home/ryotaro/cuda-11.8", help="Path to CUDA 11.8 installation")
+    parser.add_argument("--cuda_home", type=str, default="/usr/local/cuda-11.8", help="Path to CUDA 11.8 installation")
     args = parser.parse_args()
 
     # set up CUDA environment variables

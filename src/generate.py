@@ -770,12 +770,18 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
                                 padding_mode="border",
                             )
                             from kornia.geometry.transform.imgwarp import homography_warp
-                            latents = homography_warp(
-                                latents.flatten(0, 1).float(),
+                            # latents = homography_warp(
+                            #     latents.flatten(0, 1).float(),
+                            #     M,
+                            #     dsize=latents.shape[-2:],
+                            #     padding_mode="reflection",
+                            # ).reshape_as(latents).to(latents.dtype)
+                            latents_ori = homography_warp(
+                                latents_ori.flatten(0, 1).float(),
                                 M,
                                 dsize=latents.shape[-2:],
                                 padding_mode="reflection",
-                            ).reshape_as(latents).to(latents.dtype)
+                            ).reshape_as(latents_ori).to(latents_ori.dtype)
 
                         # os.makedirs("dump", exist_ok=True)
                         # torch.save(latents_ori, f"dump/latents_ori_{i}_{j}.pt")

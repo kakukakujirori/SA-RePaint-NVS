@@ -36,7 +36,7 @@ DEGREE_LIST = [-1.0, -0.5, 0.5, 1.0]
 MOTION_DEGREE_PAIRS = [x for x in product(MOTION_MODES, DEGREE_LIST) if x not in [('vertical', -1.0), ('vertical', 1.0)]]
 MAJOR_RADIUS = 80
 MINOR_RADIUS = 70
-GPUS = [0, 1, 2, 3]
+GPUS = [0, 1]
 
 
 def reorganize_frames(mannequin_challenge_data_root: str):

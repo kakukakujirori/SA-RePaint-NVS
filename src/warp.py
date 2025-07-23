@@ -167,8 +167,8 @@ def homography_estimation(
             homography_params.grad[:, :, 0] = 0.0  # Zero grad for 0-th control point
         optimizer.step()
 
-        if iter % 100 == 0 or iter == max_iters - 1:
-            print(f"[homography_estimation] {iter=}, loss_reconst={loss_reconst.item()}, loss_regularize={loss_regularize.item()}")
+        # if iter % 100 == 0 or iter == max_iters - 1:
+        #     print(f"[homography_estimation] {iter=}, loss_reconst={loss_reconst.item()}, loss_regularize={loss_regularize.item()}")
 
     with torch.no_grad():
         # apply the optimized warp

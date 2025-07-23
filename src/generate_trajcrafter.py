@@ -10,6 +10,8 @@ from diffusers import DDIMScheduler
 from diffusers.utils import export_to_video
 from transformers import AutoProcessor, Blip2ForConditionalGeneration, T5EncoderModel
 
+from gpu_memory_monitor import GPUMemoryMonitor
+
 sys.path.append(__file__.rsplit('/', 2)[0])  # Adjust path to include the parent directory
 sys.path.append(os.path.join(__file__.rsplit('/', 2)[0], 'tools', 'TrajectoryCrafter'))  # Adjust path to include the TrajectoryCrafter
 from tools.TrajectoryCrafter.models.crosstransformer3d import CrossTransformer3DModel
@@ -63,6 +65,9 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     device = f"cuda:{args.gpu}"
+
+    # monitor = GPUMemoryMonitor(gpu_id=args.gpu)
+    # monitor.start()
 
     # load the pipeline
     model_name = 'alibaba-pai/CogVideoX-Fun-V1.1-5b-InP'
@@ -125,6 +130,9 @@ if __name__ == '__main__':
             mask_video=cond_masks,
             reference=cond_video[:, :, 0:1, :, :].expand(-1, -1, 10, -1, -1),
         ).videos[0].permute(1, 2, 3, 0).cpu().numpy()  # (F, H, W, C)
+
+    # monitor.stop()
+    # print(f"Peak GPU memory usage: {monitor.get_max_memory():.2f} GB")
 
     frames = [PIL.Image.fromarray(np.clip(fr * 255, 0, 255).astype(np.uint8)) for fr in frames]  # Convert to PIL images
 

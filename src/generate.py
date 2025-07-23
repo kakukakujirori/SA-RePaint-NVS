@@ -22,6 +22,7 @@ from jaxtyping import Float
 from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection
 
 from covariance import guided_blur_2D, local_covariance_2D, local_covariance_3D, safe_division_3D
+from gpu_memory_monitor import GPUMemoryMonitor
 from scheduling_euler_discrete import EulerDiscreteScheduler
 from unet import MyUNet
 from warp import homography_estimation
@@ -887,6 +888,9 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                     progress_bar.update()
 
+        # cpu offload
+        self.unet.to("cpu")
+        torch.cuda.empty_cache()
 
         if not output_type == "latent":
             # cast back to fp16 if needed
@@ -1020,6 +1024,13 @@ if __name__ == '__main__':
 
     device = f"cuda:{args.gpu}"
 
+    # # limit GPU memory
+    # total_mem_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+    # limit_mem_gb = 16.0
+    # fraction = limit_mem_gb / total_mem_gb
+    # torch.cuda.set_per_process_memory_fraction(fraction, args.gpu)
+    # print(f"GPU memory upper limit was set to {limit_mem_gb:.2f}GB ({fraction:.2%})")
+
     # load pipeline
     pipe = StableVideoDiffusionPipeline.from_pretrained(
         "stabilityai/stable-video-diffusion-img2vid-xt",
@@ -1041,6 +1052,9 @@ if __name__ == '__main__':
     warped_masks = [PIL.Image.open(os.path.join(args.trajectory_folder, f"{i:04d}_mask.png")) for i in range(args.num_frames)]
 
     # inference
+    # monitor = GPUMemoryMonitor(gpu_id=args.gpu)
+    # monitor.start()
+
     svd_output = pipe(
         warped_images=warped_images,
         warped_masks=warped_masks,
@@ -1055,6 +1069,9 @@ if __name__ == '__main__':
         generator=torch.manual_seed(args.seed),
     )
     frames = svd_output.frames[0]
+
+    # monitor.stop()
+    # print(f"Peak GPU memory usage: {monitor.get_max_memory():.2f} GB")
 
     os.makedirs(args.output_folder, exist_ok=True)
     for i,fr in enumerate(frames):

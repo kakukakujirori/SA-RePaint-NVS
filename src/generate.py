@@ -805,7 +805,7 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
                             # torch.save(var_data, f"dump/var_data_{i}_{j}.pt")
 
 
-                            var_data *= 5  # NOTE: MAGIC NUMBER!!!!!!!!!!!!
+                            var_data *= 3  # NOTE: MAGIC NUMBER!!!!!!!!!!!!
 
 
                             if i < self._num_timesteps // 2:

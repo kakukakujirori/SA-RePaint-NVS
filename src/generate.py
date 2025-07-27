@@ -889,7 +889,10 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
                     progress_bar.update()
 
         # cpu offload
+        import gc
+        self.image_encoder.to("cpu")
         self.unet.to("cpu")
+        gc.collect()
         torch.cuda.empty_cache()
 
         if not output_type == "latent":
@@ -1020,16 +1023,22 @@ if __name__ == '__main__':
         default=0,
     )
 
+    parser.add_argument(
+        "--gpu_memory_limit",
+        type=float,
+        default=None,
+    )
+
     args = parser.parse_args()
 
     device = f"cuda:{args.gpu}"
 
-    # # limit GPU memory
-    # total_mem_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-    # limit_mem_gb = 16.0
-    # fraction = limit_mem_gb / total_mem_gb
-    # torch.cuda.set_per_process_memory_fraction(fraction, args.gpu)
-    # print(f"GPU memory upper limit was set to {limit_mem_gb:.2f}GB ({fraction:.2%})")
+    # limit GPU memory
+    if args.gpu_memory_limit is not None:
+        total_mem_gb = torch.cuda.get_device_properties(args.gpu).total_memory / (1024**3)
+        fraction = args.gpu_memory_limit / total_mem_gb
+        torch.cuda.set_per_process_memory_fraction(fraction, args.gpu)
+        print(f"GPU memory upper limit was set to {args.gpu_memory_limit:.2f}GB ({fraction:.2%})")
 
     # load pipeline
     pipe = StableVideoDiffusionPipeline.from_pretrained(

@@ -24,6 +24,7 @@ python src/trajectory_extraction.py \
   --major_radius 80 \
   --minor_radius 70 \
   --num_frames ${NUM_FRAMES} \
+  --control_mode image \
   --no_occlusion_revealing
 
 # generaiton

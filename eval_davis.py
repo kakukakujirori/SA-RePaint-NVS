@@ -105,6 +105,7 @@ def run_trajectory_extraction(scene: str, motion_mode: str, degree: float, no_oc
             "--major_radius", f"{MAJOR_RADIUS}",
             "--minor_radius", f"{MINOR_RADIUS}",
             "--num_frames", f"{NUM_FRAMES}",
+            "--control_mode", "image",
             ] + (
                 ["--no_occlusion_revealing"] if no_occlusion_revealing else []
             ) + (

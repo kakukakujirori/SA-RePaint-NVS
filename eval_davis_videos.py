@@ -25,114 +25,159 @@ from src.eval_ssim import ssim
 from src.eval_trajectories import eval_trajectories, run_glomap
 
 
-mannequin_challenge_input_root = "./mannequin_challenge_input"
-mannequin_challenge_output_root = "./mannequin_challenge_output"
+davis_input_root = "./davis_input"
+davis_output_root = "./davis_output"
 NUM_FRAMES = 25
 NUM_INFERECE_STEPS = 50
 DENOISE_START_STEP = NUM_INFERECE_STEPS // 3
 REPAINT_ITER_NUM = 2
 MOTION_MODES = ["horizontal", "vertical", "zoomout"]
-DEGREE_LIST = [-1.0, -0.5, 0.5, 1.0]
-MOTION_DEGREE_PAIRS = [x for x in product(MOTION_MODES, DEGREE_LIST) if x not in [('vertical', -1.0), ('vertical', 1.0)]]
+DEGREE_LIST = [-0.5, -0.25, 0.25, 0.5]
+MOTION_DEGREE_PAIRS = [x for x in product(MOTION_MODES, DEGREE_LIST) if x not in [('vertical', -0.5), ('vertical', 0.5)]]
 MAJOR_RADIUS = 80
 MINOR_RADIUS = 70
 GPUS = [0, 1]
 
 
-def reorganize_frames(mannequin_challenge_data_root: str):
-    """This script is expected to be run after
-    `python download_extract.py` is executed."""
-    for split in ["validation", "test", "train"]:
-        split_root = os.path.join(mannequin_challenge_data_root, split, "data")
-        output_root = os.path.join(mannequin_challenge_data_root, f"{split}_frames")
-        assert os.path.isdir(split_root), f"Directory {split_root} does not exist."
+def organize_videos_and_depth(davis_data_root: str, davis_input_root: str, davis_output_root: str):
+    assert os.path.isdir(davis_data_root), f"Folder not found: {davis_data_root}"
+    if os.path.isdir(davis_input_root):
+        shutil.rmtree(davis_input_root)
+    if os.path.isdir(davis_output_root):
+        shutil.rmtree(davis_output_root)
+    os.makedirs(davis_input_root)
+    os.makedirs(davis_output_root)
 
-        if os.path.isdir(output_root):
-            shutil.rmtree(output_root)
-        os.makedirs(output_root)
+    # define tasks
+    def to_chunk(chunk_img_paths: list[str], outdir: str):
+        with tempfile.TemporaryDirectory() as td:
+            # copy images
+            for idx, imgpath in enumerate(chunk_img_paths):
+                dst_img = os.path.join(td, f"{idx:04d}.jpg")
+                shutil.copy(imgpath, dst_img)
 
-        cnt = 0
-        for uid in os.listdir(split_root):
-            frame_dir = os.path.join(split_root, uid, "frames")
-            if not os.path.isdir(frame_dir):
+            # resize images
+            subprocess.run(["magick", "mogrify", "-resize", "1024x576!", os.path.join(td, "*.jpg")])
+
+            # to mp4
+            try:
+                scene_name = os.path.basename(os.path.dirname(chunk_img_paths[0])).split(".")[0]
+                start_img_num = os.path.basename(chunk_img_paths[0]).split(".")[0]
+                dst_mp4 = os.path.join(outdir, f"{scene_name}_{start_img_num}.mp4")
+                result = subprocess.run([
+                    "ffmpeg", "-y",
+                    "-framerate", "10",
+                    "-i", os.path.join(td, "%04d.jpg"),
+                    "-c:v", "libx264",
+                    "-r", "10",
+                    "-pix_fmt", "rgb24",
+                    "-crf", "0",
+                    dst_mp4
+                ], check=True, capture_output=True, text=True, encoding='utf-8')
+            except subprocess.CalledProcessError as e:
+                error_message = (
+                    f"ERROR!!!\n"
+                    f"Command: {' '.join(e.cmd)}\n"
+                    f"Return code: {e.returncode}\n"
+                    f"Stdout:\n{e.stdout.strip()}\n"
+                    f"Stderr:\n{e.stderr.strip()}"
+                )
+                print(error_message)
+                raise e
+
+    # separate frames in chunks from each scene
+    with concurrent.futures.ThreadPoolExecutor(max_workers=32) as executor:
+        future_to_task_info = {}
+        for scene in glob.glob(os.path.join(davis_data_root, "*")):
+            if not os.path.isdir(scene):
                 continue
 
-            dst_dir = os.path.join(output_root, uid)
-            if os.path.isdir(dst_dir):
-                shutil.rmtree(dst_dir)
-            shutil.copytree(frame_dir, dst_dir)
-            cnt += 1
+            imgpaths = sorted(glob.glob(os.path.join(scene, "*.jpg")))
+            num_chunks = len(imgpaths) // NUM_FRAMES
 
-        print(f"[extract_frames] Finished reorganizing '{split}' ({cnt}/{len(os.listdir(split_root))})")
+            for chunk_idx in range(num_chunks):
+                chunk_imgs = imgpaths[chunk_idx * NUM_FRAMES : (chunk_idx + 1) * NUM_FRAMES]
+                if not chunk_imgs:
+                    continue
+                future = executor.submit(to_chunk, chunk_imgs, davis_input_root)
+                future_to_task_info[future] = (chunk_imgs, davis_input_root)
 
-
-def organize_images_and_depth(mannequin_challenge_data_root: str):
-    assert os.path.isdir(mannequin_challenge_data_root), f"Folder not found: {mannequin_challenge_data_root}"
-    if os.path.isdir(mannequin_challenge_input_root):
-        shutil.rmtree(mannequin_challenge_input_root)
-    if os.path.isdir(mannequin_challenge_output_root):
-        shutil.rmtree(mannequin_challenge_output_root)
-    os.makedirs(mannequin_challenge_input_root)
-    os.makedirs(mannequin_challenge_output_root)
-
-    # extract keyframes from each scene
-    for i, scene in enumerate(glob.glob(os.path.join(mannequin_challenge_data_root, "*"))):
-        if not os.path.isdir(scene):
-            continue
-
-        scene_name = os.path.basename(scene)
-        print(scene_name)
-
-        for cnt, imgpath in enumerate(sorted(glob.glob(os.path.join(scene, "*.jpg")))):
-            # pool images
-            if cnt % NUM_FRAMES == 0:
-                img_num = os.path.basename(imgpath).split(".")[0]
-                dst_path = os.path.join(mannequin_challenge_input_root, scene_name + "_" + img_num + ".jpg")
-                shutil.copy(imgpath, dst_path)
-
-    # resize to 1024x576
-    subprocess.run(["magick", "mogrify", "-resize", "1024x576!", os.path.join(mannequin_challenge_input_root, "*.jpg")])
+        for future in tqdm(concurrent.futures.as_completed(future_to_task_info), total=len(future_to_task_info), desc="Separating videos to chunks"):
+            chunk_imgs, davis_input_root = future_to_task_info[future]
+            task_desc = f"{chunk_imgs=}, {davis_input_root=}"
+            try:
+                _ = future.result()
+            except Exception as exc:
+                print(f"Main loop caught exception for {task_desc}: {exc}")
+                raise exc
 
     # depth estimation
-    imglist = glob.glob(os.path.join(mannequin_challenge_input_root, "*.jpg"))
-    imglist_path = os.path.join(mannequin_challenge_input_root, "tmp.txt")
-    with open(imglist_path, "a") as f:
-        for imgpath in imglist:
-            f.write(imgpath + "\n")
+    video_path_list = glob.glob(os.path.join(davis_input_root, "*.mp4"))
+    task_per_GPU = (len(video_path_list) + len(GPUS) - 1) // len(GPUS)
+    processes = []
+    for i, gpu_id in enumerate(GPUS):
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
-    subprocess.run(["python", "tools/Depth-Anything-V2/run.py",
-        "--encoder", "vitl",
-        "--img-path", imglist_path,
-        "--outdir", mannequin_challenge_output_root])  # TEMPORAL USE
+        video_path_per_GPU = video_path_list[task_per_GPU * i : task_per_GPU * (i + 1)]
+        vidlist_path = os.path.join(davis_input_root, f"tmp_{gpu_id}.txt")
+        with open(vidlist_path, "w") as f:
+            for imgpath in video_path_per_GPU:
+                f.write(imgpath + "\n")
 
-    os.remove(imglist_path)
+        proc = subprocess.Popen([
+                "python", "tools/Video-Depth-Anything/run.py",
+                "--encoder", "vitl",
+                "--input_video", vidlist_path,
+                "--output_dir", davis_output_root,
+                "--save_npz",
+            ], stdout=None, stderr=None, text=True, encoding='utf-8', env=env)
+        processes.append((proc, gpu_id, vidlist_path))
+
+    # wait for all the process to finish
+    for proc, gpu_id, vidlist_path in processes:
+        stdout, stderr = proc.communicate()
+        if proc.returncode != 0:
+            print(f"[GPU {gpu_id}] ERROR: returncode={proc.returncode}")
+            print(f"[GPU {gpu_id}] STDOUT:\n{stdout}")
+            print(f"[GPU {gpu_id}] STDERR:\n{stderr}")
+        else:
+            print(f"[GPU {gpu_id}] Finished successfully.")
+
+        os.remove(vidlist_path)
 
     # store in each folder
-    for imgpath in glob.glob(os.path.join(mannequin_challenge_input_root, "*.jpg")):
-        imgname = os.path.basename(imgpath).split(".")[0]
-        image_folder_path = os.path.join(mannequin_challenge_input_root, imgname, "images")
-        depth_folder_path = os.path.join(mannequin_challenge_input_root, imgname, "depth")
+    for vidpath in glob.glob(os.path.join(davis_input_root, "*.mp4")):
+        vidname = os.path.basename(vidpath).split(".")[0]
+        image_folder_path = os.path.join(davis_input_root, vidname, "images")
+        depth_folder_path = os.path.join(davis_input_root, vidname, "depth")
         os.makedirs(image_folder_path)
         os.makedirs(depth_folder_path)
-        shutil.move(imgpath, image_folder_path)
-        shutil.move(os.path.join(mannequin_challenge_output_root, imgname + ".png"), depth_folder_path)
-        shutil.move(os.path.join(mannequin_challenge_output_root, imgname + ".npy"), depth_folder_path)
+        shutil.move(os.path.join(davis_output_root, vidname + "_depths.npz"), depth_folder_path)
+        subprocess.run([
+            "ffmpeg", "-i", vidpath,
+            "-start_number", "0",
+            os.path.join(image_folder_path, "%04d.jpg"),
+        ], check=True, capture_output=True, text=True, encoding='utf-8')
+        os.remove(vidpath)
+        os.remove(os.path.join(davis_output_root, vidname + "_src.mp4"))
+        os.remove(os.path.join(davis_output_root, vidname + "_vis.mp4"))
 
 
-def run_trajectory_extraction(scene: str, motion_mode: str, degree: float, no_occlusion_revealing: bool = True, save_trajectory: bool = False) -> str:
+def run_trajectory_extraction(scene: str, motion_mode: str, degree: float, no_occlusion_revealing: bool = True, save_trajectory: bool = False):
     task_id = f"Scene: {scene}, Motion: {motion_mode + '_' + str(degree)}"
     print(f"STARTING task: {task_id}")
     try:
         result = subprocess.run(["python", "src/trajectory_extraction.py",
-            "--image_folder", f"{mannequin_challenge_input_root}/{scene}/images/",
-            "--depth_folder", f"{mannequin_challenge_input_root}/{scene}/depth/",
-            "--output_folder", f"{mannequin_challenge_output_root}/{scene}/{motion_mode}_{degree}/warped",
+            "--image_folder", f"{davis_input_root}/{scene}/images/",
+            "--depth_folder", f"{davis_input_root}/{scene}/depth/",
+            "--output_folder", f"{davis_output_root}/{scene}/{motion_mode}_{degree}/warped",
             "--degrees_per_frame", f"{degree}",
             "--camera_motion_mode", f"{motion_mode}",
             "--major_radius", f"{MAJOR_RADIUS}",
             "--minor_radius", f"{MINOR_RADIUS}",
             "--num_frames", f"{NUM_FRAMES}",
-            "--control_mode", "image",
+            "--control_mode", "video",
             ] + (
                 ["--no_occlusion_revealing"] if no_occlusion_revealing else []
             ) + (
@@ -166,8 +211,8 @@ def run_generation_task(scene: str, motion_mode: str, degree: float, gpu_id: int
     try:
         if method == "nvssolver":
             result = subprocess.run(["python", "src/generate_nvssolver.py",
-                "--output_folder", f"{mannequin_challenge_output_root}/{scene}/{motion_mode}_{degree}/generated",
-                "--trajectory_folder", f"{mannequin_challenge_output_root}/{scene}/{motion_mode}_{degree}/warped",
+                "--output_folder", f"{davis_output_root}/{scene}/{motion_mode}_{degree}/generated",
+                "--trajectory_folder", f"{davis_output_root}/{scene}/{motion_mode}_{degree}/warped",
                 "--num_frames", f"{NUM_FRAMES}",
                 "--num_inference_steps", "100",
                 "--min_guidance_scale", "1.0",
@@ -177,8 +222,8 @@ def run_generation_task(scene: str, motion_mode: str, degree: float, gpu_id: int
                 check=True, capture_output=True, text=True, encoding='utf-8')
         elif method == "trajattn":
             result = subprocess.run(["python", "src/generate_trajattn.py",
-                "--output_folder", f"{mannequin_challenge_output_root}/{scene}/{motion_mode}_{degree}/generated",
-                "--trajectory_folder", f"{mannequin_challenge_output_root}/{scene}/{motion_mode}_{degree}/warped",
+                "--output_folder", f"{davis_output_root}/{scene}/{motion_mode}_{degree}/generated",
+                "--trajectory_folder", f"{davis_output_root}/{scene}/{motion_mode}_{degree}/warped",
                 "--num_frames", f"{NUM_FRAMES}",
                 "--num_inference_steps", "25",
                 "--min_guidance_scale", "1.0",
@@ -188,8 +233,8 @@ def run_generation_task(scene: str, motion_mode: str, degree: float, gpu_id: int
                 check=True, capture_output=True, text=True, encoding='utf-8')
         elif method == "trajcrafter":
             result = subprocess.run(["python", "src/generate_trajcrafter.py",
-                "--output_folder", f"{mannequin_challenge_output_root}/{scene}/{motion_mode}_{degree}/generated",
-                "--trajectory_folder", f"{mannequin_challenge_output_root}/{scene}/{motion_mode}_{degree}/warped",
+                "--output_folder", f"{davis_output_root}/{scene}/{motion_mode}_{degree}/generated",
+                "--trajectory_folder", f"{davis_output_root}/{scene}/{motion_mode}_{degree}/warped",
                 "--num_frames", f"{NUM_FRAMES}",
                 "--num_inference_steps", "50",
                 "--seed", "12345",
@@ -197,8 +242,8 @@ def run_generation_task(scene: str, motion_mode: str, degree: float, gpu_id: int
                 check=True, capture_output=True, text=True, encoding='utf-8')
         elif method == "mine":
             result = subprocess.run(["python", "src/generate.py",
-                "--output_folder", f"{mannequin_challenge_output_root}/{scene}/{motion_mode}_{degree}/generated",
-                "--trajectory_folder", f"{mannequin_challenge_output_root}/{scene}/{motion_mode}_{degree}/warped",
+                "--output_folder", f"{davis_output_root}/{scene}/{motion_mode}_{degree}/generated",
+                "--trajectory_folder", f"{davis_output_root}/{scene}/{motion_mode}_{degree}/warped",
                 "--num_frames", f"{NUM_FRAMES}",
                 "--num_inference_steps", f"{NUM_INFERECE_STEPS}",
                 "--denoise_start_step", f"{DENOISE_START_STEP}",
@@ -363,8 +408,8 @@ def run_fid_calculation(
 
 
 def run_fvd_calculation(
-        mannequin_challenge_data_root: str,
-        mannequin_challenge_output_root: str,
+        davis_data_root: str,
+        davis_output_root: str,
     ):
 
     # Taken from https://github.com/ZGCTroy/CamI2V/blob/main/evaluation/fvd_test.py
@@ -386,8 +431,8 @@ def run_fvd_calculation(
 
     # load videos
     start_frames_per_scene = {}
-    for scene_imgname in os.listdir(mannequin_challenge_output_root):
-        if not os.path.isdir(os.path.join(mannequin_challenge_output_root, scene_imgname)):
+    for scene_imgname in os.listdir(davis_output_root):
+        if not os.path.isdir(os.path.join(davis_output_root, scene_imgname)):
             continue
         scene, imgname = scene_imgname.split("_")
         if scene not in start_frames_per_scene:
@@ -398,7 +443,7 @@ def run_fvd_calculation(
     sample_video_list = []
 
     def run_task(scene: str, start_frames: list[str]):
-        gt_frames = sorted(glob.glob(os.path.join(mannequin_challenge_data_root, scene, "*.jpg")))
+        gt_frames = sorted(glob.glob(os.path.join(davis_data_root, scene, "*.jpg")))
 
         for start in sorted(start_frames):
             scene_imgname = f"{scene}_{start}"
@@ -415,8 +460,8 @@ def run_fvd_calculation(
             gt_video = [load_image(p) for p in gt_video]
 
             # load sample video
-            for motion in os.listdir(os.path.join(mannequin_challenge_output_root, scene_imgname)):
-                sample_video = [os.path.join(mannequin_challenge_output_root, scene_imgname, motion, f"generated/{i:04d}.png") for i in range(25)]
+            for motion in os.listdir(os.path.join(davis_output_root, scene_imgname)):
+                sample_video = [os.path.join(davis_output_root, scene_imgname, motion, f"generated/{i:04d}.png") for i in range(25)]
                 sample_video = [load_image(p) for p in sample_video]
 
             # NOTE: FDV inputs are uint8
@@ -606,19 +651,22 @@ def run_sed_calculation(output_root: str):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Mannequin Challenge Evaluation")
-    parser.add_argument("--data_root", type=str, default="/home/ryotaro/data/MannequinChallengeHQ/validation_frames")
+    parser = argparse.ArgumentParser(description="DAVIS Evaluation")
+    parser.add_argument("--data_root", type=str, default="/media/ryotaro/ssd1/DAVIS/JPEGImages/Full-Resolution")
     parser.add_argument("--scratch", action="store_true", help="If set, all the images, depth, and trajectories are re-organized and re-generated.")
     parser.add_argument("--method", type=str, default="mine", choices=["nvssolver", "trajattn", "trajcrafter", "mine"], help="Method to use for generation. 'nvssolver' uses NVS-Solver, 'trajattn' uses Trajectory Attention, and 'mine' uses the custom method.")
     args = parser.parse_args()
 
     # 1. Organize RGB images & Depth estimation
     if args.scratch:
-        # reorganize_frames(mannequin_challenge_data_root=os.path.dirname(args.data_root))
-        organize_images_and_depth(mannequin_challenge_data_root=args.data_root)
+        organize_videos_and_depth(
+            davis_data_root=args.data_root,
+            davis_input_root=davis_input_root,
+            davis_output_root=davis_output_root,
+        )
 
         scene_motion_degree_pairs = []
-        for i, scene in enumerate(sorted(os.listdir(mannequin_challenge_input_root))):
+        for i, scene in enumerate(sorted(os.listdir(davis_input_root))):
             motion_mode, degree = MOTION_DEGREE_PAIRS[i % len(MOTION_DEGREE_PAIRS)]
             scene_motion_degree_pairs.append((scene, motion_mode, degree))
 
@@ -642,16 +690,16 @@ if __name__ == '__main__':
                     print(f"Main loop caught exception for {task_desc}: {exc}")
 
     else:
-        assert os.path.isdir(mannequin_challenge_output_root)
+        assert os.path.isdir(davis_output_root)
 
         scene_motion_degree_pairs = []
-        for scene in sorted(os.listdir(mannequin_challenge_output_root)):
-            scene_path = os.path.join(mannequin_challenge_output_root, scene)
+        for scene in sorted(os.listdir(davis_output_root)):
+            scene_path = os.path.join(davis_output_root, scene)
             if not os.path.isdir(scene_path):
                 continue
             for motion_degree in os.listdir(scene_path):
-                assert os.path.isdir(os.path.join(mannequin_challenge_output_root, scene, motion_degree, "warped"))
-                if os.path.isdir(os.path.join(mannequin_challenge_output_root, scene, motion_degree, "generated")):
+                assert os.path.isdir(os.path.join(davis_output_root, scene, motion_degree, "warped"))
+                if os.path.isdir(os.path.join(davis_output_root, scene, motion_degree, "generated")):
                     continue
                 motion_mode, degree = motion_degree.split("_")
                 scene_motion_degree_pairs.append((scene, motion_mode, degree))
@@ -681,30 +729,30 @@ if __name__ == '__main__':
                     raise exc
 
         # 4. Pixelwise metrics calculation
-        pixelwise_results, _ = run_pixelwise_metrics_calculation(mannequin_challenge_output_root, allow_resize=(args.method == "trajcrafter"))
-        with open(os.path.join(mannequin_challenge_output_root, "pixelwise_results.txt"), "w") as f:
+        pixelwise_results, _ = run_pixelwise_metrics_calculation(davis_output_root, allow_resize=(args.method == "trajcrafter"))
+        with open(os.path.join(davis_output_root, "pixelwise_results.txt"), "w") as f:
             json.dump(pixelwise_results, f, indent=4)
 
         # 5. FID/FVD calculation
         fid_score = run_fid_calculation(
             data_root=args.data_root,
-            output_root=mannequin_challenge_output_root,
+            output_root=davis_output_root,
         )
         fvd_videogpt, fvd_stylegan = run_fvd_calculation(
-            mannequin_challenge_data_root=args.data_root,
-            mannequin_challenge_output_root=mannequin_challenge_output_root,
+            davis_data_root=args.data_root,
+            davis_output_root=davis_output_root,
         )
-        with open(os.path.join(mannequin_challenge_output_root, "fid_fvd.txt"), "w") as f:
+        with open(os.path.join(davis_output_root, "fid_fvd.txt"), "w") as f:
             f.write("FID: " + str(fid_score) + "\nFVD (VideoGPT): " + str(fvd_videogpt) + "\nFVD (StyleGAN): " + str(fvd_stylegan) + "\n")
 
         # 6. Camera pose error calculation
-        camera_pose_results, _ = run_camera_pose_error_calculation(mannequin_challenge_output_root)
-        with open(os.path.join(mannequin_challenge_output_root, "camera_pose_results.txt"), "w") as f:
+        camera_pose_results, _ = run_camera_pose_error_calculation(davis_output_root)
+        with open(os.path.join(davis_output_root, "camera_pose_results.txt"), "w") as f:
             json.dump(camera_pose_results, f, indent=4)
 
         # 7. SED calculation
-        sed_results = run_sed_calculation(mannequin_challenge_output_root)
-        with open(os.path.join(mannequin_challenge_output_root, "sed.txt"), "w") as f:
+        sed_results = run_sed_calculation(davis_output_root)
+        with open(os.path.join(davis_output_root, "sed.txt"), "w") as f:
             json.dump(sed_results, f, indent=4)
 
     except KeyboardInterrupt:

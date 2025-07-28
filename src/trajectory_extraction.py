@@ -327,8 +327,8 @@ def forward_warp(
 
 def save_warped_image(
         save_path: str,
-        images_lists: list[str],
-        depth_lists: list[str],
+        images_lists: list[np.ndarray],
+        depth_lists: list[np.ndarray],
         num_frames: int = 25,
         degrees_per_frame: float = 1.0,
         major_radius: float = 80,
@@ -340,7 +340,7 @@ def save_warped_image(
     """
     The images will be center cropped after each warp.
     """
-    width, height = Image.open(images_lists[0]).size
+    height, width, _ = images_lists[0].shape
     poses = generate_camera_poses(num_frames, degrees_per_frame,major_radius, minor_radius,camera_motion_mode)
 
     near = 0.0001
@@ -358,11 +358,10 @@ def save_warped_image(
     for i, pose_t in enumerate(poses):
         np.save(os.path.join(save_path, str(i).zfill(4)+"_pose.npy"), pose_t)
 
-        image = Image.open(images_lists[i])
-        image = np.array(image)
+        image = images_lists[i]
         assert image.shape[:2] == (height, width), f"{image.shape=}, {height=}, {width=}"
 
-        depth = np.load(depth_lists[i]).astype(np.float32)
+        depth = depth_lists[i].astype(np.float32)
         depth[depth < 1e-5] = 1e-5
         depth = 10000./depth
         depth = np.clip(depth, near, far)
@@ -454,6 +453,7 @@ if __name__== '__main__':
     parser.add_argument(
         "--control_mode",
         type=str,
+        choices=['image', 'video'],
         default='image'
     )
 
@@ -471,32 +471,35 @@ if __name__== '__main__':
 
     args = parser.parse_args()
 
-    image_path = os.listdir(args.image_folder)
-    image_path.sort()
-    depth_path = os.listdir(args.depth_folder)
-    depth_path.sort()
+    image_path = [os.path.join(args.image_folder, ip) for ip in sorted(os.listdir(args.image_folder))]
+    image_list = [np.array(Image.open(ip)) for ip in image_path]
 
-    depth_path = [d for d in depth_path if d.endswith('.npy')]
-    assert len(image_path) == len(depth_path)
+    depth_path_npz = [os.path.join(args.depth_folder, dp) for dp in sorted(os.listdir(args.depth_folder)) if dp.endswith('.npz')]
+    if depth_path_npz:
+        assert len(depth_path_npz) == 1
+        depth_list = np.load(depth_path_npz[0])['depths']
+        depth_list = [depth_list[i] for i in range(depth_list.shape[0])]
+    else:
+        depth_path_npy = [os.path.join(args.depth_folder, dp) for dp in sorted(os.listdir(args.depth_folder)) if dp.endswith('.npy')]
+        depth_list = [np.load(dp) for dp in depth_path_npy]
 
-    image_path = [os.path.join(args.image_folder, ip) for ip in image_path]
-    depth_path = [os.path.join(args.depth_folder, dp)for dp in depth_path]
+    assert len(image_list) == len(depth_list)
 
     if args.control_mode == 'image':
-        image_path = image_path[0:1]
-        depth_path = depth_path[0:1]
+        image_list = image_list[0:1]
+        depth_list = depth_list[0:1]
 
     # for image camera control
-    if len(image_path) == 1:
-        image_path = image_path * args.num_frames
-        depth_path = depth_path * args.num_frames
+    if len(image_list) == 1:
+        image_list = image_list * args.num_frames
+        depth_list = depth_list * args.num_frames
 
     os.makedirs(args.output_folder, exist_ok=True)
 
     save_warped_image(
         args.output_folder,
-        image_path,
-        depth_path,
+        image_list,
+        depth_list,
         args.num_frames,
         args.degrees_per_frame,
         args.major_radius,

@@ -59,20 +59,18 @@ def organize_videos_and_depth(davis_data_root: str, davis_input_root: str, davis
             # resize images
             subprocess.run(["magick", "mogrify", "-resize", "1024x576!", os.path.join(td, "*.jpg")])
 
-            # to mp4
+            # to mkv (= lossless video format)
             try:
                 scene_name = os.path.basename(os.path.dirname(chunk_img_paths[0])).split(".")[0]
                 start_img_num = os.path.basename(chunk_img_paths[0]).split(".")[0]
-                dst_mp4 = os.path.join(outdir, f"{scene_name}_{start_img_num}.mp4")
+                dst_mkv = os.path.join(outdir, f"{scene_name}_{start_img_num}.mkv")
                 result = subprocess.run([
                     "ffmpeg", "-y",
                     "-framerate", "10",
                     "-i", os.path.join(td, "%04d.jpg"),
-                    "-c:v", "libx264",
-                    "-r", "10",
-                    "-pix_fmt", "rgb24",
-                    "-crf", "0",
-                    dst_mp4
+                    "-c:v", "ffv1",
+                    "-g", "1",
+                    dst_mkv,
                 ], check=True, capture_output=True, text=True, encoding='utf-8')
             except subprocess.CalledProcessError as e:
                 error_message = (
@@ -112,7 +110,7 @@ def organize_videos_and_depth(davis_data_root: str, davis_input_root: str, davis
                 raise exc
 
     # depth estimation
-    video_path_list = glob.glob(os.path.join(davis_input_root, "*.mp4"))
+    video_path_list = glob.glob(os.path.join(davis_input_root, "*.mkv"))
     task_per_GPU = (len(video_path_list) + len(GPUS) - 1) // len(GPUS)
     processes = []
     for i, gpu_id in enumerate(GPUS):
@@ -147,7 +145,7 @@ def organize_videos_and_depth(davis_data_root: str, davis_input_root: str, davis
         os.remove(vidlist_path)
 
     # store in each folder
-    for vidpath in glob.glob(os.path.join(davis_input_root, "*.mp4")):
+    for vidpath in glob.glob(os.path.join(davis_input_root, "*.mkv")):
         vidname = os.path.basename(vidpath).split(".")[0]
         image_folder_path = os.path.join(davis_input_root, vidname, "images")
         depth_folder_path = os.path.join(davis_input_root, vidname, "depth")
@@ -157,7 +155,7 @@ def organize_videos_and_depth(davis_data_root: str, davis_input_root: str, davis
         subprocess.run([
             "ffmpeg", "-i", vidpath,
             "-start_number", "0",
-            os.path.join(image_folder_path, "%04d.jpg"),
+            os.path.join(image_folder_path, "%04d.png"),
         ], check=True, capture_output=True, text=True, encoding='utf-8')
         os.remove(vidpath)
         os.remove(os.path.join(davis_output_root, vidname + "_src.mp4"))
@@ -652,7 +650,7 @@ def run_sed_calculation(output_root: str):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="DAVIS Evaluation")
-    parser.add_argument("--data_root", type=str, default="/media/ryotaro/ssd1/DAVIS/JPEGImages/Full-Resolution")
+    parser.add_argument("--data_root", type=str, default="/home/ryotaro/data/DAVIS/JPEGImages/Full-Resolution")
     parser.add_argument("--scratch", action="store_true", help="If set, all the images, depth, and trajectories are re-organized and re-generated.")
     parser.add_argument("--method", type=str, default="mine", choices=["nvssolver", "trajattn", "trajcrafter", "mine"], help="Method to use for generation. 'nvssolver' uses NVS-Solver, 'trajattn' uses Trajectory Attention, and 'mine' uses the custom method.")
     args = parser.parse_args()

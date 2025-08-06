@@ -1,6 +1,6 @@
 ITEM=bear
 CAMERA_MOTION_MODE=horizontal
-DEGREE=0.5
+DEGREE=-0.5
 NUM_FRAMES=25
 STRIDE=1
 
@@ -28,17 +28,15 @@ find data/${ITEM}/images/ -maxdepth 1 -type f -print0 | xargs -0 -I@ convert @ -
 
 
 # depth estimation
-ffmpeg -y -framerate 10 -i "data/${ITEM}/images/%05d.png" -c:v libx264 -r 10 -pix_fmt rgb24 -crf 0 "data/${ITEM}/${ITEM}_tmp.mp4"
-rm -rf data/${ITEM}/depth
+ffmpeg -y -framerate 10 -i "data/${ITEM}/images/%05d.png" -c:v ffv1 -g 1 "data/${ITEM}/${ITEM}.mkv"
 echo "Running Video Depth Anything..."
 python tools/Video-Depth-Anything/run.py \
   --encoder vitl \
-  --input_video data/${ITEM}/${ITEM}_tmp.mp4  \
+  --input_video data/${ITEM}/${ITEM}.mkv  \
   --output_dir data/${ITEM}/depth \
   --save_npz
 
-rename 's/_tmp//' data/${ITEM}/depth/*_tmp_*
-rm "data/${ITEM}/${ITEM}_tmp.mp4"
+rm "data/${ITEM}/${ITEM}.mkv"
 
 # trajectory extraction
 echo "Running Trajectory Extraction..."

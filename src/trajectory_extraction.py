@@ -5,6 +5,8 @@ import os
 
 import cv2
 import numpy as np
+import pyvista as pv
+import utils3d
 from numba import njit
 from PIL import Image
 
@@ -317,15 +319,118 @@ def forward_warp(
     trans_valid = (trans_depth1 > 0)
     trans_valid = mask_occlusion_traj(depth1, trans_depth1, trans_coordinates, trans_valid)
 
-    frame1 = np.concatenate([frame1, depth1[..., None]], axis=-1)
-    warped_frame2, mask2 = bilinear_splatting(frame1, mask1, trans_depth1, flow12, None, is_image=False)
-    warped_frame2, depth2 = warped_frame2[..., :3], warped_frame2[..., 3]
-    warped_frame2 = np.clip(warped_frame2, a_min=0, a_max=255).round().astype('uint8')
+    warped_frame2, mask2 = bilinear_splatting(frame1, mask1, trans_depth1, flow12, None, is_image=True)
 
-    return warped_frame2, mask2, depth2, flow12, trans_coordinates, trans_valid
+    return warped_frame2, mask2, trans_coordinates, trans_valid
 
 
-def save_warped_image(
+def render_mesh(
+        frame1: np.ndarray,
+        depth1: np.ndarray,
+        transformation1: np.ndarray,
+        transformation2: np.ndarray,
+        intrinsic1: np.ndarray,
+        intrinsic2: Optional[np.ndarray],
+        mask_deocclusion: bool = True,
+    ) -> np.ndarray:
+    """
+    Given a frame1 and global transformations, warps frame1 to next view using
+    pyvista with unlit rendering, and adds a 4th channel as a validity mask.
+    """
+    h, w = frame1.shape[:2]
+    if intrinsic2 is None:
+        intrinsic2 = np.copy(intrinsic1)
+    assert frame1.shape == (h, w, 3)
+    assert depth1.shape == (h, w)
+    assert transformation1.shape == (4, 4)
+    assert transformation2.shape == (4, 4)
+    assert intrinsic1.shape == (3, 3)
+    assert intrinsic2.shape == (3, 3)
+
+    # make pyvista run background
+    pv.set_plot_theme("document")
+    pv.global_theme.lighting = False
+    pv.global_theme.show_edges = False
+    pv.global_theme.background = 'black'
+
+    trans_points1, world_points = compute_transformed_points(
+        depth1,
+        transformation1,
+        transformation2,
+        intrinsic1,
+        intrinsic2)
+
+    trans_coordinates = trans_points1[:, :, :2, 0] / trans_points1[:, :, 2:3, 0]
+    trans_depth1 = trans_points1[:, :, 2, 0]
+    trans_coordinates = trans_coordinates.reshape(-1,2)
+    trans_coordinates[trans_depth1.reshape(-1)<0] = 100000
+    trans_coordinates = trans_coordinates.reshape(h, w, 2)
+
+    trans_valid = (trans_depth1 > 0)
+    trans_valid = mask_occlusion_traj(depth1, trans_depth1, trans_coordinates, trans_valid)
+
+    # build mesh components
+    world_points = world_points.reshape(h, w, 3)
+    valid_mask = ~utils3d.numpy.depth_edge(depth1, rtol=0.04)
+    faces, vertices, vertex_colors_float, vertex_uvs = utils3d.numpy.image_mesh(
+        world_points,
+        frame1.astype(np.float32),
+        utils3d.numpy.image_uv(width=w, height=h),
+        mask=None if mask_deocclusion else valid_mask,
+        tri=True
+    )
+
+    # pyvista mesh
+    num_faces = len(faces)
+    pv_faces = np.c_[np.full(num_faces, 3), faces].ravel()
+    mesh = pv.PolyData(vertices, pv_faces)
+
+    # camera and Plotter
+    plotter = pv.Plotter(off_screen=True, window_size=[w, h])
+    relative_pose_cv = transformation1 @ np.linalg.inv(transformation2)
+    R_c2w = relative_pose_cv[:3, :3]
+    t_c2w = relative_pose_cv[:3, 3]
+    position = t_c2w
+    focal_point = position + R_c2w @ np.array([0, 0, 1])
+    viewup = -R_c2w @ np.array([0, 1, 0])
+    fov_y = np.degrees(2 * np.arctan(h / (2 * intrinsic2[1, 1])))
+    plotter.camera.position = position
+    plotter.camera.focal_point = focal_point
+    plotter.camera.up = viewup
+    plotter.camera.view_angle = fov_y
+
+    # 1. RGB rendering
+    mesh['RGB'] = vertex_colors_float.astype(np.uint8)
+    actor = plotter.add_mesh(mesh, scalars='RGB', rgb=True)
+    prop = actor.GetProperty()
+    prop.SetLighting(False)
+
+    rgb_image = plotter.screenshot(transparent_background=False, return_img=True)
+    if rgb_image.shape[2] == 4:
+        rgb_image = rgb_image[:, :, :3]
+
+    # 2. Mask rendering
+    if mask_deocclusion:
+        mask_vertex_colors = np.zeros_like(vertex_colors_float, dtype=np.uint8)
+        pixel_coords = (vertex_uvs * np.array([w - 1, h - 1])).round().astype(int)
+        pixel_coords[:, 0] = np.clip(pixel_coords[:, 0], 0, w - 1)
+        pixel_coords[:, 1] = np.clip(pixel_coords[:, 1], 0, h - 1)
+        valid_vertex_indices = np.where(valid_mask[pixel_coords[:, 1], pixel_coords[:, 0]] == True)[0]
+        mask_vertex_colors[valid_vertex_indices] = 255
+        mesh['RGB'] = mask_vertex_colors
+    else:
+        mesh['RGB'] = np.full_like(vertex_colors_float, 255, dtype=np.uint8)
+
+    # update plotter
+    plotter.render()
+    mask_image_rgb = plotter.screenshot(transparent_background=False, return_img=True)
+
+    plotter.close()
+
+    return rgb_image, (255 - mask_image_rgb), trans_coordinates, trans_valid
+
+
+def save_images(
         save_path: str,
         images_lists: list[np.ndarray],
         depth_lists: list[np.ndarray],
@@ -336,10 +441,15 @@ def save_warped_image(
         camera_motion_mode: str = "horizontal",
         no_occlusion_revealing: bool = False,
         save_trajectory: bool = False,
+        use_mesh: bool = True,
     ) -> None:
     """
     The images will be center cropped after each warp.
     """
+    if no_occlusion_revealing and (not use_mesh):
+        import warnings
+        warnings.warn("[save_image] 'no_occlusion_revealing' without using a mesh is inaccurate. It is advisable to set 'use_mesh=True'.")
+
     height, width, _ = images_lists[0].shape
     poses = generate_camera_poses(num_frames, degrees_per_frame,major_radius, minor_radius,camera_motion_mode)
 
@@ -367,30 +477,58 @@ def save_warped_image(
         depth = np.clip(depth, near, far)
         assert depth.shape == (height, width), f"{image.shape=} {depth.shape=}"
 
-        warped_frame2, mask2, depth2, flow12, trans_coordinates, trans_valid = forward_warp(image, never_occluded, depth, pose_s, pose_t, K, None)
-        if no_occlusion_revealing:
-            never_occluded *= trans_valid
+        if use_mesh:
+            warped_frame2, mask2, trans_coordinates, trans_valid = render_mesh(
+                image,
+                depth,
+                pose_s,
+                pose_t,
+                K,
+                None,
+                mask_deocclusion=no_occlusion_revealing,
+            )
+
+            if i == 0:
+                warped_frame2 = image
+                mask2 = np.zeros_like(mask2)
+
+            # save images
+            warped_frame2[mask2 > 0] = 0
+            Image.fromarray(mask2).save(os.path.join(save_path, str(i).zfill(4)+"_mask.png"))
+            Image.fromarray(warped_frame2).save(os.path.join(save_path, str(i).zfill(4)+".png"))
+
+        else:
+            warped_frame2, mask2, trans_coordinates, trans_valid = forward_warp(
+                image,
+                never_occluded,
+                depth,
+                pose_s,
+                pose_t,
+                K,
+                None,
+            )
+            if no_occlusion_revealing:
+                never_occluded *= trans_valid
+
+            # save images
+            mask = 1 - mask2
+            mask[mask < 0.5] = 0
+            mask[mask >= 0.5] = 1
+            mask = np.repeat(mask[:,:,np.newaxis]*255., repeats=3, axis=2)
+
+            kernel = np.ones((5,5), np.uint8)
+            mask_erosion = cv2.dilate(np.array(mask), kernel)
+            mask_erosion = Image.fromarray(np.uint8(mask_erosion))
+            mask_erosion.save(os.path.join(save_path, str(i).zfill(4)+"_mask.png"))
+
+            mask_erosion_ = np.array(mask_erosion)/255.
+            mask_erosion_[mask_erosion_ < 0.5] = 0
+            mask_erosion_[mask_erosion_ >= 0.5] = 1
+            warped_frame2 = Image.fromarray(np.uint8(warped_frame2 * (1-mask_erosion_)))
+            warped_frame2.save(os.path.join(save_path, str(i).zfill(4)+".png"))
 
         trans_coordinates_list.append(trans_coordinates)
         trans_valid_list.append(trans_valid)
-
-        # np.save(os.path.join(save_path,str(i).zfill(4)+"_flow.npy"), flow12)
-
-        mask = 1 - mask2
-        mask[mask < 0.5] = 0
-        mask[mask >= 0.5] = 1
-        mask = np.repeat(mask[:,:,np.newaxis]*255., repeats=3, axis=2)
-
-        kernel = np.ones((5,5), np.uint8)
-        mask_erosion = cv2.dilate(np.array(mask), kernel)
-        mask_erosion = Image.fromarray(np.uint8(mask_erosion))
-        mask_erosion.save(os.path.join(save_path, str(i).zfill(4)+"_mask.png"))
-
-        mask_erosion_ = np.array(mask_erosion)/255.
-        mask_erosion_[mask_erosion_ < 0.5] = 0
-        mask_erosion_[mask_erosion_ >= 0.5] = 1
-        warped_frame2 = Image.fromarray(np.uint8(warped_frame2 * (1-mask_erosion_)))
-        warped_frame2.save(os.path.join(save_path, str(i).zfill(4)+".png"))
 
     # overwrite the first frame trans coordinates and valid (just in case)
     trans_coordinates_list[0] = create_grid(height, width)
@@ -496,7 +634,7 @@ if __name__== '__main__':
 
     os.makedirs(args.output_folder, exist_ok=True)
 
-    save_warped_image(
+    save_images(
         args.output_folder,
         image_list,
         depth_list,
@@ -507,5 +645,6 @@ if __name__== '__main__':
         args.camera_motion_mode,
         args.no_occlusion_revealing,
         args.save_trajectory,
+        use_mesh=True,
     )
     print(f"Trajectory extraction finished, saved to {args.output_folder}")

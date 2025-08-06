@@ -25,8 +25,8 @@ from src.eval_ssim import ssim
 from src.eval_trajectories import eval_trajectories, run_glomap
 
 
-davis_input_root = "./davis_input"
-davis_output_root = "./davis_output"
+davis_input_root = "./davis_video_input"
+davis_output_root = "./davis_video_output"
 NUM_FRAMES = 25
 NUM_INFERECE_STEPS = 50
 DENOISE_START_STEP = NUM_INFERECE_STEPS // 3

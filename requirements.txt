@@ -3,6 +3,7 @@ clean-fid
 diffusers==0.32.2
 decord
 dotdict
+easydict
 einops
 evo
 hydra-core
@@ -16,6 +17,7 @@ numba
 pathos
 pycolmap
 pytorch-ignite
+pyvista
 tabulate
 timm
 torchmetrics

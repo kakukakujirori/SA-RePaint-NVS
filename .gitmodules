@@ -10,3 +10,6 @@
 [submodule "tools/Video-Depth-Anything"]
 	path = tools/Video-Depth-Anything
 	url = https://github.com/DepthAnything/Video-Depth-Anything.git
+[submodule "tools/utils3d"]
+	path = tools/utils3d
+	url = https://github.com/EasternJournalist/utils3d.git

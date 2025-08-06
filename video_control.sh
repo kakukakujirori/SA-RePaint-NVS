@@ -24,21 +24,24 @@ fi
 # extract NUM_FRAMES images -> resize to 1024x576
 mkdir -p data/${ITEM}/images
 ffmpeg -i $INPUT_VIDEO -vf "select='not(mod(n,$STRIDE))'" -vframes "$NUM_FRAMES" -vsync vfr "data/${ITEM}/images/%05d.png"
-ls data/${ITEM}/images/* | xargs -I@ convert @ -resize 1024x576! @
+find data/${ITEM}/images/ -maxdepth 1 -type f -print0 | xargs -0 -I@ convert @ -resize 1024x576! @
 
 
 # depth estimation
 ffmpeg -y -framerate 10 -i "data/${ITEM}/images/%05d.png" -c:v libx264 -r 10 -pix_fmt rgb24 -crf 0 "data/${ITEM}/${ITEM}_tmp.mp4"
-
+rm -rf data/${ITEM}/depth
+echo "Running Video Depth Anything..."
 python tools/Video-Depth-Anything/run.py \
   --encoder vitl \
   --input_video data/${ITEM}/${ITEM}_tmp.mp4  \
   --output_dir data/${ITEM}/depth \
   --save_npz
 
+rename 's/_tmp//' data/${ITEM}/depth/*_tmp_*
 rm "data/${ITEM}/${ITEM}_tmp.mp4"
 
 # trajectory extraction
+echo "Running Trajectory Extraction..."
 python src/trajectory_extraction.py \
   --image_folder data/${ITEM}/images/ \
   --depth_folder data/${ITEM}/depth/ \

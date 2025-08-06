@@ -6,7 +6,7 @@ NUM_FRAMES=25
 set -e
 
 # resize to 1024x576
-ls data/${ITEM}/images/* | xargs -I@ convert @ -resize 1024x576! @
+find data/${ITEM}/images/ -maxdepth 1 -type f -print0 | xargs -0 -I@ convert @ -resize 1024x576! @
 
 # depth estimation
 python tools/Depth-Anything-V2/run.py \

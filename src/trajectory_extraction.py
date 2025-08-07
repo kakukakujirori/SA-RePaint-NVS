@@ -398,6 +398,7 @@ def render_mesh(
     plotter.camera.focal_point = focal_point
     plotter.camera.up = viewup
     plotter.camera.view_angle = fov_y
+    plotter.camera.clipping_range = (plotter.camera.clipping_range[0], plotter.camera.clipping_range[1] + depth1.max())
 
     # 1. RGB rendering
     mesh['RGB'] = vertex_colors_float.astype(np.uint8)

@@ -5,6 +5,7 @@ import os
 
 import cv2
 import numpy as np
+import OpenEXR
 import pyvista as pv
 import utils3d
 from numba import njit
@@ -436,6 +437,7 @@ def save_images(
         images_lists: list[np.ndarray],
         depth_lists: list[np.ndarray],
         num_frames: int = 25,
+        focal_len: float = 260,
         degrees_per_frame: float = 1.0,
         major_radius: float = 80,
         minor_radius: float = 70,
@@ -456,9 +458,8 @@ def save_images(
 
     near = 0.0001
     far = 10000.
-    focal = 260.
     K = np.eye(3)
-    K[0,0] = focal; K[1,1] = focal; K[0,2] = width/2.0; K[1,2] = height/2.0
+    K[0,0] = focal_len; K[1,1] = focal_len; K[0,2] = width/2.0; K[1,2] = height/2.0
 
     pose_s = poses[0]
     never_occluded = np.ones((height, width), dtype=bool)
@@ -473,8 +474,6 @@ def save_images(
         assert image.shape[:2] == (height, width), f"{image.shape=}, {height=}, {width=}"
 
         depth = depth_lists[i].astype(np.float32)
-        depth[depth < 1e-5] = 1e-5
-        depth = 10000./depth
         depth = np.clip(depth, near, far)
         assert depth.shape == (height, width), f"{image.shape=} {depth.shape=}"
 
@@ -544,6 +543,16 @@ def save_images(
     return None
 
 
+def read_exr(ext_file_path: str) -> np.ndarray:
+    exr_file = OpenEXR.InputFile(ext_file_path)
+    header = exr_file.header()
+    data = np.frombuffer(exr_file.channel('Y'), dtype=np.float32)
+    width = header['displayWindow'].max.x - header['displayWindow'].min.x + 1
+    height = header['displayWindow'].max.y - header['displayWindow'].min.y + 1
+    image = data.reshape((height, width))
+    return image
+
+
 if __name__== '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -561,6 +570,25 @@ if __name__== '__main__':
     )
 
     parser.add_argument(
+        "--depth_format",
+        type=str,
+        choices=["npy", "npz", "exr"],
+        default="npy",
+    )
+
+    parser.add_argument(
+        "--invert_depth",
+        action="store_true",
+        help="Set if the depth estimator returns inverse depth."
+    )
+
+    parser.add_argument(
+        "--focal_len",
+        type=float,
+        default=260,
+    )
+
+    parser.add_argument(
         "--degrees_per_frame",
         type=float
     )
@@ -574,13 +602,13 @@ if __name__== '__main__':
     parser.add_argument(
         "--major_radius",
         type=int,
-        default=200
+        default=80
     )
 
     parser.add_argument(
         "--minor_radius",
         type=int,
-        default=200
+        default=70
     )
 
     parser.add_argument(
@@ -613,16 +641,24 @@ if __name__== '__main__':
     image_path = [os.path.join(args.image_folder, ip) for ip in sorted(os.listdir(args.image_folder))]
     image_list = [np.array(Image.open(ip)) for ip in image_path]
 
-    depth_path_npz = [os.path.join(args.depth_folder, dp) for dp in sorted(os.listdir(args.depth_folder)) if dp.endswith('.npz')]
-    if depth_path_npz:
+    if args.depth_format == "npy":
+        depth_path_npy = [os.path.join(args.depth_folder, dp) for dp in sorted(os.listdir(args.depth_folder)) if dp.endswith('.npy')]
+        depth_list = [np.load(dp) for dp in depth_path_npy]
+    elif args.depth_format == "npz":
+        depth_path_npz = [os.path.join(args.depth_folder, dp) for dp in sorted(os.listdir(args.depth_folder)) if dp.endswith('.npz')]
         assert len(depth_path_npz) == 1
         depth_list = np.load(depth_path_npz[0])['depths']
         depth_list = [depth_list[i] for i in range(depth_list.shape[0])]
+    elif args.depth_format == "exr":
+        depth_path_exr = [os.path.join(args.depth_folder, dp) for dp in sorted(os.listdir(args.depth_folder)) if dp.endswith('.exr')]
+        depth_list = [read_exr(dp) for dp in depth_path_exr]
     else:
-        depth_path_npy = [os.path.join(args.depth_folder, dp) for dp in sorted(os.listdir(args.depth_folder)) if dp.endswith('.npy')]
-        depth_list = [np.load(dp) for dp in depth_path_npy]
+        raise NotImplementedError(f"Depth format '{args.depth_format}' is not yet implemented.")
 
-    assert len(image_list) == len(depth_list)
+    assert len(image_list) == len(depth_list), f"{len(image_list)=}, {len(depth_list)=}"
+
+    if args.invert_depth:
+        depth_list = [10000./depth.clip(1e-5, None) for depth in depth_list]
 
     if args.control_mode == 'image':
         image_list = image_list[0:1]
@@ -640,6 +676,7 @@ if __name__== '__main__':
         image_list,
         depth_list,
         args.num_frames,
+        args.focal_len,
         args.degrees_per_frame,
         args.major_radius,
         args.minor_radius,

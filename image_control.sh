@@ -6,19 +6,25 @@ NUM_FRAMES=25
 set -e
 
 # resize to 1024x576
-find data/${ITEM}/images/ -maxdepth 1 -type f -print0 | xargs -0 -I@ convert @ -resize 1024x576! @
+find "data/${ITEM}/images/" -maxdepth 1 -type f -print0 | xargs -0 -I@ convert @ -resize 1024x576! @
 
 # depth estimation
+rm -rf "data/${ITEM}/depth"
+echo "Running Depth Anything V2..."
 python tools/Depth-Anything-V2/run.py \
   --encoder vitl \
   --img-path data/${ITEM}/images  \
   --outdir data/${ITEM}/depth
 
 # trajectory extraction
+echo "Running Trajectory Extraction..."
 python src/trajectory_extraction.py \
   --image_folder data/${ITEM}/images/ \
   --depth_folder data/${ITEM}/depth/ \
   --output_folder output/${ITEM}/${CAMERA_MOTION_MODE}_${DEGREE}/warped \
+  --depth_format npy \
+  --invert_depth \
+  --focal_len 260 \
   --degrees_per_frame ${DEGREE} \
   --camera_motion_mode ${CAMERA_MOTION_MODE} \
   --major_radius 80 \

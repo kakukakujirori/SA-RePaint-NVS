@@ -14,6 +14,7 @@ kornia
 lovely_tensors
 lpips
 numba
+OpenEXR
 pathos
 pycolmap
 pytorch-ignite

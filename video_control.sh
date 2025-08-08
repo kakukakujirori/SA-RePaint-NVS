@@ -34,6 +34,7 @@ fi
 
 # depth estimation
 ffmpeg -y -framerate 10 -i "${IMAGE_DIR}/%04d.png" -c:v ffv1 -g 1 "data/${ITEM}/${ITEM}.mkv"
+rm -rf "data/${ITEM}/depth"
 echo "Running Video Depth Anything..."
 python tools/Video-Depth-Anything/run.py \
   --encoder vitl \
@@ -49,6 +50,9 @@ python src/trajectory_extraction.py \
   --image_folder "data/${ITEM}/images/" \
   --depth_folder "data/${ITEM}/depth/" \
   --output_folder "output/${ITEM}/${CAMERA_MOTION_MODE}_${DEGREE}/warped" \
+  --depth_format npz \
+  --invert_depth \
+  --focal_len 260 \
   --degrees_per_frame ${DEGREE} \
   --camera_motion_mode ${CAMERA_MOTION_MODE} \
   --major_radius 80 \

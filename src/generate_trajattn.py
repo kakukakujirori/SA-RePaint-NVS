@@ -56,7 +56,7 @@ if __name__ == '__main__':
     parser.add_argument(
         "--checkpoint",
         type=str,
-        default="tools/TrajectoryAttention/checkpoints/trajattn_temp.pth",
+        default="checkpoints/trajattn_temp.pth",
     )
 
     parser.add_argument(

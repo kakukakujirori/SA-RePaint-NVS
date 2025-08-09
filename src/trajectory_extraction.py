@@ -492,6 +492,9 @@ def save_images(
                 warped_frame2 = image
                 mask2 = np.zeros_like(mask2)
 
+            # binarize masks
+            mask2 = np.where(mask2 > 0, 255, 0).astype(np.uint8)
+
             # save images
             warped_frame2[mask2 > 0] = 0
             Image.fromarray(mask2).save(os.path.join(save_path, str(i).zfill(4)+"_mask.png"))
@@ -631,6 +634,13 @@ if __name__== '__main__':
     )
 
     parser.add_argument(
+        "--use_mesh",
+        action="store_true",
+        help="If set, the trajectory will be extracted using a pyvista mesh renderer. "
+             "Otherwise, it will be extracted using forward warping."
+    )
+
+    parser.add_argument(
         "--save_trajectory",
         action="store_true",
         help="If set, the trajectory will be saved as a numpy file."
@@ -683,6 +693,6 @@ if __name__== '__main__':
         args.camera_motion_mode,
         args.no_occlusion_revealing,
         args.save_trajectory,
-        use_mesh=True,
+        args.use_mesh,
     )
     print(f"Trajectory extraction finished, saved to {args.output_folder}")

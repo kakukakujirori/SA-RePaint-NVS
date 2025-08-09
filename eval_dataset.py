@@ -25,8 +25,6 @@ from src.eval_ssim import ssim
 from src.eval_trajectories import eval_trajectories, run_glomap
 
 
-tanks_and_temples_input_root = "./tanks_and_temples_input"
-tanks_and_temples_output_root = "./tanks_and_temples_output"
 NUM_FRAMES = 25
 NUM_INFERECE_STEPS = 50
 DENOISE_START_STEP = NUM_INFERECE_STEPS // 3
@@ -39,17 +37,44 @@ MINOR_RADIUS = 70
 GPUS = [0, 1]
 
 
-def organize_images_and_depth(tanks_and_temples_data_root: str):
-    assert os.path.isdir(tanks_and_temples_data_root), f"Folder not found: {tanks_and_temples_data_root}"
-    if os.path.isdir(tanks_and_temples_input_root):
-        shutil.rmtree(tanks_and_temples_input_root)
-    if os.path.isdir(tanks_and_temples_output_root):
-        shutil.rmtree(tanks_and_temples_output_root)
-    os.makedirs(tanks_and_temples_input_root)
-    os.makedirs(tanks_and_temples_output_root)
+def reorganize_frames(mannequin_challenge_data_root: str):
+    """This script is expected to be run after
+    `python download_extract.py` is executed."""
+    for split in ["validation", "test", "train"]:
+        split_root = os.path.join(mannequin_challenge_data_root, split, "data")
+        output_root = os.path.join(mannequin_challenge_data_root, f"{split}_frames")
+        assert os.path.isdir(split_root), f"Directory {split_root} does not exist."
+
+        if os.path.isdir(output_root):
+            shutil.rmtree(output_root)
+        os.makedirs(output_root)
+
+        cnt = 0
+        for uid in os.listdir(split_root):
+            frame_dir = os.path.join(split_root, uid, "frames")
+            if not os.path.isdir(frame_dir):
+                continue
+
+            dst_dir = os.path.join(output_root, uid)
+            if os.path.isdir(dst_dir):
+                shutil.rmtree(dst_dir)
+            shutil.copytree(frame_dir, dst_dir)
+            cnt += 1
+
+        print(f"[extract_frames] Finished reorganizing '{split}' ({cnt}/{len(os.listdir(split_root))})")
+
+
+def organize_images_and_depth(data_root: str, input_root: str, output_root: str):
+    assert os.path.isdir(data_root), f"Folder not found: {data_root}"
+    if os.path.isdir(input_root):
+        shutil.rmtree(input_root)
+    if os.path.isdir(output_root):
+        shutil.rmtree(output_root)
+    os.makedirs(input_root)
+    os.makedirs(output_root)
 
     # extract keyframes from each scene
-    for i, scene in enumerate(glob.glob(os.path.join(tanks_and_temples_data_root, "*"))):
+    for i, scene in enumerate(glob.glob(os.path.join(data_root, "*"))):
         if not os.path.isdir(scene):
             continue
 
@@ -60,15 +85,15 @@ def organize_images_and_depth(tanks_and_temples_data_root: str):
             # pool images
             if cnt % NUM_FRAMES == 0:
                 img_num = os.path.basename(imgpath).split(".")[0]
-                dst_path = os.path.join(tanks_and_temples_input_root, scene_name + "_" + img_num + ".jpg")
+                dst_path = os.path.join(input_root, scene_name + "_" + img_num + ".jpg")
                 shutil.copy(imgpath, dst_path)
 
     # resize to 1024x576
-    subprocess.run(["magick", "mogrify", "-resize", "1024x576!", os.path.join(tanks_and_temples_input_root, "*.jpg")])
+    subprocess.run(["magick", "mogrify", "-resize", "1024x576!", os.path.join(input_root, "*.jpg")])
 
     # depth estimation
-    imglist = glob.glob(os.path.join(tanks_and_temples_input_root, "*.jpg"))
-    imglist_path = os.path.join(tanks_and_temples_input_root, "tmp.txt")
+    imglist = glob.glob(os.path.join(input_root, "*.jpg"))
+    imglist_path = os.path.join(input_root, "tmp.txt")
     with open(imglist_path, "a") as f:
         for imgpath in imglist:
             f.write(imgpath + "\n")
@@ -76,30 +101,39 @@ def organize_images_and_depth(tanks_and_temples_data_root: str):
     subprocess.run(["python", "tools/Depth-Anything-V2/run.py",
         "--encoder", "vitl",
         "--img-path", imglist_path,
-        "--outdir", tanks_and_temples_output_root])  # TEMPORAL USE
+        "--outdir", output_root])  # TEMPORAL USE
 
     os.remove(imglist_path)
 
     # store in each folder
-    for imgpath in glob.glob(os.path.join(tanks_and_temples_input_root, "*.jpg")):
+    for imgpath in glob.glob(os.path.join(input_root, "*.jpg")):
         imgname = os.path.basename(imgpath).split(".")[0]
-        image_folder_path = os.path.join(tanks_and_temples_input_root, imgname, "images")
-        depth_folder_path = os.path.join(tanks_and_temples_input_root, imgname, "depth")
+        image_folder_path = os.path.join(input_root, imgname, "images")
+        depth_folder_path = os.path.join(input_root, imgname, "depth")
         os.makedirs(image_folder_path)
         os.makedirs(depth_folder_path)
         shutil.move(imgpath, image_folder_path)
-        shutil.move(os.path.join(tanks_and_temples_output_root, imgname + ".png"), depth_folder_path)
-        shutil.move(os.path.join(tanks_and_temples_output_root, imgname + ".npy"), depth_folder_path)
+        shutil.move(os.path.join(output_root, imgname + ".png"), depth_folder_path)
+        shutil.move(os.path.join(output_root, imgname + ".npy"), depth_folder_path)
 
 
-def run_trajectory_extraction(scene: str, motion_mode: str, degree: float, no_occlusion_revealing: bool = True, save_trajectory: bool = False):
+def run_trajectory_extraction(
+        input_root: str,
+        output_root: str,
+        scene: str,
+        motion_mode: str,
+        degree: float,
+        no_occlusion_revealing: bool = True,
+        save_trajectory: bool = False,
+        use_mesh: bool = True,
+    ) -> str:
     task_id = f"Scene: {scene}, Motion: {motion_mode + '_' + str(degree)}"
     print(f"STARTING task: {task_id}")
     try:
         result = subprocess.run(["python", "src/trajectory_extraction.py",
-            "--image_folder", f"{tanks_and_temples_input_root}/{scene}/images/",
-            "--depth_folder", f"{tanks_and_temples_input_root}/{scene}/depth/",
-            "--output_folder", f"{tanks_and_temples_output_root}/{scene}/{motion_mode}_{degree}/warped",
+            "--image_folder", f"{input_root}/{scene}/images/",
+            "--depth_folder", f"{input_root}/{scene}/depth/",
+            "--output_folder", f"{output_root}/{scene}/{motion_mode}_{degree}/warped",
             "--depth_format", "npy",
             "--invert_depth",
             "--focal_len", "260",
@@ -113,6 +147,8 @@ def run_trajectory_extraction(scene: str, motion_mode: str, degree: float, no_oc
                 ["--no_occlusion_revealing"] if no_occlusion_revealing else []
             ) + (
                 ["--save_trajectory"] if save_trajectory else []
+            ) + (
+                ["--use_mesh"] if use_mesh else []
             ),
             check=True, capture_output=True, text=True, encoding='utf-8')
         print(f"COMPLETED task: {task_id}\nSTDOUT:\n{result.stdout.strip()}")
@@ -134,7 +170,7 @@ def run_trajectory_extraction(scene: str, motion_mode: str, degree: float, no_oc
         return f"Unexpected error for {task_id}: {e}"
 
 
-def run_generation_task(scene: str, motion_mode: str, degree: float, gpu_id: int, method: str = "mine") -> str:
+def run_generation_task(output_root: str, scene: str, motion_mode: str, degree: float, gpu_id: int, method: str = "mine") -> str:
     task_id = f"Scene: {scene}, Motion: {motion_mode + '_' + str(degree)}, GPU: {gpu_id}"
     print(f"STARTING task: {task_id}")
     with torch.cuda.device(f'cuda:{gpu_id}'):
@@ -142,8 +178,8 @@ def run_generation_task(scene: str, motion_mode: str, degree: float, gpu_id: int
     try:
         if method == "nvssolver":
             result = subprocess.run(["python", "src/generate_nvssolver.py",
-                "--output_folder", f"{tanks_and_temples_output_root}/{scene}/{motion_mode}_{degree}/generated",
-                "--trajectory_folder", f"{tanks_and_temples_output_root}/{scene}/{motion_mode}_{degree}/warped",
+                "--output_folder", f"{output_root}/{scene}/{motion_mode}_{degree}/generated",
+                "--trajectory_folder", f"{output_root}/{scene}/{motion_mode}_{degree}/warped",
                 "--num_frames", f"{NUM_FRAMES}",
                 "--num_inference_steps", "100",
                 "--min_guidance_scale", "1.0",
@@ -153,8 +189,8 @@ def run_generation_task(scene: str, motion_mode: str, degree: float, gpu_id: int
                 check=True, capture_output=True, text=True, encoding='utf-8')
         elif method == "trajattn":
             result = subprocess.run(["python", "src/generate_trajattn.py",
-                "--output_folder", f"{tanks_and_temples_output_root}/{scene}/{motion_mode}_{degree}/generated",
-                "--trajectory_folder", f"{tanks_and_temples_output_root}/{scene}/{motion_mode}_{degree}/warped",
+                "--output_folder", f"{output_root}/{scene}/{motion_mode}_{degree}/generated",
+                "--trajectory_folder", f"{output_root}/{scene}/{motion_mode}_{degree}/warped",
                 "--num_frames", f"{NUM_FRAMES}",
                 "--num_inference_steps", "25",
                 "--min_guidance_scale", "1.0",
@@ -164,8 +200,8 @@ def run_generation_task(scene: str, motion_mode: str, degree: float, gpu_id: int
                 check=True, capture_output=True, text=True, encoding='utf-8')
         elif method == "trajcrafter":
             result = subprocess.run(["python", "src/generate_trajcrafter.py",
-                "--output_folder", f"{tanks_and_temples_output_root}/{scene}/{motion_mode}_{degree}/generated",
-                "--trajectory_folder", f"{tanks_and_temples_output_root}/{scene}/{motion_mode}_{degree}/warped",
+                "--output_folder", f"{output_root}/{scene}/{motion_mode}_{degree}/generated",
+                "--trajectory_folder", f"{output_root}/{scene}/{motion_mode}_{degree}/warped",
                 "--num_frames", f"{NUM_FRAMES}",
                 "--num_inference_steps", "50",
                 "--seed", "12345",
@@ -173,8 +209,8 @@ def run_generation_task(scene: str, motion_mode: str, degree: float, gpu_id: int
                 check=True, capture_output=True, text=True, encoding='utf-8')
         elif method == "mine":
             result = subprocess.run(["python", "src/generate.py",
-                "--output_folder", f"{tanks_and_temples_output_root}/{scene}/{motion_mode}_{degree}/generated",
-                "--trajectory_folder", f"{tanks_and_temples_output_root}/{scene}/{motion_mode}_{degree}/warped",
+                "--output_folder", f"{output_root}/{scene}/{motion_mode}_{degree}/generated",
+                "--trajectory_folder", f"{output_root}/{scene}/{motion_mode}_{degree}/warped",
                 "--num_frames", f"{NUM_FRAMES}",
                 "--num_inference_steps", f"{NUM_INFERECE_STEPS}",
                 "--denoise_start_step", f"{DENOISE_START_STEP}",
@@ -244,6 +280,9 @@ def run_pixelwise_metrics_calculation(output_root: str, allow_resize: bool = Fal
         mask_tensor_bool = mask_tensor < 0.5
         mask_tensor_float = mask_tensor_bool.float().mean(dim=1, keepdim=True)
 
+        # [NOTE: IMPORTANT] fill invalid pixels (prevent black pixels from seeping into valid regions)
+        warped_tensor = torch.where(mask_tensor_bool, warped_tensor, generated_tensor)
+
         # calculate psnr, ssim, lpips (NOTE: image range is [-1, 1] for LPIPS)
         results = {}
         with torch.no_grad():
@@ -304,10 +343,7 @@ def run_pixelwise_metrics_calculation(output_root: str, allow_resize: bool = Fal
     return total_results, missing
 
 
-def run_fid_calculation(
-        data_root: str,
-        output_root: str,
-    ):
+def run_fid_calculation(data_root: str, output_root: str):
     with tempfile.TemporaryDirectory() as td:
         print(f"[run_fid_calculation] Images are copied to {td} for FID calculation.")
         gt_folder = os.path.join(td, "gt")
@@ -338,11 +374,7 @@ def run_fid_calculation(
         return score.item()
 
 
-def run_fvd_calculation(
-        tanks_and_temples_data_root: str,
-        tanks_and_temples_output_root: str,
-    ):
-
+def run_fvd_calculation(data_root: str, output_root: str):
     # Taken from https://github.com/ZGCTroy/CamI2V/blob/main/evaluation/fvd_test.py
     class MyFVDCalculation(FVDCalculation):
         def calculate_fvd_by_video_list(
@@ -362,8 +394,8 @@ def run_fvd_calculation(
 
     # load videos
     start_frames_per_scene = {}
-    for scene_imgname in os.listdir(tanks_and_temples_output_root):
-        if not os.path.isdir(os.path.join(tanks_and_temples_output_root, scene_imgname)):
+    for scene_imgname in os.listdir(output_root):
+        if not os.path.isdir(os.path.join(output_root, scene_imgname)):
             continue
         scene, imgname = scene_imgname.split("_")
         if scene not in start_frames_per_scene:
@@ -374,7 +406,7 @@ def run_fvd_calculation(
     sample_video_list = []
 
     def run_task(scene: str, start_frames: list[str]):
-        gt_frames = sorted(glob.glob(os.path.join(tanks_and_temples_data_root, scene, "*.jpg")))
+        gt_frames = sorted(glob.glob(os.path.join(data_root, scene, "*.jpg")))
 
         for start in sorted(start_frames):
             scene_imgname = f"{scene}_{start}"
@@ -391,8 +423,8 @@ def run_fvd_calculation(
             gt_video = [load_image(p) for p in gt_video]
 
             # load sample video
-            for motion in os.listdir(os.path.join(tanks_and_temples_output_root, scene_imgname)):
-                sample_video = [os.path.join(tanks_and_temples_output_root, scene_imgname, motion, f"generated/{i:04d}.png") for i in range(25)]
+            for motion in os.listdir(os.path.join(output_root, scene_imgname)):
+                sample_video = [os.path.join(output_root, scene_imgname, motion, f"generated/{i:04d}.png") for i in range(NUM_FRAMES)]
                 sample_video = [load_image(p) for p in sample_video]
 
             # NOTE: FDV inputs are uint8
@@ -491,7 +523,7 @@ def run_camera_pose_error_calculation(output_root: str, gt_focal_len: float = 26
             assert os.path.isdir(data_dir)
             tasks.append((data_dir, GPUS[idx % len(GPUS)]))
 
-    with ProcessingPool(nodes=32) as pool:
+    with ProcessingPool(nodes=24) as pool:
         results = list(tqdm(pool.imap(run_task, tasks), total=len(tasks), desc="Calculating camera pose errors"))
 
     total_results = {}
@@ -582,18 +614,37 @@ def run_sed_calculation(output_root: str):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Tanks and Temples Evaluation")
-    parser.add_argument("--data_root", type=str, default="/home/ryotaro/data/TanksAndTemples")
+    parser = argparse.ArgumentParser(description="DAVIS Evaluation")
+    parser.add_argument("dataset", type=str, choices=["davis", "mannequin", "tanks"], help="Dataset to use for evaluation.")
     parser.add_argument("--scratch", action="store_true", help="If set, all the images, depth, and trajectories are re-organized and re-generated.")
     parser.add_argument("--method", type=str, default="mine", choices=["nvssolver", "trajattn", "trajcrafter", "mine"], help="Method to use for generation. 'nvssolver' uses NVS-Solver, 'trajattn' uses Trajectory Attention, and 'mine' uses the custom method.")
+    parser.add_argument("--use_mesh", action="store_true", help="If set, use mesh for trajectory extraction.")
     args = parser.parse_args()
+
+    # 0. Set up paths
+    if args.dataset == "davis":
+        data_root = "/home/ryotaro/data/DAVIS/JPEGImages/Full-Resolution"
+        input_root = "./davis_input"
+        output_root = "./davis_output"
+    elif args.dataset == "mannequin":
+        data_root = "/home/ryotaro/data/MannequinChallengeHQ/validation_frames"
+        input_root = "./mannequin_challenge_input"
+        output_root = "./mannequin_challenge_output"
+    elif args.dataset == "tanks":
+        data_root = "/home/ryotaro/data/TanksAndTemples"
+        input_root = "./tanks_and_temples_input"
+        output_root = "./tanks_and_temples_output"
+    else:
+        raise NotImplementedError(f"Dataset '{args.dataset}' is not implemented.")
 
     # 1. Organize RGB images & Depth estimation
     if args.scratch:
-        organize_images_and_depth(tanks_and_temples_data_root=args.data_root)
+        # if args.dataset == "mannequin":
+        #     reorganize_frames(data_root)
+        organize_images_and_depth(data_root=data_root, input_root=input_root, output_root=output_root)
 
         scene_motion_degree_pairs = []
-        for i, scene in enumerate(sorted(os.listdir(tanks_and_temples_input_root))):
+        for i, scene in enumerate(sorted(os.listdir(input_root))):
             motion_mode, degree = MOTION_DEGREE_PAIRS[i % len(MOTION_DEGREE_PAIRS)]
             scene_motion_degree_pairs.append((scene, motion_mode, degree))
 
@@ -602,7 +653,7 @@ if __name__ == '__main__':
         with concurrent.futures.ThreadPoolExecutor(max_workers=31) as executor:
             future_to_task_info = {}
             for scene, motion, degree in scene_motion_degree_pairs:
-                future = executor.submit(run_trajectory_extraction, scene, motion, degree, save_trajectory=(args.method == "trajattn"))
+                future = executor.submit(run_trajectory_extraction, input_root, output_root, scene, motion, degree, save_trajectory=(args.method == "trajattn"), use_mesh=args.use_mesh)
                 future_to_task_info[future] = (scene, motion, degree, None)
                 job_idx += 1 # This ensures round-robin submission to GPUs
 
@@ -617,16 +668,16 @@ if __name__ == '__main__':
                     print(f"Main loop caught exception for {task_desc}: {exc}")
 
     else:
-        assert os.path.isdir(tanks_and_temples_output_root)
+        assert os.path.isdir(output_root)
 
         scene_motion_degree_pairs = []
-        for scene in sorted(os.listdir(tanks_and_temples_output_root)):
-            scene_path = os.path.join(tanks_and_temples_output_root, scene)
+        for scene in sorted(os.listdir(output_root)):
+            scene_path = os.path.join(output_root, scene)
             if not os.path.isdir(scene_path):
                 continue
             for motion_degree in os.listdir(scene_path):
-                assert os.path.isdir(os.path.join(tanks_and_temples_output_root, scene, motion_degree, "warped"))
-                if os.path.isdir(os.path.join(tanks_and_temples_output_root, scene, motion_degree, "generated")):
+                assert os.path.isdir(os.path.join(output_root, scene, motion_degree, "warped"))
+                if os.path.isdir(os.path.join(output_root, scene, motion_degree, "generated")):
                     continue
                 motion_mode, degree = motion_degree.split("_")
                 scene_motion_degree_pairs.append((scene, motion_mode, degree))
@@ -640,7 +691,7 @@ if __name__ == '__main__':
             future_to_task_info = {}
             for scene, motion, degree in scene_motion_degree_pairs:
                 gpu_id_for_task = GPUS[job_idx_for_gpu_assignment % len(GPUS)]
-                future = executor.submit(run_generation_task, scene, motion, degree, gpu_id_for_task, args.method)
+                future = executor.submit(run_generation_task, output_root, scene, motion, degree, gpu_id_for_task, args.method)
                 future_to_task_info[future] = (scene, motion, degree, gpu_id_for_task)
                 job_idx_for_gpu_assignment += 1 # This ensures round-robin submission to GPUs
 
@@ -656,30 +707,30 @@ if __name__ == '__main__':
                     raise exc
 
         # 4. Pixelwise metrics calculation
-        pixelwise_results, _ = run_pixelwise_metrics_calculation(tanks_and_temples_output_root, allow_resize=(args.method == "trajcrafter"))
-        with open(os.path.join(tanks_and_temples_output_root, "pixelwise_results.txt"), "w") as f:
+        pixelwise_results, _ = run_pixelwise_metrics_calculation(output_root, allow_resize=(args.method == "trajcrafter"))
+        with open(os.path.join(output_root, "pixelwise_results.txt"), "w") as f:
             json.dump(pixelwise_results, f, indent=4)
 
         # 5. FID/FVD calculation
         fid_score = run_fid_calculation(
-            data_root=args.data_root,
-            output_root=tanks_and_temples_output_root,
+            data_root=data_root,
+            output_root=output_root,
         )
         fvd_videogpt, fvd_stylegan = run_fvd_calculation(
-            tanks_and_temples_data_root=args.data_root,
-            tanks_and_temples_output_root=tanks_and_temples_output_root,
+            data_root=data_root,
+            output_root=output_root,
         )
-        with open(os.path.join(tanks_and_temples_output_root, "fid_fvd.txt"), "w") as f:
+        with open(os.path.join(output_root, "fid_fvd.txt"), "w") as f:
             f.write("FID: " + str(fid_score) + "\nFVD (VideoGPT): " + str(fvd_videogpt) + "\nFVD (StyleGAN): " + str(fvd_stylegan) + "\n")
 
         # 6. Camera pose error calculation
-        camera_pose_results, _ = run_camera_pose_error_calculation(tanks_and_temples_output_root)
-        with open(os.path.join(tanks_and_temples_output_root, "camera_pose_results.txt"), "w") as f:
+        camera_pose_results, _ = run_camera_pose_error_calculation(output_root)
+        with open(os.path.join(output_root, "camera_pose_results.txt"), "w") as f:
             json.dump(camera_pose_results, f, indent=4)
 
         # 7. SED calculation
-        sed_results = run_sed_calculation(tanks_and_temples_output_root)
-        with open(os.path.join(tanks_and_temples_output_root, "sed.txt"), "w") as f:
+        sed_results = run_sed_calculation(output_root)
+        with open(os.path.join(output_root, "sed.txt"), "w") as f:
             json.dump(sed_results, f, indent=4)
 
     except KeyboardInterrupt:

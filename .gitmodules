@@ -1,3 +1,12 @@
+[submodule "tools/Depth-Anything-V2"]
+	path = tools/Depth-Anything-V2
+	url = https://github.com/DepthAnything/Depth-Anything-V2.git
+[submodule "tools/Video-Depth-Anything"]
+	path = tools/Video-Depth-Anything
+	url = https://github.com/DepthAnything/Video-Depth-Anything.git
+[submodule "tools/utils3d"]
+	path = tools/utils3d
+	url = https://github.com/EasternJournalist/utils3d.git
 [submodule "tools/TrajectoryAttention"]
 	path = tools/TrajectoryAttention
 	url = https://github.com/xizaoqu/TrajectoryAttention.git
@@ -7,9 +16,3 @@
 [submodule "tools/FVD"]
 	path = tools/FVD
 	url = https://github.com/zhizhou57/FVD.git
-[submodule "tools/Video-Depth-Anything"]
-	path = tools/Video-Depth-Anything
-	url = https://github.com/DepthAnything/Video-Depth-Anything.git
-[submodule "tools/utils3d"]
-	path = tools/utils3d
-	url = https://github.com/EasternJournalist/utils3d.git

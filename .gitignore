@@ -1,5 +1,5 @@
 **/__pycache__/
-**/checkpoints/
+checkpoints/
 data/
 output/
 notebooks/

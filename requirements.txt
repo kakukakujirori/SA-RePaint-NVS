@@ -26,3 +26,4 @@ transformers
 rerun-sdk
 viser
 wandb
+-e ./tools/utils3d

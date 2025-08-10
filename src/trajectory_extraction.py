@@ -1,4 +1,3 @@
-"""Basic concept: Modify trajectory_extraction.py"""
 from typing import Optional
 import argparse
 import os
@@ -322,7 +321,10 @@ def forward_warp(
 
     warped_frame2, mask2 = bilinear_splatting(frame1, mask1, trans_depth1, flow12, None, is_image=True)
 
-    return warped_frame2, mask2, trans_coordinates, trans_valid
+    # make trans_coordiante 3D (for Diffusion As Shader)
+    trans_coordinates_3D = np.concatenate([trans_coordinates, trans_depth1.reshape(h,w,1)], axis=-1)
+
+    return warped_frame2, mask2, trans_coordinates_3D, trans_valid
 
 
 def render_mesh(
@@ -369,6 +371,9 @@ def render_mesh(
 
     trans_valid = (trans_depth1 > 0)
     trans_valid = mask_occlusion_traj(depth1, trans_depth1, trans_coordinates, trans_valid)
+
+    # make trans_coordiante 3D (for Diffusion As Shader)
+    trans_coordinates_3D = np.concatenate([trans_coordinates, trans_depth1.reshape(h,w,1)], axis=-1)
 
     # build mesh components
     world_points = world_points.reshape(h, w, 3)
@@ -429,7 +434,7 @@ def render_mesh(
 
     plotter.close()
 
-    return rgb_image, (255 - mask_image_rgb), trans_coordinates, trans_valid
+    return rgb_image, (255 - mask_image_rgb), trans_coordinates_3D, trans_valid
 
 
 def save_images(
@@ -443,7 +448,7 @@ def save_images(
         minor_radius: float = 70,
         camera_motion_mode: str = "horizontal",
         no_occlusion_revealing: bool = False,
-        save_trajectory: bool = False,
+        save_trajectory_type: Optional[str] = None,
         use_mesh: bool = True,
     ) -> None:
     """
@@ -464,7 +469,7 @@ def save_images(
     pose_s = poses[0]
     never_occluded = np.ones((height, width), dtype=bool)
 
-    trans_coordinates_list = []
+    trans_coordinates_3D_list = []
     trans_valid_list = []
 
     for i, pose_t in enumerate(poses):
@@ -478,7 +483,7 @@ def save_images(
         assert depth.shape == (height, width), f"{image.shape=} {depth.shape=}"
 
         if use_mesh:
-            warped_frame2, mask2, trans_coordinates, trans_valid = render_mesh(
+            warped_frame2, mask2, trans_coordinates_3D, trans_valid = render_mesh(
                 image,
                 depth,
                 pose_s,
@@ -501,7 +506,7 @@ def save_images(
             Image.fromarray(warped_frame2).save(os.path.join(save_path, str(i).zfill(4)+".png"))
 
         else:
-            warped_frame2, mask2, trans_coordinates, trans_valid = forward_warp(
+            warped_frame2, mask2, trans_coordinates_3D, trans_valid = forward_warp(
                 image,
                 never_occluded,
                 depth,
@@ -530,18 +535,44 @@ def save_images(
             warped_frame2 = Image.fromarray(np.uint8(warped_frame2 * (1-mask_erosion_)))
             warped_frame2.save(os.path.join(save_path, str(i).zfill(4)+".png"))
 
-        trans_coordinates_list.append(trans_coordinates)
+        trans_coordinates_3D_list.append(trans_coordinates_3D)
         trans_valid_list.append(trans_valid)
 
-    # overwrite the first frame trans coordinates and valid (just in case)
-    trans_coordinates_list[0] = create_grid(height, width)
-    trans_valid_list[0] = trans_valid_list[0] + True
+    if save_trajectory_type == "2d_npy":
+        trans_coordinates_list = [coords[:, :, :2] for coords in trans_coordinates_3D_list]
 
-    if save_trajectory:
+        # overwrite the first frame trans coordinates and valid (just in case)
+        trans_coordinates_list[0] = create_grid(height, width)
+        trans_valid_list[0] = trans_valid_list[0] + True
+
         trans_coordinates = np.stack(trans_coordinates_list, axis=0)
         trans_valid = np.stack(trans_valid_list, axis=0)
         np.save(os.path.join(save_path, 'trans_coordinates.npy'), trans_coordinates)
         np.save(os.path.join(save_path, 'trans_valid.npy'), trans_valid)
+
+    elif save_trajectory_type == "3d_rgb":
+        import sys
+        sys.path.append(__file__.rsplit('/', 2)[0])  # Adjust path to include the parent directory
+        sys.path.append(os.path.join(__file__.rsplit('/', 2)[0], 'tools', 'DiffusionAsShader'))  # Adjust path to include the DiffusionAsShader
+        from tools.DiffusionAsShader.models.pipelines import DiffusionAsShaderPipeline
+
+        trans_coordinates_3D = np.stack(trans_coordinates_3D_list, axis=0)
+        trans_coordinates_3D[:, :, :, 0] /= width
+        trans_coordinates_3D[:, :, :, 1] /= height
+
+        das = DiffusionAsShaderPipeline(gpu_id=0, output_dir=save_path)
+        _, tracking_tensor = das.visualize_tracking_moge(
+            points=trans_coordinates_3D,
+            mask=None,
+            save_tracking=False,  # TODO: turn off during evaluation
+        )
+        assert tracking_tensor.shape[0] == len(poses)
+        np.save(os.path.join(save_path, 'trans_coordinates_rgb.npy'), tracking_tensor.cpu().numpy())
+
+    elif save_trajectory_type is None:
+        pass
+    else:
+        raise NotImplementedError(f"Invalid save_trajectory_type: {save_trajectory_type}")
 
     return None
 
@@ -641,9 +672,11 @@ if __name__== '__main__':
     )
 
     parser.add_argument(
-        "--save_trajectory",
-        action="store_true",
-        help="If set, the trajectory will be saved as a numpy file."
+        "--save_trajectory_type",
+        type=str,
+        choices=[None, "2d_npy", "3d_rgb"],
+        default=None,
+        help="If set, the trajectory will be saved as a numpy file. (Use it for TrajectoryAttention or DiffusionAsShader)"
     )
 
     args = parser.parse_args()
@@ -692,7 +725,7 @@ if __name__== '__main__':
         args.minor_radius,
         args.camera_motion_mode,
         args.no_occlusion_revealing,
-        args.save_trajectory,
+        args.save_trajectory_type,
         args.use_mesh,
     )
     print(f"Trajectory extraction finished, saved to {args.output_folder}")

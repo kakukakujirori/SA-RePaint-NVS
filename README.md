@@ -32,8 +32,10 @@
     # Trajectory Attention (only for evaluation comparison)
     wget https://huggingface.co/zeqixiao/TrajectoryAttention/resolve/main/trajattn_temp.pth?download=true
     mv trajattn_temp.pth\?download\=true checkpoints/trajattn_temp.pth
-    ```
 
+    # Diffusion As Shader (only for evaluation comparison)
+    git clone https://huggingface.co/EXCAI/Diffusion-As-Shader checkpoints/Diffusion-As-Shader
+    ```
 
 ## Run
 

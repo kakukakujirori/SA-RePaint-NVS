@@ -7,12 +7,15 @@
 [submodule "tools/utils3d"]
 	path = tools/utils3d
 	url = https://github.com/EasternJournalist/utils3d.git
+[submodule "tools/FVD"]
+	path = tools/FVD
+	url = https://github.com/zhizhou57/FVD.git
 [submodule "tools/TrajectoryAttention"]
 	path = tools/TrajectoryAttention
 	url = https://github.com/xizaoqu/TrajectoryAttention.git
 [submodule "tools/TrajectoryCrafter"]
 	path = tools/TrajectoryCrafter
 	url = https://github.com/TrajectoryCrafter/TrajectoryCrafter.git
-[submodule "tools/FVD"]
-	path = tools/FVD
-	url = https://github.com/zhizhou57/FVD.git
+[submodule "tools/DiffusionAsShader"]
+	path = tools/DiffusionAsShader
+	url = https://github.com/IGL-HKUST/DiffusionAsShader.git

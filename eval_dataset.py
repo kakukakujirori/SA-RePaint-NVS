@@ -124,7 +124,7 @@ def run_trajectory_extraction(
         motion_mode: str,
         degree: float,
         no_occlusion_revealing: bool = True,
-        save_trajectory: bool = False,
+        save_trajectory_type: str = None,
         use_mesh: bool = True,
     ) -> str:
     task_id = f"Scene: {scene}, Motion: {motion_mode + '_' + str(degree)}"
@@ -146,7 +146,7 @@ def run_trajectory_extraction(
             ] + (
                 ["--no_occlusion_revealing"] if no_occlusion_revealing else []
             ) + (
-                ["--save_trajectory"] if save_trajectory else []
+                ["--save_trajectory_type", save_trajectory_type] if save_trajectory_type is not None else []
             ) + (
                 ["--use_mesh"] if use_mesh else []
             ),
@@ -176,7 +176,20 @@ def run_generation_task(output_root: str, scene: str, motion_mode: str, degree: 
     with torch.cuda.device(f'cuda:{gpu_id}'):
         torch.cuda.empty_cache()
     try:
-        if method == "nvssolver":
+        if method == "mine":
+            result = subprocess.run(["python", "src/generate.py",
+                "--output_folder", f"{output_root}/{scene}/{motion_mode}_{degree}/generated",
+                "--trajectory_folder", f"{output_root}/{scene}/{motion_mode}_{degree}/warped",
+                "--num_frames", f"{NUM_FRAMES}",
+                "--num_inference_steps", f"{NUM_INFERECE_STEPS}",
+                "--denoise_start_step", f"{DENOISE_START_STEP}",
+                "--repaint_iter_num", f"{REPAINT_ITER_NUM}",
+                "--min_guidance_scale", "1.0",
+                "--max_guidance_scale", "3.0",
+                "--seed", "12345",
+                "--gpu", f"{gpu_id}"],
+                check=True, capture_output=True, text=True, encoding='utf-8')
+        elif method == "nvssolver":
             result = subprocess.run(["python", "src/generate_nvssolver.py",
                 "--output_folder", f"{output_root}/{scene}/{motion_mode}_{degree}/generated",
                 "--trajectory_folder", f"{output_root}/{scene}/{motion_mode}_{degree}/warped",
@@ -207,16 +220,12 @@ def run_generation_task(output_root: str, scene: str, motion_mode: str, degree: 
                 "--seed", "12345",
                 "--gpu", f"{gpu_id}"],
                 check=True, capture_output=True, text=True, encoding='utf-8')
-        elif method == "mine":
-            result = subprocess.run(["python", "src/generate.py",
+        elif method == "das":
+            result = subprocess.run(["python", "src/generate_das.py",
                 "--output_folder", f"{output_root}/{scene}/{motion_mode}_{degree}/generated",
                 "--trajectory_folder", f"{output_root}/{scene}/{motion_mode}_{degree}/warped",
                 "--num_frames", f"{NUM_FRAMES}",
-                "--num_inference_steps", f"{NUM_INFERECE_STEPS}",
-                "--denoise_start_step", f"{DENOISE_START_STEP}",
-                "--repaint_iter_num", f"{REPAINT_ITER_NUM}",
-                "--min_guidance_scale", "1.0",
-                "--max_guidance_scale", "3.0",
+                "--num_inference_steps", "50",
                 "--seed", "12345",
                 "--gpu", f"{gpu_id}"],
                 check=True, capture_output=True, text=True, encoding='utf-8')
@@ -617,7 +626,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="DAVIS Evaluation")
     parser.add_argument("dataset", type=str, choices=["davis", "mannequin", "tanks"], help="Dataset to use for evaluation.")
     parser.add_argument("--scratch", action="store_true", help="If set, all the images, depth, and trajectories are re-organized and re-generated.")
-    parser.add_argument("--method", type=str, default="mine", choices=["nvssolver", "trajattn", "trajcrafter", "mine"], help="Method to use for generation. 'nvssolver' uses NVS-Solver, 'trajattn' uses Trajectory Attention, and 'mine' uses the custom method.")
+    parser.add_argument("--method", type=str, default="mine", choices=["mine", "nvssolver", "trajattn", "trajcrafter", "das"], help="Method to use for generation. 'nvssolver' uses NVS-Solver, 'trajattn' uses Trajectory Attention, and 'das' uses DiffusionAsShader.")
     parser.add_argument("--use_mesh", action="store_true", help="If set, use mesh for trajectory extraction.")
     args = parser.parse_args()
 
@@ -653,7 +662,15 @@ if __name__ == '__main__':
         with concurrent.futures.ThreadPoolExecutor(max_workers=31) as executor:
             future_to_task_info = {}
             for scene, motion, degree in scene_motion_degree_pairs:
-                future = executor.submit(run_trajectory_extraction, input_root, output_root, scene, motion, degree, save_trajectory=(args.method == "trajattn"), use_mesh=args.use_mesh)
+                future = executor.submit(
+                    run_trajectory_extraction,
+                    input_root,
+                    output_root,
+                    scene, motion,
+                    degree,
+                    save_trajectory_type=("2D_npy" if args.method == "trajattn" else "3D_rgb" if args.method == "das" else None),
+                    use_mesh=args.use_mesh,
+                )
                 future_to_task_info[future] = (scene, motion, degree, None)
                 job_idx += 1 # This ensures round-robin submission to GPUs
 
@@ -707,7 +724,7 @@ if __name__ == '__main__':
                     raise exc
 
         # 4. Pixelwise metrics calculation
-        pixelwise_results, _ = run_pixelwise_metrics_calculation(output_root, allow_resize=(args.method == "trajcrafter"))
+        pixelwise_results, _ = run_pixelwise_metrics_calculation(output_root, allow_resize=(args.method in ["trajcrafter", "das"]))
         with open(os.path.join(output_root, "pixelwise_results.txt"), "w") as f:
             json.dump(pixelwise_results, f, indent=4)
 

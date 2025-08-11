@@ -36,7 +36,7 @@ MAJOR_RADIUS = 80
 MINOR_RADIUS = 70
 
 GPUS = [0, 1]
-MAX_WORKER_NUM = 24
+MAX_WORKER_NUM = 16
 
 
 def reorganize_frames(mannequin_challenge_data_root: str):
@@ -354,9 +354,9 @@ def run_pixelwise_metrics_calculation(output_root: str, allow_resize: bool = Fal
     return total_results, missing
 
 
-def run_fid_calculation(data_root: str, output_root: str):
+def run_fid_kid_calculation(data_root: str, output_root: str):
     with tempfile.TemporaryDirectory() as td:
-        print(f"[run_fid_calculation] Images are copied to {td} for FID calculation.")
+        print(f"[run_fid_calculation] Images are copied to {td} for FID/KID calculation.")
         gt_folder = os.path.join(td, "gt")
         generated_folder = os.path.join(td, "generated")
         os.mkdir(gt_folder)
@@ -379,10 +379,11 @@ def run_fid_calculation(data_root: str, output_root: str):
                     dst_path = os.path.join(generated_folder, imgpath.replace("/", "_"))
                     shutil.copy(imgpath, dst_path)
 
-        # calculate FID
-        score = fid.compute_fid(gt_folder, generated_folder)
-        print(f"FID: {score}")
-        return score.item()
+        # calculate FID/KID
+        score_fid = fid.compute_fid(gt_folder, generated_folder).item()
+        score_kid = fid.compute_kid(gt_folder, generated_folder)
+        print(f"FID: {score_fid}, KID: {score_kid}")
+        return score_fid, score_kid
 
 
 def run_fvd_calculation(data_root: str, output_root: str):
@@ -743,7 +744,7 @@ if __name__ == '__main__':
             json.dump(pixelwise_results, f, indent=4)
 
         # 5. FID/FVD calculation
-        fid_score = run_fid_calculation(
+        fid_score, kid_score = run_fid_kid_calculation(
             data_root=data_root,
             output_root=output_root,
         )
@@ -752,7 +753,11 @@ if __name__ == '__main__':
             output_root=output_root,
         )
         with open(os.path.join(output_root, "fid_fvd.txt"), "w") as f:
-            f.write("FID: " + str(fid_score) + "\nFVD (VideoGPT): " + str(fvd_videogpt) + "\nFVD (StyleGAN): " + str(fvd_stylegan) + "\n")
+            f.write("FID: " + str(fid_score) + \
+                    "\nKID: " + str(kid_score) + \
+                    "\nFVD (VideoGPT): " + str(fvd_videogpt) + \
+                    "\nFVD (StyleGAN): " + str(fvd_stylegan) + \
+                    "\n")
 
         # 6. Camera pose error calculation
         camera_pose_results, _ = run_camera_pose_error_calculation(output_root)

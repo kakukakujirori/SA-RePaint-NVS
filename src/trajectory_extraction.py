@@ -335,6 +335,7 @@ def render_mesh(
         intrinsic1: np.ndarray,
         intrinsic2: Optional[np.ndarray],
         mask_deocclusion: bool = True,
+        mask_postprocess_opening_kernel_size: int = 7,
     ) -> np.ndarray:
     """
     Given a frame1 and global transformations, warps frame1 to next view using
@@ -404,7 +405,10 @@ def render_mesh(
     plotter.camera.focal_point = focal_point
     plotter.camera.up = viewup
     plotter.camera.view_angle = fov_y
-    plotter.camera.clipping_range = (plotter.camera.clipping_range[0], plotter.camera.clipping_range[1] + depth1.max())
+    plotter.camera.clipping_range = (
+        plotter.camera.clipping_range[0],
+        plotter.camera.clipping_range[1] + depth1.max() * 10,  # NOTE: empirically set
+    )
 
     # 1. RGB rendering
     mesh['RGB'] = vertex_colors_float.astype(np.uint8)
@@ -433,6 +437,24 @@ def render_mesh(
     mask_image_rgb = plotter.screenshot(transparent_background=False, return_img=True)
 
     plotter.close()
+
+    # Mask postprocessing (remove thin masks mis-reacted at depth edges)
+    if mask_postprocess_opening_kernel_size > 1:
+        assert mask_postprocess_opening_kernel_size % 2 == 1, f"{mask_postprocess_opening_kernel_size=} must be odd"
+        morph_kernel = np.ones((mask_postprocess_opening_kernel_size, mask_postprocess_opening_kernel_size), np.uint8)
+        mask_image_rgb_padded = cv2.copyMakeBorder(
+            mask_image_rgb,
+            mask_postprocess_opening_kernel_size,  # top
+            mask_postprocess_opening_kernel_size,  # bottom
+            mask_postprocess_opening_kernel_size,  # left
+            mask_postprocess_opening_kernel_size,  # right
+            cv2.BORDER_CONSTANT, None, value=[0, 0, 0])
+        mask_image_rgb_padded = cv2.dilate(mask_image_rgb_padded, morph_kernel, iterations=1)
+        mask_image_rgb_padded = cv2.erode(mask_image_rgb_padded, morph_kernel, iterations=1)
+        mask_image_rgb = mask_image_rgb_padded[
+            mask_postprocess_opening_kernel_size:-mask_postprocess_opening_kernel_size,
+            mask_postprocess_opening_kernel_size:-mask_postprocess_opening_kernel_size,
+        ]
 
     return rgb_image, (255 - mask_image_rgb), trans_coordinates_3D, trans_valid
 

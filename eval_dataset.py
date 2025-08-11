@@ -683,7 +683,7 @@ if __name__ == '__main__':
                     output_root,
                     scene, motion,
                     degree,
-                    save_trajectory_type=("2D_npy" if args.method == "trajattn" else "3D_rgb" if args.method == "das" else None),
+                    save_trajectory_type=("2d_npy" if args.method == "trajattn" else "3d_rgb" if args.method == "das" else None),
                     use_mesh=args.use_mesh,
                 )
                 future_to_task_info[future] = (scene, motion, degree, None)

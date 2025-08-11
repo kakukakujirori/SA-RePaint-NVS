@@ -34,7 +34,9 @@ DEGREE_LIST = [-1.0, -0.5, 0.5, 1.0]
 MOTION_DEGREE_PAIRS = [x for x in product(MOTION_MODES, DEGREE_LIST) if x not in [('vertical', -1.0), ('vertical', 1.0)]]
 MAJOR_RADIUS = 80
 MINOR_RADIUS = 70
+
 GPUS = [0, 1]
+MAX_WORKER_NUM = 24
 
 
 def reorganize_frames(mannequin_challenge_data_root: str):
@@ -452,7 +454,7 @@ def run_fvd_calculation(data_root: str, output_root: str):
             sample_video_list.append(sample_video)  # (T, C, H, W)
 
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=31) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKER_NUM) as executor:
         future_to_task_info = {}
         for scene, start_frames in start_frames_per_scene.items():
             future = executor.submit(run_task,  scene, start_frames)
@@ -532,7 +534,7 @@ def run_camera_pose_error_calculation(output_root: str, gt_focal_len: float = 26
             assert os.path.isdir(data_dir)
             tasks.append((data_dir, GPUS[idx % len(GPUS)]))
 
-    with ProcessingPool(nodes=24) as pool:
+    with ProcessingPool(nodes=MAX_WORKER_NUM) as pool:
         results = list(tqdm(pool.imap(run_task, tasks), total=len(tasks), desc="Calculating camera pose errors"))
 
     total_results = {}
@@ -595,7 +597,7 @@ def run_sed_calculation(output_root: str):
             assert os.path.isdir(data_dir)
             tasks.append((data_dir, 260.0, GPUS[idx % len(GPUS)]))
 
-    with ProcessingPool(nodes=32) as pool:
+    with ProcessingPool(nodes=MAX_WORKER_NUM) as pool:
         results = list(tqdm(pool.imap(run_task, tasks), total=len(tasks), desc="Calculating SED"))
 
     total_results = {}
@@ -607,14 +609,26 @@ def run_sed_calculation(output_root: str):
             total_results[data_dir] = result
 
     total_consistent_ratios = {}
-    for result in total_results.values():
+    probably_failed = []
+    for data_dir, result in total_results.items():
         for key, value in result.items():
             if key not in total_consistent_ratios:
                 total_consistent_ratios[key] = 0
             total_consistent_ratios[key] += value
+        # sanity check
+        if max(result.values()) == 0:
+            probably_failed.append(data_dir)
+
     for key in total_consistent_ratios:
         total_consistent_ratios[key] /= len(total_results)
         print(f"Total SED Mean (threshold {key:.2f}): {total_consistent_ratios[key]:.3f}")
+    if probably_failed:
+        print("[run_sed_calcluation] All SED values are 0 in the following data_dir. "
+              "This may indicate that the multiprocess worker failed to process the data. "
+              "Consider reducing MAX_WORKER_NUM.")
+        for data_dir in probably_failed:
+            print("  " + data_dir)
+
 
     total_results["total_sed_mean"] = total_consistent_ratios
     total_results["missing_videos"] = missing
@@ -659,7 +673,7 @@ if __name__ == '__main__':
 
         # 2. Trajectory Extraction
         job_idx = 0
-        with concurrent.futures.ThreadPoolExecutor(max_workers=31) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKER_NUM) as executor:
             future_to_task_info = {}
             for scene, motion, degree in scene_motion_degree_pairs:
                 future = executor.submit(

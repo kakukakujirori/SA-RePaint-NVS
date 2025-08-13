@@ -638,7 +638,7 @@ def run_sed_calculation(output_root: str):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="DAVIS Evaluation")
+    parser = argparse.ArgumentParser(description="Image-to-Video Evaluation")
     parser.add_argument("dataset", type=str, choices=["davis", "mannequin", "tanks"], help="Dataset to use for evaluation.")
     parser.add_argument("--scratch", action="store_true", help="If set, all the images, depth, and trajectories are re-organized and re-generated.")
     parser.add_argument("--method", type=str, default="mine", choices=["mine", "nvssolver", "trajattn", "trajcrafter", "das"], help="Method to use for generation. 'nvssolver' uses NVS-Solver, 'trajattn' uses Trajectory Attention, and 'das' uses DiffusionAsShader.")
@@ -681,7 +681,8 @@ if __name__ == '__main__':
                     run_trajectory_extraction,
                     input_root,
                     output_root,
-                    scene, motion,
+                    scene,
+                    motion,
                     degree,
                     save_trajectory_type=("2d_npy" if args.method == "trajattn" else "3d_rgb" if args.method == "das" else None),
                     use_mesh=args.use_mesh,

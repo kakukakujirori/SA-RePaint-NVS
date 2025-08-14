@@ -522,8 +522,12 @@ def run_camera_pose_error_calculation(output_root: str, gt_focal_len: float = 26
             estimated_K = np.array([estimated_K[i] for i in range(num_frames) if i not in missing_estimated_poses_ids])
 
         # Compute errors
-        results, estimated_abs_poses_c2w, gt_abs_poses_c2w = eval_trajectories(estimated_poses_c2w, gt_poses_c2w, estimated_K, gt_K)
-        return (data_dir, results)
+        if estimated_poses_c2w:
+            results, estimated_abs_poses_c2w, gt_abs_poses_c2w = eval_trajectories(estimated_poses_c2w, gt_poses_c2w, estimated_K, gt_K)
+            return (data_dir, results)
+        else:
+            print(f"[WARNING] `estimated_poses_c2w` was empty for {data_dir}. This is usually unexpected; check the data manually.")
+            return (data_dir, None)
 
     tasks = []
     for idx, scene in enumerate(os.listdir(output_root)):

@@ -153,4 +153,4 @@ if __name__ == '__main__':
     os.makedirs(args.output_folder, exist_ok=True)
     for i,fr in enumerate(frames[start_frame:end_frame]):
         fr.save(os.path.join(args.output_folder, f"{i:04d}.png"))
-    export_to_video(frames, os.path.join(args.output_folder, "generated.mp4"))
+    export_to_video(frames[start_frame:end_frame], os.path.join(args.output_folder, "generated.mp4"))

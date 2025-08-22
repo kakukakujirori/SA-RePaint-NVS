@@ -103,7 +103,7 @@ def align_linear_trajectories(traj_query_posepath3d: PosePath3D, traj_ref_posepa
     len_query = np.linalg.norm(dir_query)
     len_ref = np.linalg.norm(dir_ref)
     if len_query == 0:
-        raise ValueError("traj_query has zero length.")
+        raise GeometryException("traj_query has zero length.")
     scale = len_ref / len_query
 
     dir_query_norm = dir_query / len_query
@@ -191,8 +191,12 @@ def eval_trajectories(
     try:
         pred_traj.align(gt_traj, correct_scale=True)
     except GeometryException:
-        # print("[eval_trajectories] Umeyama alignment failed. Assuming that the trajectories are straight lines.")
-        pred_traj = align_linear_trajectories(pred_traj, gt_traj)
+        try:
+            # print("[eval_trajectories] Umeyama alignment failed. Assuming that the trajectories are straight lines.")
+            pred_traj = align_linear_trajectories(pred_traj, gt_traj)
+        except GeometryException as e:
+            print(f"`align_linear_trajectories` failed: {e}")
+            return None, pred_traj, gt_traj
     except Exception as e:
         raise e
 

@@ -4,7 +4,12 @@ To run this script, you must create another python environment with the followin
 - PyTorch: 2.4.1
 - CUDA: 11.8
 """
-import argparse, glob, os, shutil, tempfile
+import argparse, os, shutil, tempfile
+from tqdm import tqdm
+
+import torch
+from diffusers.utils import load_video
+from transformers import AutoProcessor, Blip2ForConditionalGeneration, set_seed
 from vbench import VBench
 
 if __name__ == '__main__':
@@ -26,6 +31,11 @@ if __name__ == '__main__':
     cuda_lib_path = os.path.join(args.cuda_home, "lib64")
     os.environ['LD_LIBRARY_PATH'] = f"{cuda_lib_path}{os.pathsep}{existing_ld_path}"
 
+    # set up BLIP2
+    blip_path = "Salesforce/blip2-opt-2.7b"
+    caption_processor = AutoProcessor.from_pretrained(blip_path)
+    captioner = Blip2ForConditionalGeneration.from_pretrained(blip_path, torch_dtype=torch.float16).to("cuda:0")
+
     # set up VBench
     device = f"cuda:{args.gpu}"
     my_VBench = VBench(device, "", "vbench_results")
@@ -43,6 +53,17 @@ if __name__ == '__main__':
                 videopath = os.path.normpath(videopath)  # delete the leading ./
                 dst_path = os.path.join(td, videopath.replace("/", "_"))
                 shutil.copy(videopath, dst_path)
+
+        # rename videos for Overall Consistency evaluation
+        for videoname in tqdm(os.listdir(td), desc="Captioning"):
+            videopath = os.path.join(td, videoname)
+            frames = load_video(videopath)
+            with torch.no_grad():
+                set_seed(42)
+                captioner_inputs = caption_processor(images=frames[0], return_tensors="pt").to(device, torch.float16)
+                generated_ids = captioner.generate(**captioner_inputs)
+                generated_text = caption_processor.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
+            os.rename(videopath, os.path.join(td, f"{generated_text}.mp4"))
 
         # run
         my_VBench.evaluate(

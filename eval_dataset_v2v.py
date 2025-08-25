@@ -1,5 +1,6 @@
 import argparse
 import concurrent.futures
+import gc
 import glob
 import json
 import os
@@ -22,7 +23,7 @@ from torchmetrics.image import PeakSignalNoiseRatio
 
 from src.eval_sed import eval_sed
 from src.eval_ssim import ssim
-from src.eval_trajectories import eval_trajectories, run_glomap
+from src.eval_trajectories import eval_trajectories
 
 
 NUM_FRAMES = 25
@@ -528,70 +529,109 @@ def run_fvd_calculation(data_root: str, output_root: str):
     return score_videogpt, score_stylegan
 
 
-def run_camera_pose_error_calculation(output_root: str, gt_focal_len: float = 260.0):
-
-    def run_task(args: tuple[str, int]):
-        data_dir, gpu_id = args
-
-        if not os.path.isfile(os.path.join(data_dir, "generated/generated.mp4")):
-            print(f"Missing video for {data_dir}")
-            return (data_dir, None)
-
-        # Load the generated frames
-        image_names = sorted(glob.glob(os.path.join(data_dir, f"generated/0*.png")))
-        num_frames = len(image_names)
-
-        # Load the gt image size
-        gt_width, gt_height = imagesize.get(os.path.join(data_dir, f"warped/0000.png"))
-
-        # Load the camera poses
-        gt_poses_w2c = [np.load(os.path.join(data_dir, f"warped/{i:04d}_pose.npy")) for i in range(num_frames)]
-        gt_poses_c2w = [np.linalg.inv(p) for p in gt_poses_w2c]
-        gt_K = np.array([
-            [gt_focal_len, 0, gt_width/2],
-            [0, gt_focal_len, gt_height/2],
-            [0, 0, 1],
-        ], dtype=np.float32)
-
-        # Estimate the camera poses from the generated video
-        estimated_poses_c2w = run_glomap(image_names, gt_width=gt_width, gt_height=gt_height, gt_focal_len=gt_focal_len, gpu_id=gpu_id)
-        estimated_K = gt_K
-
-        # Filter out missing poses
-        missing_estimated_poses_ids = [i for (i, pose) in enumerate(estimated_poses_c2w) if pose is None]
-        estimated_poses_c2w = [pose for (i, pose) in enumerate(estimated_poses_c2w) if i not in missing_estimated_poses_ids]
-        gt_poses_c2w = [pose for (i, pose) in enumerate(gt_poses_c2w) if i not in missing_estimated_poses_ids]
-        if len(estimated_K) == num_frames:
-            estimated_K = np.array([estimated_K[i] for i in range(num_frames) if i not in missing_estimated_poses_ids])
-
-        # Compute errors
-        if estimated_poses_c2w:
-            results, estimated_abs_poses_c2w, gt_abs_poses_c2w = eval_trajectories(estimated_poses_c2w, gt_poses_c2w, estimated_K, gt_K)
-            return (data_dir, results)
-        else:
-            print(f"[WARNING] `estimated_poses_c2w` was empty for {data_dir}. This is usually unexpected; check the data manually.")
-            return (data_dir, None)
-
-    tasks = []
-    for idx, scene in enumerate(os.listdir(output_root)):
-        scene_path = os.path.join(output_root, scene)
-        if not os.path.isdir(scene_path):
-            continue
-        for motion_degree in os.listdir(scene_path):
-            data_dir = os.path.join(output_root, scene, motion_degree)
-            assert os.path.isdir(data_dir)
-            tasks.append((data_dir, GPUS[idx % len(GPUS)]))
-
-    with ProcessingPool(nodes=MAX_WORKER_NUM) as pool:
-        results = list(tqdm(pool.imap(run_task, tasks), total=len(tasks), desc="Calculating camera pose errors"))
+def run_camera_pose_error_calculation(input_root: str, output_root: str, gt_focal_len: float = 260.0):
 
     total_results = {}
     missing = []
-    for data_dir, result in results:
-        if result is None:
-            missing.append(data_dir)
-        else:
-            total_results[data_dir] = result
+
+    def run_task(input_frame_paths: list[str], output_frame_paths: list[str], gt_pose_paths: list[str], gpu_id: int):
+        with tempfile.TemporaryDirectory() as td:
+            # load properties
+            env = os.environ.copy()
+            env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+            gt_width, gt_height = imagesize.get(input_frame_paths[0])
+            dirname = os.path.dirname(os.path.dirname(output_frame_paths[0]))
+            dirname_flatten = dirname.replace("/", "_")
+
+            concat_frame_paths = input_frame_paths[::-1] + output_frame_paths
+            for i, p in enumerate(concat_frame_paths):
+                img = load_image(p).resize((gt_width, gt_height))
+                img.save(os.path.join(td, f"{i:04d}.png"))
+
+            try:
+                # to mkv (= lossless video format)
+                subprocess.run([
+                    "ffmpeg", "-y",
+                    "-framerate", "10",
+                    "-i", os.path.join(td, f"%04d.png"),
+                    "-c:v", "ffv1",
+                    "-g", "1",
+                    os.path.join(td, f"{dirname_flatten}.mkv"),
+                ], check=True, capture_output=True, text=True, encoding='utf-8', env=env)
+                # free cache
+                gc.collect()
+                with torch.cuda.device(f'cuda:{gpu_id}'):
+                    torch.cuda.empty_cache()
+                # vipe
+                subprocess.run([
+                    "vipe", "infer", os.path.join(td, f"{dirname_flatten}.mkv"),
+                    "--output", os.path.join(td, "vipe_results"),
+                ], check=True, capture_output=True, text=True, encoding='utf-8', env=env)
+
+            except subprocess.CalledProcessError as e:
+                error_message = (
+                    f"ERROR!!!\n"
+                    f"Command: {' '.join(e.cmd)}\n"
+                    f"Return code: {e.returncode}\n"
+                    f"Stdout:\n{e.stdout.strip()}\n"
+                    f"Stderr:\n{e.stderr.strip()}"
+                )
+                print(error_message)
+                missing.append(dirname)
+                return
+
+            # extract camera poses
+            pose_data = np.load(os.path.join(td, f"vipe_results/pose/{dirname_flatten}.npz"))
+            poses = pose_data["data"]  # (N, 4, 4)
+            input_poses_c2w = poses[:NUM_FRAMES][::-1]
+            output_poses_c2w = poses[NUM_FRAMES:]
+            relative_poses_c2w = np.linalg.inv(input_poses_c2w) @ output_poses_c2w
+
+            intrinsics_data = np.load(os.path.join(td, f"vipe_results/intrinsics/{dirname_flatten}.npz"))
+            intrinsics = intrinsics_data["data"][0]  # (4,)
+            pred_K = np.array([
+                [intrinsics[0], 0, intrinsics[2]],
+                [0, intrinsics[1], intrinsics[3]],
+                [0, 0, 1],
+            ], dtype=np.float32)
+
+            # load gt poses
+            gt_poses_w2c = [np.load(p) for p in gt_pose_paths]
+            gt_poses_c2w = [np.linalg.inv(p) for p in gt_poses_w2c]
+            gt_K = np.array([
+                [gt_focal_len, 0, gt_width/2],
+                [0, gt_focal_len, gt_height/2],
+                [0, 0, 1],
+            ], dtype=np.float32)
+
+            # eval
+            results, estimated_abs_poses_c2w, gt_abs_poses_c2w = eval_trajectories(relative_poses_c2w, gt_poses_c2w, pred_K, gt_K)
+            total_results[dirname] = results
+            # return dirname, results
+
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(GPUS)) as executor:
+        future_to_task_info = {}
+        cnt = 0
+        for scene in os.listdir(input_root):
+            input_frame_paths = [os.path.join(input_root, scene, "images", f"{i:04d}.png") for i in range(NUM_FRAMES)]
+            for motion_degree in os.listdir(os.path.join(output_root, scene)):
+                output_frame_paths = [os.path.join(output_root, scene, motion_degree, "generated", f"{i:04d}.png") for i in range(NUM_FRAMES)]
+                gt_pose_paths= [os.path.join(output_root, scene, motion_degree, "warped", f"{i:04d}_pose.npy") for i in range(NUM_FRAMES)]
+
+                future = executor.submit(run_task, input_frame_paths, output_frame_paths, gt_pose_paths, GPUS[cnt % len(GPUS)])
+                future_to_task_info[future] = (input_frame_paths, output_frame_paths, gt_pose_paths, GPUS[cnt % len(GPUS)])
+                cnt += 1
+
+        for future in tqdm(concurrent.futures.as_completed(future_to_task_info), total=len(future_to_task_info), desc="Calculating camera pose errors"):
+            input_frame_paths, output_frame_paths, gt_pose_paths, gpu_id = future_to_task_info[future]
+            task_desc = f"{input_frame_paths=}, {output_frame_paths=}, {gt_pose_paths=}, {gpu_id=}"
+            try:
+                result_message = future.result()
+                # print(f"Result for {task_desc}: {result_message}")
+            except Exception as exc:
+                print(f"Main loop caught exception for {task_desc}: {exc}")
+                raise exc
 
     total_ape_mean = sum([result["ape_mean"] for result in total_results.values()]) / len(total_results)
     total_rre_mean = sum([result["rre_mean"] for result in total_results.values()]) / len(total_results)
@@ -599,14 +639,13 @@ def run_camera_pose_error_calculation(output_root: str, gt_focal_len: float = 26
     print(f"Total APE Mean: {total_ape_mean}")
     print(f"Total RRE Mean: {total_rre_mean}")
     print(f"Total RTE Mean: {total_rte_mean}")
-    print(f"Missing videos: {len(missing)}")
+    print(f"Missing dirs: {len(missing)}")
     total_results["total_ape_mean"] = total_ape_mean
     total_results["total_rre_mean"] = total_rre_mean
     total_results["total_rte_mean"] = total_rte_mean
-    total_results["missing_videos"] = missing
+    total_results["missing_dirs"] = missing
 
     return total_results, missing
-
 
 
 if __name__ == '__main__':
@@ -731,9 +770,9 @@ if __name__ == '__main__':
                     "\n")
 
         # 6. Camera pose error calculation
-        # camera_pose_results, _ = run_camera_pose_error_calculation(output_root)
-        # with open(os.path.join(output_root, "camera_pose_results.txt"), "w") as f:
-        #     json.dump(camera_pose_results, f, indent=4)
+        camera_pose_results, _ = run_camera_pose_error_calculation(input_root, output_root)
+        with open(os.path.join(output_root, "camera_pose_results.txt"), "w") as f:
+            json.dump(camera_pose_results, f, indent=4)
 
     except KeyboardInterrupt:
         print("Caught KeyboardInterrupt, shutting down.")

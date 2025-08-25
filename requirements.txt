@@ -27,3 +27,4 @@ rerun-sdk
 viser
 wandb
 -e ./tools/utils3d
+./tools/FVD/fvdcal-1.0-py3-none-any.whl

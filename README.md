@@ -15,6 +15,7 @@
     cd My-NVS-Solver
     bash patch/apply_patch.sh  # apply patch to submodules
     pip3 install -r requirements.txt
+    pip3 install --no-build-isolation -e ./tools/vipe  # used only for video-to-video evaluation
     ```
 
 3. Download model weights

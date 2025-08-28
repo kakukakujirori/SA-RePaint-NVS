@@ -354,19 +354,24 @@ def run_glomap(image_paths: list[str], gt_width: int, gt_height: int, gt_focal_l
                                     "--database_path", os.path.join(td, "database.db"),
                                     "--ImageReader.single_camera", "1",
                                     "--ImageReader.camera_model", "SIMPLE_PINHOLE",
-                                    "--ImageReader.camera_params", f"{gt_focal_len},{gt_width/2},{gt_height/2}"],
+                                    "--ImageReader.camera_params", f"{gt_focal_len},{gt_width/2},{gt_height/2}",
+                                    # "--SiftExtraction.use_gpu", "0",
+                                    ],
                                     check=True, capture_output=not verbose, text=True, encoding='utf-8', env=env)
             _ = subprocess.run(["colmap", "exhaustive_matcher",
-                                    "--database_path", os.path.join(td, "database.db")],
+                                    "--database_path", os.path.join(td, "database.db"),
+                                    # "--SiftMatching.use_gpu", "0",
+                                    ],
                                     check=True, capture_output=not verbose, text=True, encoding='utf-8', env=env)
             _ = subprocess.run(["glomap", "mapper",
                                     "--database_path", os.path.join(td, "database.db"),
                                     "--image_path", img_dir,
                                     "--output_path", os.path.join(td, "sparse"),
-                                    "--GlobalPositioning.use_gpu", "1",
-                                    "--BundleAdjustment.use_gpu", "1",
+                                    "--GlobalPositioning.use_gpu", "0",
+                                    "--BundleAdjustment.use_gpu", "0",
                                     "--BundleAdjustment.optimize_intrinsics", "0",
-                                    "--skip_view_graph_calibration", "1"],
+                                    "--skip_view_graph_calibration", "1",
+                                    ],
                                     check=True, capture_output=not verbose, text=True, encoding='utf-8', env=env)
         except subprocess.CalledProcessError as e:
             import sys

@@ -8,7 +8,7 @@ import argparse, os, shutil, tempfile
 from tqdm import tqdm
 
 import torch
-from diffusers.utils import load_video
+from diffusers.utils import load_image
 from transformers import AutoProcessor, Blip2ForConditionalGeneration, set_seed
 from vbench import VBench
 
@@ -41,29 +41,27 @@ if __name__ == '__main__':
     my_VBench = VBench(device, "", "vbench_results")
 
     with tempfile.TemporaryDirectory() as td:
-        print(f"Video are copied to {td} for VBench evaluation.")
-
         # copy generated images
-        for scene in os.listdir(args.output_dir):
+        for scene in tqdm(os.listdir(args.output_dir), desc="Captioning videos"):
             scene_path = os.path.join(args.output_dir, scene)
             if not os.path.isdir(scene_path):
                 continue
             for motion_degree in os.listdir(scene_path):
                 videopath = os.path.join(args.output_dir, scene, motion_degree, "generated/generated.mp4")
                 videopath = os.path.normpath(videopath)  # delete the leading ./
-                dst_path = os.path.join(td, videopath.replace("/", "_"))
-                shutil.copy(videopath, dst_path)
 
-        # rename videos for Overall Consistency evaluation
-        for videoname in tqdm(os.listdir(td), desc="Captioning"):
-            videopath = os.path.join(td, videoname)
-            frames = load_video(videopath)
-            with torch.no_grad():
-                set_seed(42)
-                captioner_inputs = caption_processor(images=frames[0], return_tensors="pt").to(device, torch.float16)
-                generated_ids = captioner.generate(**captioner_inputs)
-                generated_text = caption_processor.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
-            os.rename(videopath, os.path.join(td, f"{generated_text}.mp4"))
+                # captioning
+                imagepath = os.path.join(args.output_dir, scene, motion_degree, "warped/0000.png")
+                image = load_image(imagepath)
+                with torch.no_grad():
+                    set_seed(42)
+                    captioner_inputs = caption_processor(images=image, return_tensors="pt").to(device, torch.float16)
+                    generated_ids = captioner.generate(**captioner_inputs)
+                    generated_text = caption_processor.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
+
+                # video name is refereed as a text query for Overall Consistency evaluation
+                dst_path = os.path.join(td, f"{generated_text}.mp4")
+                shutil.copy(videopath, dst_path)
 
         # run
         my_VBench.evaluate(

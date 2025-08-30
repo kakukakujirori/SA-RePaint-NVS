@@ -91,6 +91,7 @@ def get_var_data(
         warped_masks_sh: Float[torch.Tensor, "batch num_frames () height width"],
         kernel_radius: int = 3,
         use_first_frame: bool = True,
+        channelwise: bool = True,
     ) -> Float[torch.Tensor, "batch num_frames c^2 height width"]:
     batch, num_frames, _, height, width = warped_latents.shape
     scale_factor = int(round((height * width // q.shape[-2])**0.5))
@@ -100,7 +101,7 @@ def get_var_data(
     h, w = height // scale_factor, width // scale_factor
 
     # local spatial variance of warped_masks_sh
-    warped_variance = local_covariance_2D(warped_latents, warped_latents, k=kernel_radius)
+    warped_variance = local_covariance_2D(warped_latents, warped_latents, k=kernel_radius, channelwise=channelwise)
     warped_variance_sh = F.interpolate(
         rearrange(warped_variance, "b f c2 h w -> (b f) c2 h w"),
         size=(h, w),
@@ -799,6 +800,7 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
                                 warped_masks_sh,
                                 kernel_radius=5,
                                 use_first_frame=True,
+                                channelwise=True,
                             )  # warped_latents[batch_size:, 0:1].var()
 
                             # os.makedirs("dump", exist_ok=True)
@@ -814,14 +816,14 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
                                 # deduce optimal sigma_s for RePaint
                                 pseudo_x0 = pseudo_x0.float()
                                 derivative = (latents_ori.float() - pseudo_x0) / sigma_t
-                                identity = torch.diag(torch.ones_like(pseudo_x0[0, 0, :, 0, 0])).reshape(1, 1, -1, 1, 1)
+                                identity = torch.ones_like(pseudo_x0[0, 0, :, 0, 0]).reshape(1, 1, -1, 1, 1)
 
                                 k_spatial = 1
                                 k_temporal = 1
 
-                                var_pseudo_x0 = local_covariance_3D(pseudo_x0, pseudo_x0, k_spatial, k_temporal)
-                                var_derivative = local_covariance_3D(derivative, derivative, k_spatial, k_temporal)
-                                cov_pseudo_x0_derivative = local_covariance_3D(pseudo_x0, derivative, k_spatial, k_temporal)
+                                var_pseudo_x0 = local_covariance_3D(pseudo_x0, pseudo_x0, k_spatial, k_temporal, channelwise=True)
+                                var_derivative = local_covariance_3D(derivative, derivative, k_spatial, k_temporal, channelwise=True)
+                                cov_pseudo_x0_derivative = local_covariance_3D(pseudo_x0, derivative, k_spatial, k_temporal, channelwise=True)
 
                                 var_pseudo_x0 = guided_blur_2D(var_data, var_pseudo_x0)
                                 var_derivative = guided_blur_2D(var_data, var_derivative)
@@ -829,15 +831,27 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
 
                                 coeff_A = var_derivative - identity
                                 coeff_B = cov_pseudo_x0_derivative
-                                coeff_C = (var_pseudo_x0 - var_data)
+                                coeff_C = var_pseudo_x0 - var_data
 
                                 nunom = (-1) * coeff_B + torch.sign(coeff_B) * torch.sqrt(torch.relu(coeff_B.pow(2) - coeff_A * coeff_C))
                                 sigma_s = safe_division_3D(nunom, coeff_A, k_spatial, k_temporal)
+
+                                # endpoints check
+                                sigma_s_left_eval = torch.abs(coeff_C)
+                                sigma_s_right_eval = torch.abs(coeff_A * sigma_t**2 + 2 * coeff_B * sigma_t + coeff_C)
+                                sigma_s_endpoints = torch.where(
+                                    sigma_s_left_eval < sigma_s_right_eval,
+                                    torch.zeros_like(sigma_s),
+                                    torch.full_like(sigma_s, sigma_t),
+                                )
+
+                                sigma_s_endpoints_eval = torch.abs(coeff_A * sigma_s_endpoints**2 + 2 * coeff_B * sigma_s_endpoints + coeff_C)
+                                sigma_s_eval = torch.abs(coeff_A * sigma_s**2 + 2 * coeff_B * sigma_s + coeff_C)
+                                sigma_s = torch.where(sigma_s_eval < sigma_s_endpoints_eval, sigma_s, sigma_s_endpoints)
+
+                                # postprocessing
                                 sigma_s = guided_blur_2D(var_data, sigma_s)
                                 sigma_s = torch.clamp(sigma_s, 0, sigma_t)
-
-                                var_data = var_data[:, :, [0, 5, 10, 15], :, :]
-                                sigma_s = sigma_s[:, :, [0, 5, 10, 15], :, :]
 
 
                                 # torch.save(sigma_s, f"dump/sigma_s_{i}_{j}.pt")

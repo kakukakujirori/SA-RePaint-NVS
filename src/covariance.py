@@ -81,7 +81,7 @@ def blur_3D(
     # Apply temporal blur (if kt > 0)
     if kt > 0:
         temp_tensor = rearrange(tensor, "... f c h w -> (... h w) c f")
-        padded_tensor = F.pad(temp_tensor, (kt, kt), mode='reflect')
+        padded_tensor = F.pad(temp_tensor, (kt, kt), mode='replicate')  # NOTE: 'reflect' is buggy for large tensors
         temp_blurred = F.conv1d(padded_tensor, conv_temporal_kernel, padding='valid', groups=c)
         temp_blurred = rearrange(temp_blurred, "(b h w) c f -> b f c h w", c=c, h=h, w=w)
         temp_blurred = temp_blurred.view_as(tensor)
@@ -138,12 +138,21 @@ def local_covariance_2D(
         X: Float[torch.Tensor, "... c h w"],
         Y: Float[torch.Tensor, "... c h w"],
         k: int,
+        channelwise: bool = False,
         kernel_type: Literal["gaussian", "box"] = "gaussian",
-    ) -> Float[torch.Tensor, "... c^2 h w"]:
+    ) -> Float[torch.Tensor, "... c' h w"]:
+    """
+    If channelwise is True, the output shape is "... c h w"
+    If channelwise is False, the output shape is "... c^2 h w"
+    """
     if X.shape != Y.shape:
         raise ValueError("Input tensors must have the same shape.")
     if k < 0:
         raise ValueError("Kernel size k must be a non-negative integer.")
+
+    if channelwise:
+        X = rearrange(X, "... c h w -> ... c () h w")
+        Y = rearrange(Y, "... c h w -> ... c () h w")
 
     X_centered = X - blur_2D(X, k, kernel_type).blurred
     Y_centered = Y - blur_2D(Y, k, kernel_type).blurred
@@ -152,7 +161,12 @@ def local_covariance_2D(
     outer_blured = blur_2D(outer, k, kernel_type)
     biased_cov, kernel = outer_blured.blurred, outer_blured.kernel
     bessel_correction = 1.0 / (1.0 - torch.sum(kernel**2))
-    return biased_cov * bessel_correction
+    unbiased_cov = biased_cov * bessel_correction
+
+    if channelwise:
+        unbiased_cov = rearrange(unbiased_cov, "... c () h w -> ... c h w")
+
+    return unbiased_cov
 
 
 def local_covariance_3D(
@@ -160,12 +174,17 @@ def local_covariance_3D(
         Y: Float[torch.Tensor, "... f c h w"],
         k_spatial: int,
         k_temporal: int,
+        channelwise: bool = False,
         kernel_type: Literal["gaussian", "box"] = "gaussian",
     ) -> Float[torch.Tensor, "... f c^2 h w"]:
     if X.shape != Y.shape:
         raise ValueError("Input tensors must have the same shape.")
     if k_spatial < 0 or k_temporal < 0:
         raise ValueError("Kernel size k_spatial and k_temporal must be a non-negative integer.")
+
+    if channelwise:
+        X = rearrange(X, "... f c h w -> ... c f () h w")
+        Y = rearrange(Y, "... f c h w -> ... c f () h w")
 
     X_centered = X - blur_3D(X, k_spatial, k_temporal, kernel_type).blurred
     Y_centered = Y - blur_3D(Y, k_spatial, k_temporal, kernel_type).blurred
@@ -174,4 +193,9 @@ def local_covariance_3D(
     outer_blured = blur_3D(outer, k_spatial, k_temporal, kernel_type)
     biased_cov, kernel = outer_blured.blurred, outer_blured.kernel
     bessel_correction = 1.0 / (1.0 - torch.sum(kernel**2))
-    return biased_cov * bessel_correction
+    unbiased_cov = biased_cov * bessel_correction
+
+    if channelwise:
+        unbiased_cov = rearrange(unbiased_cov, "... c f () h w -> ... f c h w")
+
+    return unbiased_cov

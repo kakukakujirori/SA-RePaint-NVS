@@ -833,8 +833,22 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
                                 coeff_B = cov_pseudo_x0_derivative
                                 coeff_C = var_pseudo_x0 - var_data
 
-                                nunom = (-1) * coeff_B + torch.sign(coeff_B) * torch.sqrt(torch.relu(coeff_B.pow(2) - coeff_A * coeff_C))
-                                sigma_s = safe_division_3D(nunom, coeff_A, k_spatial, k_temporal)
+                                # check two roots
+                                nunom_pos = (-1) * coeff_B + torch.sign(coeff_B) * torch.sqrt(torch.relu(coeff_B.pow(2) - coeff_A * coeff_C))
+                                sigma_s_pos = safe_division_3D(nunom_pos, coeff_A, k_spatial, k_temporal)
+                                sigma_s_pos = torch.clamp(sigma_s_pos, 0, sigma_t)
+
+                                nunom_neg = (-1) * coeff_B - torch.sign(coeff_B) * torch.sqrt(torch.relu(coeff_B.pow(2) - coeff_A * coeff_C))
+                                sigma_s_neg = safe_division_3D(nunom_neg, coeff_A, k_spatial, k_temporal)
+                                sigma_s_neg = torch.clamp(sigma_s_neg, 0, sigma_t)
+
+                                sigma_s_pos_eval = torch.abs(coeff_A * sigma_s_pos**2 + 2 * coeff_B * sigma_s_pos + coeff_C)
+                                sigma_s_neg_eval = torch.abs(coeff_A * sigma_s_neg**2 + 2 * coeff_B * sigma_s_neg + coeff_C)
+                                sigma_s = torch.where(
+                                    sigma_s_pos_eval < sigma_s_neg_eval,
+                                    sigma_s_pos,
+                                    sigma_s_neg,
+                                )
 
                                 # endpoints check
                                 sigma_s_left_eval = torch.abs(coeff_C)

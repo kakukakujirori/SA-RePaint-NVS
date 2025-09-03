@@ -845,7 +845,7 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
                                 sigma_s_pos_eval = torch.abs(coeff_A * sigma_s_pos**2 + 2 * coeff_B * sigma_s_pos + coeff_C)
                                 sigma_s_neg_eval = torch.abs(coeff_A * sigma_s_neg**2 + 2 * coeff_B * sigma_s_neg + coeff_C)
                                 sigma_s = torch.where(
-                                    sigma_s_pos_eval < sigma_s_neg_eval,
+                                    sigma_s_pos_eval <= sigma_s_neg_eval + 1e-6, # NOTE: if two solutions are available, adopt sigma_s_pos
                                     sigma_s_pos,
                                     sigma_s_neg,
                                 )
@@ -854,7 +854,7 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
                                 sigma_s_left_eval = torch.abs(coeff_C)
                                 sigma_s_right_eval = torch.abs(coeff_A * sigma_t**2 + 2 * coeff_B * sigma_t + coeff_C)
                                 sigma_s_endpoints = torch.where(
-                                    sigma_s_left_eval < sigma_s_right_eval,
+                                    sigma_s_left_eval <= sigma_s_right_eval,
                                     torch.zeros_like(sigma_s),
                                     torch.full_like(sigma_s, sigma_t),
                                 )

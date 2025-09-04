@@ -636,13 +636,19 @@ def run_camera_pose_error_calculation(input_root: str, output_root: str, gt_foca
     total_ape_mean = sum([result["ape_mean"] for result in total_results.values()]) / len(total_results)
     total_rre_mean = sum([result["rre_mean"] for result in total_results.values()]) / len(total_results)
     total_rte_mean = sum([result["rte_mean"] for result in total_results.values()]) / len(total_results)
-    print(f"Total APE Mean: {total_ape_mean}")
-    print(f"Total RRE Mean: {total_rre_mean}")
-    print(f"Total RTE Mean: {total_rte_mean}")
+    total_ape_median = np.median(np.array([result["ape_mean"] for result in total_results.values()]))
+    total_rre_median = np.median(np.array([result["rre_mean"] for result in total_results.values()]))
+    total_rte_median = np.median(np.array([result["rte_mean"] for result in total_results.values()]))
+    print(f"Total APE Mean: {total_ape_mean}, Median: {total_ape_median}")
+    print(f"Total RRE Mean: {total_rre_mean}, Median: {total_rre_median}")
+    print(f"Total RTE Mean: {total_rte_mean}, Median: {total_rte_median}")
     print(f"Missing dirs: {len(missing)}")
     total_results["total_ape_mean"] = total_ape_mean
     total_results["total_rre_mean"] = total_rre_mean
     total_results["total_rte_mean"] = total_rte_mean
+    total_results["total_ape_median"] = total_ape_median
+    total_results["total_rre_median"] = total_rre_median
+    total_results["total_rte_median"] = total_rte_median
     total_results["missing_dirs"] = missing
 
     return total_results, missing

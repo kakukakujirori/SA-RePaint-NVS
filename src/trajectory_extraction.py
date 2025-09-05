@@ -394,6 +394,7 @@ def render_mesh(
 
     # camera and Plotter
     plotter = pv.Plotter(off_screen=True, window_size=[w, h])
+    plotter.enable_anti_aliasing("ssaa")  # NOTE: IMPORTANT!!! Without it, rendered images contain noticeable salt-pepper noise
     relative_pose_cv = transformation1 @ np.linalg.inv(transformation2)
     R_c2w = relative_pose_cv[:3, :3]
     t_c2w = relative_pose_cv[:3, 3]

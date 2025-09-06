@@ -41,8 +41,10 @@ if __name__ == '__main__':
     my_VBench = VBench(device, "", "vbench_results")
 
     with tempfile.TemporaryDirectory() as td:
+        uid = 0
         # copy generated images
-        for scene in tqdm(os.listdir(args.output_dir), desc="Captioning videos"):
+        print("Captioning videos...")
+        for scene in sorted(os.listdir(args.output_dir)):
             scene_path = os.path.join(args.output_dir, scene)
             if not os.path.isdir(scene_path):
                 continue
@@ -58,10 +60,12 @@ if __name__ == '__main__':
                     captioner_inputs = caption_processor(images=image, return_tensors="pt").to(device, torch.float16)
                     generated_ids = captioner.generate(**captioner_inputs)
                     generated_text = caption_processor.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
+                print(f"{os.path.join(scene, motion_degree)}: {generated_text}")
 
                 # video name is refereed as a text query for Overall Consistency evaluation
-                dst_path = os.path.join(td, f"{generated_text}.mp4")
+                dst_path = os.path.join(td, f"{generated_text}-{uid}.mp4")  # NOTE: uid is to prevent path duplication
                 shutil.copy(videopath, dst_path)
+                uid += 1
 
         # run
         my_VBench.evaluate(

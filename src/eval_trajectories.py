@@ -138,7 +138,7 @@ def align_linear_trajectories(traj_query_posepath3d: PosePath3D, traj_ref_posepa
     up_ref = R_ref_start[:, 1]
     up_query_aligned = R_query_aligned[:, 1]
 
-    # project these "up" vectors to a plane orthogonal to the movind direction
+    # project these "up" vectors to a plane orthogonal to the moving direction
     proj_up_ref = up_ref - np.dot(up_ref, dir_ref_norm) * dir_ref_norm
     proj_up_query = up_query_aligned - np.dot(up_query_aligned, dir_ref_norm) * dir_ref_norm
 
@@ -374,11 +374,10 @@ def run_glomap(image_paths: list[str], gt_width: int, gt_height: int, gt_focal_l
                                     ],
                                     check=True, capture_output=not verbose, text=True, encoding='utf-8', env=env)
         except subprocess.CalledProcessError as e:
-            import sys
             print(f"\n❌ command failed: {e.cmd}")
             print(f"📤 stdout:\n{e.stdout}")
             print(f"📥 stderr:\n{e.stderr}")
-            sys.exit(1)
+            return [None for _ in range(len(image_paths))]
 
         # read estimated poses (NOTE: intrinsic parameters are set to the ground truth values)
         estimated_poses_c2w = [None for _ in range(len(image_paths))]

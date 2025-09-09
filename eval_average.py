@@ -1,15 +1,28 @@
 import argparse
 import concurrent.futures
+import json
 import os
 import shutil
 import tempfile
 from tqdm import tqdm
+from tabulate import tabulate
 
 from eval_dataset_i2v import run_pixelwise_metrics_calculation, run_fid_kid_calculation, run_fvd_calculation, run_camera_pose_error_calculation, run_sed_calculation
 
 NUM_FRAMES = 25
 MAX_WORKER_NUM = 16
 GPUS = [0, 1]
+
+
+def load_vbench_scores(json_path: str):
+    if not os.path.isfile(json_path):
+        raise ValueError(f"{json_path} doesn't exist.")
+    with open(json_path, "r") as f:
+        results = json.load(f)
+    for dimension in results.keys():
+        results[dimension] = results[dimension][0]  # take the average score
+    return results
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Image-to-Video Evaluation")
@@ -32,8 +45,10 @@ if __name__ == '__main__':
             warped_img = os.path.join(dst, "warped", f"{i:04d}.png")
             warped_mask = os.path.join(dst, "warped", f"{i:04d}_mask.png")
             if os.path.isfile(warped_img):
+                print(f"Warning: {warped_img} shouldn't exist at this directory. Removing it...")
                 os.remove(warped_img)
             if os.path.isfile(warped_mask):
+                print(f"Warning: {warped_mask} shouldn't exist at this directory. Removing it...")
                 os.remove(warped_mask)
 
     with tempfile.TemporaryDirectory(dir=args.data_root) as td:  # NOTE: assuming args.data_root is on HDD
@@ -102,6 +117,17 @@ if __name__ == '__main__':
 
             # 7. SED calculation
             sed_results = run_sed_calculation(output_root)
+
+            # 8. VBench
+            davis_vbench = load_vbench_scores(f"./vbench_results/davis_output_{args.suffix}_eval_results.json")
+            mannequin_challenge_vbench = load_vbench_scores(f"./vbench_results/mannequin_challenge_output_{args.suffix}_eval_results.json")
+            tanks_and_temples_vbench = load_vbench_scores(f"./vbench_results/tanks_and_temples_output_{args.suffix}_eval_results.json")
+            assert set(davis_vbench.keys()) == set(mannequin_challenge_vbench.keys()) == set(tanks_and_temples_vbench.keys())
+            vbench_average_scores = {}
+            for dimension in davis_vbench.keys():
+                vbench_average_scores[dimension] = (davis_vbench[dimension] + mannequin_challenge_vbench[dimension] + tanks_and_temples_vbench[dimension]) / 3
+            print(tabulate(vbench_average_scores.items(), floatfmt=".4f"))
+
 
         except KeyboardInterrupt:
             print("Caught KeyboardInterrupt, shutting down.")

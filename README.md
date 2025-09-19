@@ -1,4 +1,4 @@
-# My-NVS-Solver
+# Prioritizing Faithfulness: Efficient Zero-Shot NVS with Adaptive Latent Modulation
 
 ## Installation
 
@@ -6,6 +6,8 @@
     ```bash
     conda create -n myenv python=3.12
     conda activate myenv
+    # conda install conda-forge::imagemagick  # If imagemagick is not installed
+    # conda install conda-forge::ffmpeg       # If ffmpeg is not installed
     pip3 install torch torchvision xformers --index-url https://download.pytorch.org/whl/cu126
     ```
 
@@ -48,3 +50,54 @@ bash image_control.sh
 bash video_control.sh
 ```
 You will find the results in the ```output``` folder.
+
+## Evaluation
+
+We assume the following data structure:
+
+```bash
+$(data_root)
+├── DAVIS
+│   ├── Annotations
+│   │   └── Full-Resolution
+│   ├── ImageSets
+│   │   ├── 2016
+│   │   └── 2017
+│   └── JPEGImages
+│       └── Full-Resolution
+├── MannequinChallenge
+│   ├── test
+│   ├── train
+│   └── validation
+│       ├── 00c9878266685887.txt
+│       ├── 0370e2174d04548b.txt
+│       └── ......
+└── TanksAndTemples
+    ├── Auditorium
+    ├── Ballroom
+    └── ......
+```
+
+### DAVIS / Tanks and Temples
+
+```bash
+python eval_dataset_i2v.py [davis/tanks] --method mine --use_mesh --scratch
+```
+
+### Mannequin Challenge
+
+If it's the first time, comment out the following two lines in line 676 of `eval_dataset_i2v`:
+```python
+# if args.dataset == "mannequin":
+#     reorganize_frames(data_root)
+```
+Then run the following:
+```bash
+python eval_dataset_i2v.py mannequin --use_mesh --scratch
+```
+
+### DAVIS Vdeos
+
+```bash
+python eval_dataset_v2v.py davis --use_mesh --scratch
+```

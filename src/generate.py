@@ -786,8 +786,9 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
                             ).reshape_as(latents_ori).to(latents_ori.dtype)
 
                         # os.makedirs("dump", exist_ok=True)
-                        # torch.save(latents_ori, f"dump/latents_ori_{i}_{j}.pt")
+                        # torch.save(M, f"dump/homography_{i}_{j}.pt")
                         # torch.save(pseudo_x0, f"dump/pseudo_x0_{i}_{j}.pt")
+                        # torch.save(latents_ori, f"dump/latents_ori_{i}_{j}.pt")
 
                         # resampling
                         if j < repaint_iter_num - 1:
@@ -807,7 +808,7 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
                             # torch.save(var_data, f"dump/var_data_{i}_{j}.pt")
 
 
-                            var_data *= 3  # NOTE: MAGIC NUMBER!!!!!!!!!!!!
+                            var_data *= 1.5  # NOTE: MAGIC NUMBER!!!!!!!!!!!!
 
 
                             if i < self._num_timesteps // 2:

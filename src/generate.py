@@ -3,7 +3,6 @@ import argparse
 import inspect
 import os
 from dataclasses import dataclass
-from tqdm import tqdm
 
 import cv2
 import lovely_tensors
@@ -13,12 +12,13 @@ import torch
 import torch.nn.functional as F
 from diffusers.image_processor import PipelineImageInput
 from diffusers import AutoencoderKLTemporalDecoder, UNetSpatioTemporalConditionModel
-from diffusers.utils import BaseOutput, logging, load_image, export_to_video
+from diffusers.utils import BaseOutput, logging, export_to_video
 from diffusers.utils.torch_utils import is_compiled_module, randn_tensor
 from diffusers.video_processor import VideoProcessor
 from diffusers.pipelines import DiffusionPipeline
 from einops import rearrange
 from jaxtyping import Float
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection
 
 from covariance import guided_blur_2D, local_covariance_2D, local_covariance_3D, safe_division_3D
@@ -93,15 +93,15 @@ def get_var_data(
         use_first_frame: bool = True,
         channelwise: bool = True,
     ) -> Float[torch.Tensor, "batch num_frames c^2 height width"]:
-    batch, num_frames, _, height, width = warped_latents.shape
+    batch, num_frames, channel, height, width = warped_latents.shape
     scale_factor = int(round((height * width // q.shape[-2])**0.5))
     assert batch == 1
     assert height * width == q.shape[-2] * scale_factor**2, f"{height=}, {width=}, {q.shape=}, {scale_factor=}"
     assert num_frames == q.shape[0] == k.shape[0]
     h, w = height // scale_factor, width // scale_factor
 
-    # local spatial variance of warped_masks_sh
-    warped_variance = local_covariance_2D(warped_latents, warped_latents, k=kernel_radius, channelwise=channelwise)
+    # local spatial variance of warped_masks_sh (NOTE: select channelwise=False on purpose; see the NOTE below)
+    warped_variance = local_covariance_2D(warped_latents, warped_latents, k=kernel_radius, channelwise=False)
     warped_variance_sh = F.interpolate(
         rearrange(warped_variance, "b f c2 h w -> (b f) c2 h w"),
         size=(h, w),
@@ -121,9 +121,13 @@ def get_var_data(
         mask = rearrange(mask, "bf () h w -> bf () () (h w)").contiguous()
 
     # variance
-    var_data_sh = F.scaled_dot_product_attention(
-        q.contiguous(), k.contiguous(), v.contiguous(), attn_mask=mask, dropout_p=0.0, is_causal=False
-    )
+    # NOTE: If the channel size is too small (e.g., 4), scaled_dot_product_attention defaults to the MATH backend, which has very high memory cost.
+    #       To avoid this, we force the [EFFICIENT/FLASH]_ATTENTION backend, which should be auto-selected when channelwise=False (resulting in 16 channels).
+    #       However, if channelwise=True and the channel size is 4, it raises "No available kernel"; this can work as an assertion check.
+    with sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION, SDPBackend.FLASH_ATTENTION]):
+        var_data_sh = F.scaled_dot_product_attention(
+            q.contiguous(), k.contiguous(), v.contiguous(), attn_mask=mask, dropout_p=0.0, is_causal=False
+        )
     var_data_sh = rearrange(var_data_sh, "num_frames num_heads (h w) c2 -> num_frames num_heads c2 h w", h=h, w=w)
     var_data_sh = var_data_sh.mean(dim=1)
     var_data = F.interpolate(
@@ -132,6 +136,11 @@ def get_var_data(
         mode="bilinear",
         align_corners=False,
     ).reshape(batch, num_frames, -1, height, width)
+
+    # extract diagonal components
+    if channelwise:
+        var_data = rearrange(var_data, "b f (c1 c2) h w -> b f c1 c2 h w", c1=channel, c2=channel)
+        var_data = torch.diagonal(var_data, dim1=2, dim2=3).permute(0, 1, 4, 2, 3) # [b, f, c, h, w]
 
     return var_data
 
@@ -751,7 +760,7 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
 
                         if i >= self._num_timesteps * 4//5:
                             # This avoids flickering around small masks
-                            print(f"SKIP REPAINT!!! {i=}, {j=}")
+                            print(f"SKIP SA-REPAINT!!! {i=}, {j=}")
                             break
 
                         # os.makedirs("dump", exist_ok=True)
@@ -792,28 +801,28 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
 
                         # resampling
                         if j < repaint_iter_num - 1:
-
                             sigma_t = self.scheduler.sigmas[i]
-                            var_data = get_var_data(
-                                attn_query,
-                                attn_key,
-                                warped_latents[batch_size:] if self.do_classifier_free_guidance else warped_latents,
-                                warped_masks_sh,
-                                kernel_radius=5,
-                                use_first_frame=True,
-                                channelwise=True,
-                            )  # warped_latents[batch_size:, 0:1].var()
-
-                            # os.makedirs("dump", exist_ok=True)
-                            # torch.save(var_data, f"dump/var_data_{i}_{j}.pt")
-
-
-                            var_data *= 1.5  # NOTE: MAGIC NUMBER!!!!!!!!!!!!
-
 
                             if i < self._num_timesteps // 2:
                                 sigma_s = 0
                             else:
+                                # approximate Var[z0] by attention qk-similarity
+                                var_data = get_var_data(
+                                    attn_query,
+                                    attn_key,
+                                    warped_latents[batch_size:] if self.do_classifier_free_guidance else warped_latents,
+                                    warped_masks_sh,
+                                    kernel_radius=5,
+                                    use_first_frame=True,
+                                    channelwise=True,
+                                )
+
+                                # os.makedirs("dump", exist_ok=True)
+                                # torch.save(var_data, f"dump/var_data_{i}_{j}.pt")
+
+                                var_data *= 1.5  # NOTE: MAGIC NUMBER!!!!!!!!!!!!
+
+
                                 # deduce optimal sigma_s for RePaint
                                 pseudo_x0 = pseudo_x0.float()
                                 derivative = (latents_ori.float() - pseudo_x0) / sigma_t

@@ -1,4 +1,7 @@
-# Prioritizing Faithfulness: Efficient Zero-Shot NVS with Adaptive Latent Modulation
+# Prioritizing Faithfulness: Efficient Zero-Shot Novel View Synthesis with Adaptive Latent Modulation
+
+![elephant](assets/elephant_00025_zoomout_1.0.gif)
+![breakdance](assets/breakdance_00000_horizontal_-0.25.gif)
 
 ## Installation
 
@@ -13,11 +16,11 @@
 
 2. Clone the repository
     ```bash
-    git clone --recursive https://github.com/kakukakujirori/My-NVS-Solver.git
+    git clone --recursive git@github.com:kakukakujirori/My-NVS-Solver.git
     cd My-NVS-Solver
     bash patch/apply_patch.sh  # apply patch to submodules
     pip3 install -r requirements.txt
-    pip3 install --no-build-isolation -e ./tools/vipe  # used only for video-to-video evaluation
+    # pip3 install --no-build-isolation -e ./tools/vipe  # used only for video-to-video evaluation
     ```
 
 3. Download model weights
@@ -32,12 +35,12 @@
     wget https://huggingface.co/depth-anything/Video-Depth-Anything-Large/resolve/main/video_depth_anything_vitl.pth
     mv video_depth_anything_vitl.pth checkpoints/video_depth_anything_vitl.pth
 
-    # Trajectory Attention (only for evaluation comparison)
-    wget https://huggingface.co/zeqixiao/TrajectoryAttention/resolve/main/trajattn_temp.pth?download=true
-    mv trajattn_temp.pth\?download\=true checkpoints/trajattn_temp.pth
+    # # Trajectory Attention (only for evaluation comparison)
+    # wget https://huggingface.co/zeqixiao/TrajectoryAttention/resolve/main/trajattn_temp.pth?download=true
+    # mv trajattn_temp.pth\?download\=true checkpoints/trajattn_temp.pth
 
-    # Diffusion As Shader (only for evaluation comparison)
-    git clone https://huggingface.co/EXCAI/Diffusion-As-Shader checkpoints/Diffusion-As-Shader
+    # # Diffusion As Shader (only for evaluation comparison)
+    # git clone https://huggingface.co/EXCAI/Diffusion-As-Shader checkpoints/Diffusion-As-Shader
     ```
 
 ## Run
@@ -77,6 +80,8 @@ $(data_root)
     ├── Ballroom
     └── ......
 ```
+Then, change the `data_root` under the `if __name__ == '__main__':` block of `eval_dataset_[i/v]2v.py` to your own $(data_root).
+You may also want to change the `GPUS` and `MAX_WORKER_NUM` for multiprocessing at the top of these python files.
 
 ### DAVIS / Tanks and Temples
 
@@ -85,6 +90,8 @@ python eval_dataset_i2v.py [davis/tanks] --method mine --use_mesh --scratch
 ```
 
 ### Mannequin Challenge
+
+TODO: provide `download_extract.py` (The following works only after you run `download_extract.py` and download all the videos).
 
 If it's the first time, comment out the following two lines in line 676 of `eval_dataset_i2v`:
 ```python

@@ -664,15 +664,15 @@ if __name__ == '__main__':
 
     # 0. Set up paths
     if args.dataset == "davis":
-        data_root = "/home/ryotaro/data/DAVIS/JPEGImages/Full-Resolution"
+        data_root = "/mnt/data/DAVIS/JPEGImages/Full-Resolution"
         input_root = "./davis_video_input"
         output_root = "./davis_video_output"
     elif args.dataset == "mannequin":
-        data_root = "/home/ryotaro/data/MannequinChallengeHQ/validation_frames"
+        data_root = "/mnt/data/MannequinChallengeHQ/validation_frames"
         input_root = "./mannequin_challenge_video_input"
         output_root = "./mannequin_challenge_video_output"
     elif args.dataset == "tanks":
-        data_root = "/home/ryotaro/data/TanksAndTemples"
+        data_root = "/mnt/data/TanksAndTemples"
         input_root = "./tanks_and_temples_video_input"
         output_root = "./tanks_and_temples_video_output"
     else:

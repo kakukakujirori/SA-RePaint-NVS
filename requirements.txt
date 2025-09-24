@@ -1,6 +1,6 @@
 accelerate
 clean-fid
-diffusers==0.32.2
+diffusers>=0.32.2
 decord
 dotdict
 easydict

@@ -1,4 +1,4 @@
-ITEM=basketball
+ITEM=ride
 CAMERA_MOTION_MODE=horizontal
 DEGREE=1.0
 NUM_FRAMES=25

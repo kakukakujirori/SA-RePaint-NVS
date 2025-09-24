@@ -32,57 +32,6 @@ lovely_tensors.monkey_patch()
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 
-# >>> Adaptive Projected Guidance (APG) >>>
-class MomentumBuffer:
-    def __init__(self, momentum: float):
-        self.momentum = momentum
-        self.running_average = 0
-    def update(self, update_value: torch.Tensor):
-        new_average = self.momentum * self.running_average
-        self.running_average = update_value + new_average
-
-
-def adaptive_projected_guidance(
-        pred_uncond: torch.Tensor, # [B, F, C, H, W]
-        pred_cond: torch.Tensor, # [B, F, C, H, W]
-        guidance_scale: float,
-        momentum_buffer: MomentumBuffer = None,
-        eta: float = 0.5,
-        norm_threshold: float = 400,
-    ):
-
-    def project(
-        v0: torch.Tensor, # [B, F, C, H, W]
-        v1: torch.Tensor, # [B, F, C, H, W]
-    ):
-        dtype = v0.dtype
-        v0, v1 = v0.double(), v1.double()
-        v1 = torch.nn.functional.normalize(v1, dim=[-1, -2, -3, -4])
-        v0_parallel = (v0 * v1).sum(dim=[-1, -2, -3, -4], keepdim=True) * v1
-        v0_orthogonal = v0 - v0_parallel
-        return v0_parallel.to(dtype), v0_orthogonal.to(dtype)
-
-    diff = pred_cond - pred_uncond
-    if momentum_buffer is not None:
-        momentum_buffer.update(diff)
-        diff = momentum_buffer.running_average
-    if norm_threshold > 0:
-        ones = torch.ones_like(diff)
-        diff_norm = diff.norm(p=2, dim=[-1, -2, -3, -4], keepdim=True)
-        print(f"[adaptive_projected_guidance] {norm_threshold=}, {diff_norm.item()=}")
-        scale_factor = torch.minimum(ones, norm_threshold / diff_norm)
-        diff = diff * scale_factor
-    diff_parallel, diff_orthogonal = project(diff, pred_cond)
-    normalized_update = diff_orthogonal + eta * diff_parallel
-    pred_guided = pred_cond + (guidance_scale - 1) * normalized_update
-    return pred_guided
-
-
-momentum_buffer = MomentumBuffer(momentum=-0.0)
-
-# <<< Adaptive Projected Guidance (APG) <<<
-
-
 @torch.no_grad()
 def get_var_data(
         q: Float[torch.Tensor, "num_frames num_heads hw c"],
@@ -737,12 +686,6 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
 
                         # perform guidance
                         noise_pred = noise_pred_negative + self.guidance_scale * (noise_pred_positive - noise_pred_negative)
-                        # noise_pred = adaptive_projected_guidance(
-                        #     noise_pred_negative,
-                        #     noise_pred_positive,
-                        #     self.guidance_scale,
-                        #     momentum_buffer,
-                        # )
 
                         # retrieve qk
                         attn_query = self.unet.record_query_[0]
@@ -891,14 +834,12 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
                             latents_mid_pasted = warped_masks_sh * latents_mid + \
                                         (1 - warped_masks_sh) * (warped_latents_noisy[batch_size:] if self.do_classifier_free_guidance else warped_latents_noisy)
 
-                            opt_std = 0.1
-                            posterior_sigma = torch.inf #sigma_t**2 / opt_std
                             latents = self.stochastic_resample(
                                 opt_zs=latents_mid_pasted,
                                 ori_zt=latents_ori,
                                 sigma_s=sigma_s,
                                 sigma_t=sigma_t,
-                                posterior_sigma=posterior_sigma,
+                                posterior_sigma=torch.inf,  # sigma_t**2 / opt_std
                                 generator=generator,
                             )
 

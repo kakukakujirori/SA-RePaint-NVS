@@ -842,7 +842,7 @@ if __name__ == '__main__':
     pipe.to(device)
 
     # calculate lambda
-    sigma_list = np.load(f'sigmas/sigmas_{args.num_inference_steps}.npy').tolist()
+    sigma_list = np.load(f'tools/NVS_Solver/sigmas/sigmas_{args.num_inference_steps}.npy').tolist()
     lambda_ts = search_hypers(sigma_list, args.num_frames)
     lambda_ts = torch.tensor(lambda_ts)
 

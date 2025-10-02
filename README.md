@@ -89,6 +89,10 @@ You may also want to change the `GPUS` and `MAX_WORKER_NUM` for multiprocessing 
 python eval_dataset_i2v.py [davis/tanks] --method mine --use_mesh --scratch
 ```
 
+- `--method` : which inpainting method to use (`mine`, `trajcrafter`, `trajattn`, `nvssolver`, `das`)
+- `--use_mesh` : If set, mesh-based rendering is used. If not, NVS-Solver's bilinear splatting is used.
+- `--scratch` : Set when you run the evaluation for the first time. If not set, the code assumes that rendering has already completed and the results are stored in a particular folder.
+
 ### Mannequin Challenge
 
 TODO: provide `download_extract.py` (The following works only after you run `download_extract.py` and download all the videos).
@@ -100,11 +104,11 @@ If it's the first time, comment out the following two lines in line 676 of `eval
 ```
 Then run the following:
 ```bash
-python eval_dataset_i2v.py mannequin --use_mesh --scratch
+python eval_dataset_i2v.py mannequin --method mine --use_mesh --scratch
 ```
 
 ### DAVIS Vdeos
 
 ```bash
-python eval_dataset_v2v.py davis --use_mesh --scratch
+python eval_dataset_v2v.py davis --method mine --use_mesh --scratch
 ```

@@ -22,3 +22,6 @@
 [submodule "tools/DiffusionAsShader"]
 	path = tools/DiffusionAsShader
 	url = https://github.com/IGL-HKUST/DiffusionAsShader.git
+[submodule "tools/NVS_Solver"]
+	path = tools/NVS_Solver
+	url = https://github.com/ZHU-Zhiyu/NVS_Solver.git

@@ -29,3 +29,4 @@ viser
 wandb
 -e ./tools/utils3d
 ./tools/FVD/fvdcal-1.0-py3-none-any.whl
+git+https://github.com/mohammadasim98/met3r

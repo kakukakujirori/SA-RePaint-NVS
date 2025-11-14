@@ -16,7 +16,9 @@ import torch
 import torch.nn.functional as F
 from cleanfid import fid
 from diffusers.utils import load_image
+from einops import rearrange
 from fvdcal import FVDCalculation
+from met3r import MEt3R
 from pathos.multiprocessing import ProcessingPool
 from torchmetrics.image import PeakSignalNoiseRatio
 
@@ -647,6 +649,109 @@ def run_sed_calculation(output_root: str):
     return total_results, missing
 
 
+def run_met3r_calculation(output_root: str, process_size: int = 256, resize_mode: str = "area"):
+    # Initialize MEt3R
+    MET3R_MODULES = {i: MEt3R(
+            img_size=None, # Default to 256, set to `None` to use the input resolution on the fly!
+            use_norm=True, # Default to True
+            backbone="mast3r", # Default to MASt3R, select from ["mast3r", "dust3r", "raft"]
+            feature_backbone="dino16", # Default to DINO, select from ["dino16", "dinov2", "maskclip", "vit", "clip", "resnet50"]
+            feature_backbone_weights="mhamilton723/FeatUp", # Default
+            upsampler="featup", # Default to FeatUP upsampling, select from ["featup", "nearest", "bilinear", "bicubic"]
+            distance="cosine", # Default to feature similarity, select from ["cosine", "lpips", "rmse", "psnr", "mse", "ssim"]
+            freeze=True, # Default to True
+        ).to(f"cuda:{i}") for i in GPUS}
+
+    def run_task(data_dir: str, gpu_id: int, process_size: int, resize_mode: str):
+        # select evaluator
+        metric = MET3R_MODULES[gpu_id]
+        device = f"cuda:{gpu_id}"
+
+        # load warped frames and generated frames
+        generated_frames = [load_image(os.path.join(data_dir, "generated", f"{i:04d}.png")) for i in range(NUM_FRAMES)]
+        generated_tensor_source = torch.stack([torch.from_numpy(np.array(x).astype(np.float32) / 255.0).permute(2, 0, 1) for x in generated_frames[:-1]], dim=0)
+        generated_tensor_target = torch.stack([torch.from_numpy(np.array(x).astype(np.float32) / 255.0).permute(2, 0, 1) for x in generated_frames[1:]], dim=0)
+        generated_tensor = torch.stack([generated_tensor_source, generated_tensor_target], dim=1) * 2 - 1
+
+        # resize (NOTE: size must be multiple of 32)
+        height, width = generated_tensor.shape[-2:]
+        if width >= height:
+            width_sh = process_size
+            height_sh = int(32 * round(process_size * height / (32 * width)))
+        else:
+            height_sh = process_size
+            width_sh = int(32 * round(process_size * width / (32 * height)))
+        generated_tensor = F.interpolate(
+            rearrange(generated_tensor, "b v c h w -> (b v) c h w", v=2),
+            size=(height_sh, width_sh),
+            mode=resize_mode,
+        )
+        generated_tensor = rearrange(generated_tensor, "(b v) c h w -> b v c h w", v=2)
+        # print(f"Process size: {generated_tensor.shape}")
+
+        # Evaluate MEt3R
+        scores = {}
+        for idx, inputs in enumerate(generated_tensor):
+            s, *_ = metric(
+                images=inputs.unsqueeze(0).to(device),
+                return_overlap_mask=False, # Default
+                return_score_map=False, # Default
+                return_projections=False # Default
+            )
+            scores[f"{idx}_{idx+1}"] = s.cpu().item()
+        total_results[data_dir] = scores
+
+        # Clear up GPU memory
+        torch.cuda.empty_cache()
+
+
+    total_results = {}
+    missing = []
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(GPUS)) as executor:
+        future_to_task_info = {}
+        for idx, scene in enumerate(sorted(os.listdir(output_root))):
+            scene_path = os.path.join(output_root, scene)
+            if not os.path.isdir(scene_path):
+                continue
+            for motion_degree in os.listdir(scene_path):
+                data_dir = os.path.join(output_root, scene, motion_degree)
+                assert os.path.isdir(data_dir)
+
+                if not os.path.isdir(os.path.join(data_dir, "generated")):
+                    print(f"Missing {os.path.join(data_dir, 'generated')}")
+                    missing.append(data_dir)
+                    continue
+
+                future = executor.submit(run_task, data_dir, GPUS[idx % len(GPUS)], process_size, resize_mode)
+                future_to_task_info[future] = (data_dir, GPUS[idx % len(GPUS)])
+
+        for future in tqdm(concurrent.futures.as_completed(future_to_task_info), total=len(future_to_task_info), desc="Calculating MEt3R metrics"):
+            data_dir, gpu_id = future_to_task_info[future]
+            task_desc = f"{data_dir=}, {gpu_id=}"
+            try:
+                result_message = future.result()
+                # print(f"Result for {task_desc}: {result_message}")
+            except Exception as exc:
+                print(f"Main loop caught exception for {task_desc}: {exc}")
+                raise exc
+
+    total_met3r_values = []
+    for scores in total_results.values():
+        total_met3r_values += list(scores.values())
+    total_met3r_values = np.array(total_met3r_values)
+    total_met3r_mean = np.mean(total_met3r_values)
+    total_met3r_median = np.median(total_met3r_values)
+    print(f"Total MEt3R Mean: {total_met3r_mean}")
+    print(f"Total MEt3R Median: {total_met3r_median}")
+    print(f"Missing dirs: {len(missing)}")
+    total_results["total_met3r_mean"] = total_met3r_mean
+    total_results["total_met3r_median"] = total_met3r_median
+    total_results["missing_dirs"] = missing
+
+    return total_results, missing
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Image-to-Video Evaluation")
     parser.add_argument("dataset", type=str, choices=["davis", "mannequin", "tanks"], help="Dataset to use for evaluation.")
@@ -779,6 +884,11 @@ if __name__ == '__main__':
         sed_results = run_sed_calculation(output_root)
         with open(os.path.join(output_root, "sed.txt"), "w") as f:
             json.dump(sed_results, f, indent=4)
+
+        # 8. MEt3R calculation
+        met3r_results, _ = run_met3r_calculation(output_root, process_size=256, resize_mode="area")
+        with open(os.path.join(output_root, "met3r.txt"), "w") as f:
+            json.dump(met3r_results, f, indent=4)
 
     except KeyboardInterrupt:
         print("Caught KeyboardInterrupt, shutting down.")

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import html
+import html, os
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import cv2
@@ -419,6 +419,7 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         device: Optional[torch.device] = None,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         latents: Optional[torch.Tensor] = None,
+        denoise_start_step: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         num_latent_frames = (num_frames - 1) // self.vae_scale_factor_temporal + 1
         latent_height = height // self.vae_scale_factor_spatial
@@ -431,21 +432,17 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                 f" size of {batch_size}. Make sure the batch size matches the length of the generators."
             )
 
-        if latents is None:
-            latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
-        else:
-            latents = latents.to(device=device, dtype=dtype)
-
+        # prepare conditioning
         warped_images = rearrange(warped_images, "f c h w -> () c f h w", c=3)  # [batch_size, channels, frames, height, width]
         video_condition = warped_images.to(device=device, dtype=self.vae.dtype)
 
         latents_mean = (
             torch.tensor(self.vae.config.latents_mean)
             .view(1, self.vae.config.z_dim, 1, 1, 1)
-            .to(latents.device, latents.dtype)
+            .to(device, dtype)
         )
         latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
-            latents.device, latents.dtype
+            device, dtype
         )
 
         if isinstance(generator, list):
@@ -474,6 +471,19 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         condition_mask = torch.cat([first_mask, condition_mask], dim=2)
         assert condition_mask.shape == (1, 1, num_latent_frames, latent_height, latent_width)
 
+        # prepare latents
+        if denoise_start_step is not None:
+            if latents is not None:
+                print("Warning: when denoise_start_step is set, 'latents' argument is ignored.")
+            sigma_t = self.scheduler.sigmas[denoise_start_step]  # NOTE: sigmas are accessible after scheduler.set_timesteps is called
+            latents = (1 - sigma_t) * latent_condition + sigma_t * randn_tensor(
+                latent_condition.shape, generator=generator, device=device, dtype=dtype)
+        else:
+            if latents is None:
+                latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+            else:
+                latents = latents.to(device=device, dtype=dtype)
+
         return latents, latent_condition, condition_mask
 
 
@@ -498,6 +508,9 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         self,
         warped_images: List[PIL.Image.Image],
         warped_masks: List[PIL.Image.Image],
+        denoise_start_step: Optional[int],
+        repaint_iter_num: int,
+        ########
         prompt: Union[str, List[str]] = None,
         negative_prompt: Union[str, List[str]] = None,
         height: int = 480,
@@ -614,6 +627,8 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
             image_embeds,
             callback_on_step_end_tensor_inputs,
         )
+        if denoise_start_step is not None:
+            assert denoise_start_step < num_inference_steps
 
         if num_frames % self.vae_scale_factor_temporal != 1:
             logger.warning(
@@ -685,6 +700,7 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
             device,
             generator,
             latents,
+            denoise_start_step
         )
         latents, condition, condition_mask = latents_outputs
         first_frame_mask = torch.ones_like(condition_mask)
@@ -697,38 +713,178 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
 
-                latent_model_input = (1 - condition_mask) * condition + condition_mask * latents
-                latent_model_input = latent_model_input.to(transformer_dtype)
+                if (denoise_start_step is not None) and i < denoise_start_step:
+                    progress_bar.update()
+                    continue
 
-                # seq_len: num_latent_frames * (latent_height // patch_size) * (latent_width // patch_size)
-                temp_ts = (first_frame_mask[0][0][:, ::2, ::2] * t).flatten()
-                # batch_size, seq_len
-                timestep = temp_ts.unsqueeze(0).expand(latents.shape[0], -1)
+                for j in range(repaint_iter_num):
+                    latents_ori = rearrange(latents, "b c f h w -> b f c h w").float()
 
-                with self.transformer.cache_context("cond"):
-                    noise_pred = self.transformer(
-                        hidden_states=latent_model_input,
-                        timestep=timestep,
-                        encoder_hidden_states=prompt_embeds,
-                        encoder_hidden_states_image=image_embeds,
-                        attention_kwargs=attention_kwargs,
-                        return_dict=False,
-                    )[0]
+                    latent_model_input = (1 - first_frame_mask) * condition + first_frame_mask * latents
+                    latent_model_input = latent_model_input.to(transformer_dtype)
 
-                if self.do_classifier_free_guidance:
-                    with self.transformer.cache_context("uncond"):
-                        noise_uncond = self.transformer(
+                    # seq_len: num_latent_frames * (latent_height // patch_size) * (latent_width // patch_size)
+                    temp_ts = (first_frame_mask[0][0][:, ::2, ::2] * t).flatten()
+                    # batch_size, seq_len
+                    timestep = temp_ts.unsqueeze(0).expand(latents.shape[0], -1)
+
+                    with self.transformer.cache_context("cond"):
+                        noise_pred = self.transformer(
                             hidden_states=latent_model_input,
                             timestep=timestep,
-                            encoder_hidden_states=negative_prompt_embeds,
+                            encoder_hidden_states=prompt_embeds,
                             encoder_hidden_states_image=image_embeds,
                             attention_kwargs=attention_kwargs,
                             return_dict=False,
                         )[0]
-                        noise_pred = noise_uncond + guidance_scale * (noise_pred - noise_uncond)
 
-                # compute the previous noisy sample x_t -> x_t-1
-                latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+                    # perform guidance
+                    if self.do_classifier_free_guidance:
+                        with self.transformer.cache_context("uncond"):
+                            noise_uncond = self.transformer(
+                                hidden_states=latent_model_input,
+                                timestep=timestep,
+                                encoder_hidden_states=negative_prompt_embeds,
+                                encoder_hidden_states_image=image_embeds,
+                                attention_kwargs=attention_kwargs,
+                                return_dict=False,
+                            )[0]
+                            noise_pred = noise_uncond + guidance_scale * (noise_pred - noise_uncond)
+
+                    # compute the previous noisy sample x_t -> x_t-1
+                    out = self.scheduler.step(noise_pred, t, latents, step_i=i)
+                    pseudo_x0 = rearrange(out.pred_original_sample, "b c f h w -> b f c h w")
+                    latents = out.prev_sample
+
+                    if i >= self._num_timesteps * 4//5:
+                        # This avoids flickering around small masks
+                        print(f"SKIP SA-REPAINT!!! {i=}, {j=}")
+                        break
+
+                    os.makedirs("dump", exist_ok=True)
+                    torch.save(pseudo_x0, f"dump/pseudo_x0_ori_{i}_{j}.pt")
+
+                    # alignment
+                    if i < self._num_timesteps * 3 // 5:
+                        M, pseudo_x0 = homography_estimation(
+                            pseudo_x0,
+                            rearrange(condition, "b c f h w -> b f c h w"),
+                            rearrange(condition_mask, "b c f h w -> b f c h w") < 0.5,
+                            process_size=128,
+                            lr=1e-2,
+                            max_iters=100,
+                            num_control_points=None,#num_frames//3,
+                            fix_first_frame=True,
+                            acceleration_penalty_weight=0.5,
+                            padding_mode="border",
+                        )
+                        from kornia.geometry.transform.imgwarp import homography_warp
+                        latents_ori = homography_warp(
+                            rearrange(latents_ori, "b f c h w -> (b f) c h w"),
+                            M,
+                            dsize=latents.shape[-2:],
+                            padding_mode="reflection",
+                        )
+                        latents_ori = rearrange(latents_ori, "(b f) c h w -> b f c h w", b=latents.shape[0])
+
+                        # os.makedirs("dump", exist_ok=True)
+                        # torch.save(M, f"dump/homography_{i}_{j}.pt")
+                        # torch.save(pseudo_x0, f"dump/pseudo_x0_{i}_{j}.pt")
+                        # torch.save(latents_ori, f"dump/latents_ori_{i}_{j}.pt")
+
+                    # resampling
+                    if j < repaint_iter_num - 1:
+                        sigma_t = self.scheduler.sigmas[i]
+
+                        if i < self._num_timesteps // 2:
+                            sigma_s = torch.tensor([0], device=sigma_t.device, dtype=sigma_t.dtype).reshape(1, 1, 1, 1, 1)
+                        else:
+                            # approximate Var[z0] by attention qk-similarity
+                            # var_data = get_var_data(
+                            #     attn_query,
+                            #     attn_key,
+                            #     warped_latents[batch_size:] if self.do_classifier_free_guidance else warped_latents,
+                            #     warped_masks_sh,
+                            #     kernel_radius=5,
+                            #     use_first_frame=True,
+                            #     channelwise=True,
+                            # )
+                            print("get_var_data not implemented yet! (attention qkv extraction needed)")
+                            var_data = torch.ones_like(pseudo_x0)
+
+                            # os.makedirs("dump", exist_ok=True)
+                            # torch.save(var_data, f"dump/var_data_{i}_{j}.pt")
+
+                            var_data *= 1.5  # NOTE: MAGIC NUMBER!!!!!!!!!!!!
+
+                            # deduce optimal sigma_s for RePaint
+                            pseudo_x0 = pseudo_x0.float()
+                            derivative = (latents_ori - pseudo_x0) / sigma_t
+                            identity = torch.ones_like(pseudo_x0[0, 0, :, 0, 0]).reshape(1, 1, -1, 1, 1)
+
+                            k_spatial = 1
+                            k_temporal = 1
+
+                            var_pseudo_x0 = local_covariance_3D(pseudo_x0, pseudo_x0, k_spatial, k_temporal, channelwise=True)
+                            var_derivative = local_covariance_3D(derivative, derivative, k_spatial, k_temporal, channelwise=True)
+                            cov_pseudo_x0_derivative = local_covariance_3D(pseudo_x0, derivative, k_spatial, k_temporal, channelwise=True)
+
+                            var_pseudo_x0 = guided_blur_2D(var_data, var_pseudo_x0)
+                            var_derivative = guided_blur_2D(var_data, var_derivative)
+                            cov_pseudo_x0_derivative = guided_blur_2D(var_data, cov_pseudo_x0_derivative)
+
+                            coeff_A = var_derivative - identity
+                            coeff_B = cov_pseudo_x0_derivative
+                            coeff_C = var_pseudo_x0 - var_data
+
+                            # check two roots
+                            nunom_pos = (-1) * coeff_B + torch.sign(coeff_B) * torch.sqrt(torch.relu(coeff_B.pow(2) - coeff_A * coeff_C))
+                            sigma_s_pos = safe_division_3D(nunom_pos, coeff_A, k_spatial, k_temporal)
+                            sigma_s_pos = torch.clamp(sigma_s_pos, 0, sigma_t)
+
+                            nunom_neg = (-1) * coeff_B - torch.sign(coeff_B) * torch.sqrt(torch.relu(coeff_B.pow(2) - coeff_A * coeff_C))
+                            sigma_s_neg = safe_division_3D(nunom_neg, coeff_A, k_spatial, k_temporal)
+                            sigma_s_neg = torch.clamp(sigma_s_neg, 0, sigma_t)
+
+                            sigma_s_pos_eval = torch.abs(coeff_A * sigma_s_pos**2 + 2 * coeff_B * sigma_s_pos + coeff_C)
+                            sigma_s_neg_eval = torch.abs(coeff_A * sigma_s_neg**2 + 2 * coeff_B * sigma_s_neg + coeff_C)
+                            sigma_s = torch.where(
+                                sigma_s_pos_eval <= sigma_s_neg_eval + 1e-6, # NOTE: if two solutions are available, adopt sigma_s_pos
+                                sigma_s_pos,
+                                sigma_s_neg,
+                            )
+
+                            # endpoints check
+                            sigma_s_left_eval = torch.abs(coeff_C)
+                            sigma_s_right_eval = torch.abs(coeff_A * sigma_t**2 + 2 * coeff_B * sigma_t + coeff_C)
+                            sigma_s_endpoints = torch.where(
+                                sigma_s_left_eval <= sigma_s_right_eval,
+                                torch.zeros_like(sigma_s),
+                                torch.full_like(sigma_s, sigma_t),
+                            )
+
+                            sigma_s_endpoints_eval = torch.abs(coeff_A * sigma_s_endpoints**2 + 2 * coeff_B * sigma_s_endpoints + coeff_C)
+                            sigma_s_eval = torch.abs(coeff_A * sigma_s**2 + 2 * coeff_B * sigma_s + coeff_C)
+                            sigma_s = torch.where(sigma_s_eval < sigma_s_endpoints_eval, sigma_s, sigma_s_endpoints)
+
+                            # postprocessing
+                            sigma_s = guided_blur_2D(var_data, sigma_s)
+                            sigma_s = torch.clamp(sigma_s, 0, sigma_t)
+
+                        print(f"{sigma_s=}, {sigma_t=}")
+
+                        # direct pasting
+                        pseudo_x0 = rearrange(pseudo_x0, "b f c h w -> b c f h w")
+                        sigma_s = rearrange(sigma_s, "b f c h w -> b c f h w")
+                        latents_mid = pseudo_x0 + sigma_s * noise_pred  # NOTE: `noise_pred = eps - x0` for flow_prediction
+                        condition_noisy = (1 - sigma_s) * condition + sigma_s * randn_tensor(
+                            condition.shape, generator=generator, device=condition.device, dtype=condition.dtype)
+                        latents_mid_pasted = condition_mask * latents_mid + (1 - condition_mask) * condition_noisy
+
+                        coeff_data = (1 - sigma_t) / (1 - sigma_s + 1e-6)
+                        coeff_noise = (sigma_t**2 - (coeff_data ** 2) * sigma_s**2).sqrt()
+                        latents = coeff_data * latents_mid_pasted + coeff_noise * randn_tensor(
+                            latents_mid_pasted.shape, generator=generator, device=latents_mid_pasted.device, dtype=latents_mid_pasted.dtype)
 
                 if callback_on_step_end is not None:
                     callback_kwargs = {}

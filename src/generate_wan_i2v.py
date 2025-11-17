@@ -103,7 +103,7 @@ def get_var_data(
     scale_factor = int(round((height * width // q.shape[-2])**0.5))
     assert batch == 1
     assert height * width == q.shape[-2] * scale_factor**2, f"{height=}, {width=}, {q.shape=}, {scale_factor=}"
-    assert num_frames == q.shape[0] == k.shape[0]
+    assert num_frames == q.shape[0] == k.shape[0], f"{warped_latents.shape=}, {q.shape=}, {k.shape=}"
     h, w = height // scale_factor, width // scale_factor
 
     # local spatial variance of warped_masks_sh (NOTE: select channelwise=False on purpose; see the NOTE below)
@@ -462,13 +462,13 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         warped_masks = warped_masks.mean(dim=1, keepdim=True)
         warped_masks_sh = rearrange(warped_masks, "() () f (nh ph) (nw pw) -> () () f nh nw (ph pw)", ph=16, pw=16)
         warped_masks_sh = warped_masks_sh.mean(dim=-1)
-        warped_masks_sh = torch.clip(warped_masks_sh * 5, 0, 1)
         assert warped_masks_sh.shape == (1, 1, num_frames, latent_height, latent_width)
 
         first_mask = warped_masks_sh[:, :, 0:1]
         condition_mask = rearrange(warped_masks_sh[:, :, 1:], "() () (f pf) nh nw -> () () f pf nh nw", pf=4)
         condition_mask = condition_mask.mean(dim=3)
         condition_mask = torch.cat([first_mask, condition_mask], dim=2)
+        condition_mask = torch.clip(condition_mask * 5, 0, 1)
         assert condition_mask.shape == (1, 1, num_latent_frames, latent_height, latent_width)
 
         # prepare latents
@@ -728,7 +728,20 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                     # batch_size, seq_len
                     timestep = temp_ts.unsqueeze(0).expand(latents.shape[0], -1)
 
+                    # Attention weighting
+                    base_weight = min(1, i / self._num_timesteps)
+                    weight_map = (1 - condition_mask) * (1 - base_weight) + base_weight
+
+                    # SEG
+                    query_blur_sigma_invalid_max = 2  # TODO: MAGIC NUMBER!!!
+                    query_blur_sigma_invalid_min = 2  # TODO: MAGIC NUMBER!!!
+                    query_blur_sigma_invalid = query_blur_sigma_invalid_min + (query_blur_sigma_invalid_max - query_blur_sigma_invalid_min) * i / self._num_timesteps
+                    query_blur_sigma_valid = 4  # TODO: MAGIC NUMBER!!!
+                    query_blur_sigma = (1 - condition_mask) * query_blur_sigma_valid + condition_mask * query_blur_sigma_invalid
+
                     with self.transformer.cache_context("cond"):
+                        self.transformer.latent_shape_ = latents.shape[-3:]
+                        self.transformer.inject(weight_map)
                         noise_pred = self.transformer(
                             hidden_states=latent_model_input,
                             timestep=timestep,
@@ -736,20 +749,50 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                             encoder_hidden_states_image=image_embeds,
                             attention_kwargs=attention_kwargs,
                             return_dict=False,
+                            record_attention=True,
                         )[0]
+
+                        # retrieve qk
+                        attn_query = self.transformer.record_query_[0]
+                        attn_key = self.transformer.record_key_[0]
+                        attn_value = self.transformer.record_value_[0]
+                        os.makedirs("dump", exist_ok=True)
+                        torch.save(attn_query, f"dump/query_{i}_{j}_{0}.pt")
+                        torch.save(attn_key, f"dump/key_{i}_{j}_{0}.pt")
+                        torch.save(attn_value, f"dump/value_{i}_{j}_{0}.pt")
 
                     # perform guidance
                     if self.do_classifier_free_guidance:
-                        with self.transformer.cache_context("uncond"):
-                            noise_uncond = self.transformer(
-                                hidden_states=latent_model_input,
-                                timestep=timestep,
-                                encoder_hidden_states=negative_prompt_embeds,
-                                encoder_hidden_states_image=image_embeds,
-                                attention_kwargs=attention_kwargs,
-                                return_dict=False,
-                            )[0]
-                            noise_pred = noise_uncond + guidance_scale * (noise_pred - noise_uncond)
+                        use_seg = i % 3 == 0
+
+                        if use_seg:
+                            with self.transformer.cache_context("uncond"):
+                                self.transformer.latent_shape_ = latents.shape[-3:]
+                                self.transformer.inject(weight_map, query_blur_sigma=query_blur_sigma)
+                                noise_uncond = self.transformer(
+                                    hidden_states=latent_model_input,
+                                    timestep=timestep,
+                                    encoder_hidden_states=prompt_embeds,
+                                    encoder_hidden_states_image=image_embeds,
+                                    attention_kwargs=attention_kwargs,
+                                    return_dict=False,
+                                    record_attention=False,
+                                )[0]
+                        else:
+                            with self.transformer.cache_context("uncond"):
+                                self.transformer.latent_shape_ = latents.shape[-3:]
+                                self.transformer.inject(weight_map)
+                                noise_uncond = self.transformer(
+                                    hidden_states=latent_model_input,
+                                    timestep=timestep,
+                                    encoder_hidden_states=negative_prompt_embeds,
+                                    encoder_hidden_states_image=image_embeds,
+                                    attention_kwargs=attention_kwargs,
+                                    return_dict=False,
+                                    record_attention=False,
+                                )[0]
+
+                        noise_pred = noise_uncond + guidance_scale * (noise_pred - noise_uncond)
 
                     # compute the previous noisy sample x_t -> x_t-1
                     out = self.scheduler.step(noise_pred, t, latents, step_i=i)
@@ -800,17 +843,15 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                             sigma_s = torch.tensor([0], device=sigma_t.device, dtype=sigma_t.dtype).reshape(1, 1, 1, 1, 1)
                         else:
                             # approximate Var[z0] by attention qk-similarity
-                            # var_data = get_var_data(
-                            #     attn_query,
-                            #     attn_key,
-                            #     warped_latents[batch_size:] if self.do_classifier_free_guidance else warped_latents,
-                            #     warped_masks_sh,
-                            #     kernel_radius=5,
-                            #     use_first_frame=True,
-                            #     channelwise=True,
-                            # )
-                            print("get_var_data not implemented yet! (attention qkv extraction needed)")
-                            var_data = torch.ones_like(pseudo_x0)
+                            var_data = get_var_data(
+                                attn_query.float(),
+                                attn_key.float(),
+                                rearrange(condition, "b c f h w -> b f c h w"),
+                                rearrange(condition_mask, "b c f h w -> b f c h w"),
+                                kernel_radius=5,
+                                use_first_frame=True,
+                                channelwise=True,
+                            )
 
                             # os.makedirs("dump", exist_ok=True)
                             # torch.save(var_data, f"dump/var_data_{i}_{j}.pt")

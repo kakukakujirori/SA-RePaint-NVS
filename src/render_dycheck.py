@@ -959,7 +959,7 @@ if __name__ == '__main__':
     parser.add_argument(
         "--data_root",
         type=str,
-        default="/mnt/hdd1/ryotaro/data/iphone",
+        default="/disk1/ryotaro/data/iphone",
     )
     parser.add_argument(
         "--sequence",
@@ -968,12 +968,19 @@ if __name__ == '__main__':
     parser.add_argument(
         "--output_folder",
         type=str,
-        default="./dycheck_output"
+        default="./dycheck_rendered"
     )
     parser.add_argument(
         "--use_mesh",
         action="store_true",
         help="Use mesh-based rendering.",
+    )
+    parser.add_argument(
+        "--save_trajectory_type",
+        type=str,
+        default=None,
+        choices=[None, "2d_npy"],
+        help="If specified, save additional trajectories.",
     )
     parser.add_argument(
         "--gpu_id",
@@ -1110,6 +1117,8 @@ if __name__ == '__main__':
             trans_valid = np.stack(trans_valid_list, axis=0)
             np.save(os.path.join(save_path, 'trans_coordinates.npy'), trans_coordinates)
             np.save(os.path.join(save_path, 'trans_valid.npy'), trans_valid)
+        elif save_trajectory_type is not None:
+            raise NotImplementedError(f"Save trajectory type '{save_trajectory_type}' is not implemented.")
 
         return save_path
 
@@ -1126,4 +1135,4 @@ if __name__ == '__main__':
     os.makedirs(args.output_folder, exist_ok=True)
 
     for idx, time_id in enumerate(tqdm(parser.time_ids, desc=args.sequence)):
-        run_trajectory(src_cam, tgt_cam, time_id, use_mesh=args.use_mesh)
+        run_trajectory(src_cam, tgt_cam, time_id, use_mesh=args.use_mesh, save_trajectory_type=args.save_trajectory_type)

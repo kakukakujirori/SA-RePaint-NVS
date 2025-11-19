@@ -1036,8 +1036,8 @@ if __name__ == '__main__':
     pipe.to(device)
 
     # load images
-    warped_images = [PIL.Image.open(os.path.join(args.trajectory_folder, f"{i:04d}.png")) for i in range(args.num_frames)]
-    warped_masks = [PIL.Image.open(os.path.join(args.trajectory_folder, f"{i:04d}_mask.png")) for i in range(args.num_frames)]
+    warped_images = [PIL.Image.open(os.path.join(args.trajectory_folder, f"{i:04d}.png")).convert("RGB") for i in range(args.num_frames)]
+    warped_masks = [PIL.Image.open(os.path.join(args.trajectory_folder, f"{i:04d}_mask.png")).convert("RGB") for i in range(args.num_frames)]
 
     # inference
     # monitor = GPUMemoryMonitor(gpu_id=args.gpu)

@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import html, os
+import argparse, html, os
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import cv2
@@ -25,21 +26,21 @@ import torch.nn.functional as F
 from einops import rearrange
 from jaxtyping import Float
 from torch.nn.attention import SDPBackend, sdpa_kernel
-from transformers import AutoTokenizer, CLIPImageProcessor, CLIPVisionModel, UMT5EncoderModel
+from transformers import AutoProcessor, AutoTokenizer, Blip2ForConditionalGeneration, CLIPImageProcessor, CLIPVisionModel, UMT5EncoderModel
 
 from diffusers.callbacks import MultiPipelineCallbacks, PipelineCallback
 from diffusers.image_processor import PipelineImageInput
 from diffusers.loaders import WanLoraLoaderMixin
 from diffusers.models import AutoencoderKLWan, WanTransformer3DModel
-from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
-from diffusers.utils import is_ftfy_available, is_torch_xla_available, logging, replace_example_docstring
+from diffusers.utils import BaseOutput, logging, export_to_video, is_ftfy_available, is_torch_xla_available
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
-from diffusers.pipelines.wan.pipeline_output import WanPipelineOutput
 
 from covariance import guided_blur_2D, local_covariance_2D, local_covariance_3D, safe_division_3D
 from gpu_memory_monitor import GPUMemoryMonitor
+from scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
+from transformer_wan import MyWanTransformer3DModel
 from warp import homography_estimation
 
 
@@ -149,6 +150,21 @@ def get_var_data(
         var_data = torch.diagonal(var_data, dim1=2, dim2=3).permute(0, 1, 4, 2, 3) # [b, f, c, h, w]
 
     return var_data
+
+
+@dataclass
+class WanPipelineOutput(BaseOutput):
+    r"""
+    Output class for Wan pipelines.
+
+    Args:
+        frames (`torch.Tensor`, `np.ndarray`, or List[List[PIL.Image.Image]]):
+            List of video outputs - It can be a nested list of length `batch_size,` with each sub-list containing
+            denoised PIL image sequences of length `num_frames.` It can also be a NumPy array or Torch tensor of shape
+            `(batch_size, num_frames, channels, height, width)`.
+    """
+
+    frames: torch.Tensor
 
 
 class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
@@ -524,7 +540,7 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         prompt_embeds: Optional[torch.Tensor] = None,
         negative_prompt_embeds: Optional[torch.Tensor] = None,
         image_embeds: Optional[torch.Tensor] = None,
-        output_type: Optional[str] = "np",
+        output_type: Optional[str] = "pil",
         return_dict: bool = True,
         attention_kwargs: Optional[Dict[str, Any]] = None,
         callback_on_step_end: Optional[
@@ -729,15 +745,15 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                     timestep = temp_ts.unsqueeze(0).expand(latents.shape[0], -1)
 
                     # Attention weighting
-                    base_weight = min(1, i / self._num_timesteps)
+                    base_weight = min(1, 0.8 + i / self._num_timesteps)
                     weight_map = (1 - condition_mask) * (1 - base_weight) + base_weight
 
                     # SEG
-                    query_blur_sigma_invalid_max = 2  # TODO: MAGIC NUMBER!!!
-                    query_blur_sigma_invalid_min = 2  # TODO: MAGIC NUMBER!!!
-                    query_blur_sigma_invalid = query_blur_sigma_invalid_min + (query_blur_sigma_invalid_max - query_blur_sigma_invalid_min) * i / self._num_timesteps
-                    query_blur_sigma_valid = 4  # TODO: MAGIC NUMBER!!!
-                    query_blur_sigma = (1 - condition_mask) * query_blur_sigma_valid + condition_mask * query_blur_sigma_invalid
+                    # query_blur_sigma_invalid_max = 2  # TODO: MAGIC NUMBER!!!
+                    # query_blur_sigma_invalid_min = 2  # TODO: MAGIC NUMBER!!!
+                    # query_blur_sigma_invalid = query_blur_sigma_invalid_min + (query_blur_sigma_invalid_max - query_blur_sigma_invalid_min) * i / self._num_timesteps
+                    # query_blur_sigma_valid = 4  # TODO: MAGIC NUMBER!!!
+                    # query_blur_sigma = (1 - condition_mask) * query_blur_sigma_valid + condition_mask * query_blur_sigma_invalid
 
                     with self.transformer.cache_context("cond"):
                         self.transformer.latent_shape_ = latents.shape[-3:]
@@ -763,7 +779,7 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
 
                     # perform guidance
                     if self.do_classifier_free_guidance:
-                        use_seg = i % 3 == 0
+                        use_seg = False #i % 3 == 0
 
                         if use_seg:
                             with self.transformer.cache_context("uncond"):
@@ -808,7 +824,7 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                     torch.save(pseudo_x0, f"dump/pseudo_x0_ori_{i}_{j}.pt")
 
                     # alignment
-                    if i < self._num_timesteps * 3 // 5:
+                    if i < self._num_timesteps * 1 // 5:
                         M, pseudo_x0 = homography_estimation(
                             pseudo_x0,
                             rearrange(condition, "b c f h w -> b f c h w"),
@@ -826,7 +842,7 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                             rearrange(latents_ori, "b f c h w -> (b f) c h w"),
                             M,
                             dsize=latents.shape[-2:],
-                            padding_mode="reflection",
+                            padding_mode="border",
                         )
                         latents_ori = rearrange(latents_ori, "(b f) c h w -> b f c h w", b=latents.shape[0])
 
@@ -839,7 +855,7 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                     if j < repaint_iter_num - 1:
                         sigma_t = self.scheduler.sigmas[i]
 
-                        if i < self._num_timesteps // 2:
+                        if i < self._num_timesteps * 0 // 2:
                             sigma_s = torch.tensor([0], device=sigma_t.device, dtype=sigma_t.dtype).reshape(1, 1, 1, 1, 1)
                         else:
                             # approximate Var[z0] by attention qk-similarity
@@ -946,6 +962,12 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
 
         latents = (1 - condition_mask) * condition + condition_mask * latents
 
+        # cpu offload
+        import gc
+        self.transformer.cpu()
+        gc.collect()
+        torch.cuda.empty_cache()
+
         if not output_type == "latent":
             latents = latents.to(self.vae.dtype)
             latents_mean = (
@@ -969,3 +991,138 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
             return (video,)
 
         return WanPipelineOutput(frames=video)
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--output_folder",
+        type=str,
+    )
+
+    parser.add_argument(
+        "--trajectory_folder",
+        type=str,
+    )
+
+    parser.add_argument(
+        "--num_frames",
+        type=int,
+        default=25,
+    )
+
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=12345
+    )
+
+    parser.add_argument(
+        "--num_inference_steps",
+        type=int,
+        default=100
+    )
+
+    parser.add_argument(
+        "--guidance_scale",
+        type=float,
+        default=5.0,
+    )
+
+    parser.add_argument(
+        "--denoise_start_step",
+        type=int,
+        default=None,
+        help="If you enable resample, num_inference_steps // 3 is the recommended value"
+    )
+
+    parser.add_argument(
+        "--repaint_iter_num",
+        type=int,
+        default=2,
+    )
+
+    parser.add_argument(
+        "--gpu",
+        type=int,
+        default=0,
+    )
+
+    parser.add_argument(
+        "--gpu_memory_limit",
+        type=float,
+        default=None,
+    )
+
+    args = parser.parse_args()
+
+    device = f"cuda:{args.gpu}"
+
+    # limit GPU memory
+    if args.gpu_memory_limit is not None:
+        total_mem_gb = torch.cuda.get_device_properties(args.gpu).total_memory / (1024**3)
+        fraction = args.gpu_memory_limit / total_mem_gb
+        torch.cuda.set_per_process_memory_fraction(fraction, args.gpu)
+        print(f"GPU memory upper limit was set to {args.gpu_memory_limit:.2f}GB ({fraction:.2%})")
+
+    # load pipeline
+    model_id = "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
+    vae = AutoencoderKLWan.from_pretrained(model_id, subfolder="vae", torch_dtype=torch.float32)
+    transformer = MyWanTransformer3DModel.from_pretrained(model_id, subfolder="transformer", torch_dtype=torch.bfloat16)
+    pipe = WanImageToVideoPipeline.from_pretrained(model_id, vae=vae, transformer=transformer, torch_dtype=torch.bfloat16)
+    pipe.scheduler = FlowMatchEulerDiscreteScheduler.from_config(pipe.scheduler.config)
+    pipe.to(device)
+
+    # load captioner
+    blip_path = "Salesforce/blip2-opt-2.7b"
+    caption_processor = AutoProcessor.from_pretrained(blip_path)
+    captioner = Blip2ForConditionalGeneration.from_pretrained(
+        blip_path, torch_dtype=torch.float16
+    )
+
+    # load images
+    warped_images = [PIL.Image.open(os.path.join(args.trajectory_folder, f"{i:04d}.png")) for i in range(args.num_frames)]
+    warped_masks = [PIL.Image.open(os.path.join(args.trajectory_folder, f"{i:04d}_mask.png")) for i in range(args.num_frames)]
+
+    # inference
+    # monitor = GPUMemoryMonitor(gpu_id=args.gpu)
+    # monitor.start()
+
+    # qk extraction setting
+    pipe.transformer.record_blocks = [15]
+    assert max(pipe.transformer.record_blocks) < len(pipe.transformer.blocks), f"Must be lower than {len(pipe.transformer.blocks)=}"
+
+    # get caption
+    captioner.to(device)
+    captioner_inputs = caption_processor(images=warped_images[0], return_tensors="pt").to(device, torch.float16)
+    generated_ids = captioner.generate(**captioner_inputs)
+    generated_text = caption_processor.batch_decode(
+        generated_ids, skip_special_tokens=True
+    )[0].strip()
+    prompt = generated_text + ". The video is of high quality, and the view is very clear. High quality, masterpiece, best quality, highres, ultra-detailed, fantastic."
+    captioner.cpu()
+    print(prompt)
+
+    frames = pipe(
+        warped_images=warped_images,
+        warped_masks=warped_masks,
+        denoise_start_step=args.denoise_start_step,
+        repaint_iter_num=args.repaint_iter_num,
+        prompt=prompt,
+        negative_prompt="Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards",
+        height=704,
+        width=1280,
+        num_frames=args.num_frames,
+        guidance_scale=args.guidance_scale,
+        num_inference_steps=args.num_inference_steps,
+        generator=torch.manual_seed(args.seed),
+    ).frames[0]
+
+    # monitor.stop()
+    # print(f"Peak GPU memory usage: {monitor.get_max_memory():.2f} GB")
+
+    os.makedirs(args.output_folder, exist_ok=True)
+    for i,fr in enumerate(frames):
+        fr.save(os.path.join(args.output_folder, f"{i:04d}.png"))
+    export_to_video(frames, os.path.join(args.output_folder, "generated.mp4"))

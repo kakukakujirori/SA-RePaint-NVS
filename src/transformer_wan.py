@@ -822,7 +822,13 @@ class MyWanTransformer3DModel(WanTransformer3DModel):
                 self.record_value_.append(rearrange(value, "() (f pph ppw) heads dim -> f heads (pph ppw) dim", f=ppf, pph=pph, ppw=ppw))
 
             if kv_weight is not None:
-                key *= kv_weight_reshaped
+                key *= kv_weight_reshaped  # b (f pph ppw) () ()
+
+                # attention_mask = rearrange(kv_weight_reshaped > 0.9999, "b l () () -> b () () l")
+                # attention_mask = torch.kron(torch.eye(pph * ppw), torch.ones((ppf, ppf))).to(query.device)
+                # attention_mask = torch.where(attention_mask > 0.9999, 0.0, kv_weight_reshaped.min() - 0.2).to(query.dtype)
+                # attention_mask = rearrange(attention_mask, "l s -> () () l s")
+
 
             if query_blur_sigma is not None:
                 chans = query.shape[-1]

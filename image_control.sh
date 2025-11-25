@@ -1,6 +1,6 @@
-ITEM=ride
+ITEM=bear_00000
 CAMERA_MOTION_MODE=horizontal
-DEGREE=1.0
+DEGREE=-1.0
 NUM_FRAMES=25
 
 set -e
@@ -35,13 +35,10 @@ python src/trajectory_extraction.py \
   --use_mesh
 
 # generaiton
-python src/generate.py \
+python src/generate_wan_i2v.py \
   --output_folder output/${ITEM}/${CAMERA_MOTION_MODE}_${DEGREE}/generated \
   --trajectory_folder output/${ITEM}/${CAMERA_MOTION_MODE}_${DEGREE}/warped \
   --num_frames ${NUM_FRAMES} \
   --num_inference_steps 50 \
-  --denoise_start_step 16 \
   --repaint_iter_num 2 \
-  --min_guidance_scale 1.0 \
-  --max_guidance_scale 3.0 \
   --seed 12345

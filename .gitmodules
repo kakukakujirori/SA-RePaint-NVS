@@ -25,3 +25,6 @@
 [submodule "tools/NVS_Solver"]
 	path = tools/NVS_Solver
 	url = https://github.com/ZHU-Zhiyu/NVS_Solver.git
+[submodule "tools/invisible_stitch"]
+	path = tools/invisible_stitch
+	url = https://github.com/paulengstler/invisible-stitch.git

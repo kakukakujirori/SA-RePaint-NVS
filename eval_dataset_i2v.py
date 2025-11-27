@@ -113,7 +113,7 @@ def organize_images_and_depth(data_root: str, input_root: str, output_root: str)
     for imgpath in glob.glob(os.path.join(input_root, "*.jpg")):
         imgname = os.path.basename(imgpath).split(".")[0]
         image_folder_path = os.path.join(input_root, imgname, "images")
-        depth_folder_path = os.path.join(input_root, imgname, "depth")
+        depth_folder_path = os.path.join(input_root, imgname, "depths")
         os.makedirs(image_folder_path)
         os.makedirs(depth_folder_path)
         shutil.move(imgpath, image_folder_path)
@@ -136,7 +136,7 @@ def run_trajectory_extraction(
     try:
         result = subprocess.run(["python", "src/trajectory_extraction.py",
             "--image_folder", f"{input_root}/{scene}/images/",
-            "--depth_folder", f"{input_root}/{scene}/depth/",
+            "--depth_folder", f"{input_root}/{scene}/depths/",
             "--output_folder", f"{output_root}/{scene}/{motion_mode}_{degree}/warped",
             "--depth_format", "npy",
             "--invert_depth",
@@ -174,7 +174,7 @@ def run_trajectory_extraction(
         return f"Unexpected error for {task_id}: {e}"
 
 
-def run_generation_task(output_root: str, scene: str, motion_mode: str, degree: float, gpu_id: int, method: str = "mine") -> str:
+def run_generation_task(input_root: str, output_root: str, scene: str, motion_mode: str, degree: float, gpu_id: int, method: str = "mine") -> str:
     task_id = f"Scene: {scene}, Motion: {motion_mode + '_' + str(degree)}, GPU: {gpu_id}"
     print(f"STARTING task: {task_id}")
     with torch.cuda.device(f'cuda:{gpu_id}'):
@@ -233,6 +233,17 @@ def run_generation_task(output_root: str, scene: str, motion_mode: str, degree: 
                 "--seed", "12345",
                 "--gpu", f"{gpu_id}"],
                 check=True, capture_output=True, text=True, encoding='utf-8')
+        elif method == "invstitch":
+            result = subprocess.run(["python", "src/generate_invstitch.py",
+                "--input_folder", f"{input_root}/{scene}",
+                "--invert_depth",
+                "--output_folder", f"{output_root}/{scene}/{motion_mode}_{degree}/generated",
+                "--trajectory_folder", f"{output_root}/{scene}/{motion_mode}_{degree}/warped",
+                "--num_frames", f"{NUM_FRAMES}",
+                "--outpaint_frame_interval", "5",
+                "--seed", "12345",
+                "--gpu", f"{gpu_id}"],
+                check=True, capture_output=True, text=True, encoding='utf-8')
         else:
             raise NotImplementedError(f"Method '{method}' is not implemented.")
         print(f"COMPLETED task: {task_id}\nSTDOUT:\n{result.stdout.strip()}")
@@ -259,7 +270,7 @@ def run_generation_task(output_root: str, scene: str, motion_mode: str, degree: 
     return msg
 
 
-def run_pixelwise_metrics_calculation(output_root: str, allow_resize: bool = False):
+def run_pixelwise_metrics_calculation(output_root: str, allow_resize: bool = False, allow_missing_frames: bool = False):
     PSNR_MODULES = {i: PeakSignalNoiseRatio(data_range=1.0).eval().to(f"cuda:{i}") for i in GPUS}
     LPIPS_MODULES = {i: lpips.LPIPS(net='alex', spatial=True).eval().to(f"cuda:{i}") for i in GPUS}
 
@@ -273,9 +284,17 @@ def run_pixelwise_metrics_calculation(output_root: str, allow_resize: bool = Fal
         device = f"cuda:{gpu_id}"
 
         # load warped frames and generated frames
-        mask_frames = [load_image(os.path.join(data_dir, "warped", f"{i:04d}_mask.png")) for i in range(NUM_FRAMES)]
-        warped_frames = [load_image(os.path.join(data_dir, "warped", f"{i:04d}.png")) for i in range(NUM_FRAMES)]
-        generated_frames = [load_image(os.path.join(data_dir, "generated", f"{i:04d}.png")) for i in range(NUM_FRAMES)]
+        generated_frame_paths = sorted(glob.glob(os.path.join(data_dir, "generated", "*.png")))
+        valid_frame_ids = [int(os.path.basename(x).split(".")[0]) for x in generated_frame_paths]
+        mask_frame_paths = [os.path.join(data_dir, "warped", f"{i:04d}_mask.png") for i in valid_frame_ids]
+        warped_frame_paths = [os.path.join(data_dir, "warped", f"{i:04d}.png") for i in valid_frame_ids]
+
+        if not allow_missing_frames:
+            assert len(mask_frame_paths) == len(warped_frame_paths) == len(generated_frame_paths) == NUM_FRAMES
+
+        generated_frames = [load_image(x) for x in generated_frame_paths]
+        mask_frames = [load_image(x) for x in mask_frame_paths]
+        warped_frames = [load_image(x) for x in warped_frame_paths]
 
         # batchfy the frames
         mask_tensor = torch.stack([torch.from_numpy(np.array(x).astype(np.float32) / 255.0).permute(2, 0, 1) for x in mask_frames], dim=0).to(device)
@@ -498,13 +517,13 @@ def run_camera_pose_error_calculation(output_root: str, gt_focal_len: float = 26
 
         # Load the generated frames
         image_names = sorted(glob.glob(os.path.join(data_dir, f"generated/0*.png")))
-        num_frames = len(image_names)
+        image_ids = [int(os.path.basename(x).split(".")[0]) for x in image_names]
 
         # Load the gt image size
         gt_width, gt_height = imagesize.get(os.path.join(data_dir, f"warped/0000.png"))
 
         # Load the camera poses
-        gt_poses_w2c = [np.load(os.path.join(data_dir, f"warped/{i:04d}_pose.npy")) for i in range(num_frames)]
+        gt_poses_w2c = [np.load(os.path.join(data_dir, f"warped/{i:04d}_pose.npy")) for i in image_ids]
         gt_poses_c2w = [np.linalg.inv(p) for p in gt_poses_w2c]
         gt_K = np.array([
             [gt_focal_len, 0, gt_width/2],
@@ -520,8 +539,8 @@ def run_camera_pose_error_calculation(output_root: str, gt_focal_len: float = 26
         missing_estimated_poses_ids = [i for (i, pose) in enumerate(estimated_poses_c2w) if pose is None]
         estimated_poses_c2w = [pose for (i, pose) in enumerate(estimated_poses_c2w) if i not in missing_estimated_poses_ids]
         gt_poses_c2w = [pose for (i, pose) in enumerate(gt_poses_c2w) if i not in missing_estimated_poses_ids]
-        if len(estimated_K) == num_frames:
-            estimated_K = np.array([estimated_K[i] for i in range(num_frames) if i not in missing_estimated_poses_ids])
+        if len(estimated_K.shape) == 3:  # (N, 3, 3)
+            estimated_K = np.array([estimated_K[i] for i in range(len(estimated_K)) if i not in missing_estimated_poses_ids])
 
         # Compute errors
         if estimated_poses_c2w:
@@ -756,7 +775,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Image-to-Video Evaluation")
     parser.add_argument("dataset", type=str, choices=["davis", "mannequin", "tanks"], help="Dataset to use for evaluation.")
     parser.add_argument("--scratch", action="store_true", help="If set, all the images, depth, and trajectories are re-organized and re-generated.")
-    parser.add_argument("--method", type=str, default="mine", choices=["mine", "nvssolver", "trajattn", "trajcrafter", "das"], help="Method to use for generation. 'nvssolver' uses NVS-Solver, 'trajattn' uses Trajectory Attention, and 'das' uses DiffusionAsShader.")
+    parser.add_argument("--method", type=str, default="mine", choices=["mine", "nvssolver", "trajattn", "trajcrafter", "das", "invstitch"], help="Method to use for generation. 'nvssolver' uses NVS-Solver, 'trajattn' uses Trajectory Attention, and 'das' uses DiffusionAsShader.")
     parser.add_argument("--use_mesh", action="store_true", help="If set, use mesh for trajectory extraction.")
     args = parser.parse_args()
 
@@ -839,7 +858,7 @@ if __name__ == '__main__':
             future_to_task_info = {}
             for scene, motion, degree in scene_motion_degree_pairs:
                 gpu_id_for_task = GPUS[job_idx_for_gpu_assignment % len(GPUS)]
-                future = executor.submit(run_generation_task, output_root, scene, motion, degree, gpu_id_for_task, args.method)
+                future = executor.submit(run_generation_task, input_root, output_root, scene, motion, degree, gpu_id_for_task, args.method)
                 future_to_task_info[future] = (scene, motion, degree, gpu_id_for_task)
                 job_idx_for_gpu_assignment += 1 # This ensures round-robin submission to GPUs
 
@@ -855,30 +874,38 @@ if __name__ == '__main__':
                     raise exc
 
         # 4. Pixelwise metrics calculation
-        pixelwise_results, _ = run_pixelwise_metrics_calculation(output_root, allow_resize=(args.method in ["trajcrafter", "das"]))
+        pixelwise_results, _ = run_pixelwise_metrics_calculation(
+            output_root,
+            allow_resize=(args.method in ["trajcrafter", "das"]),
+            allow_missing_frames=(args.method == "invstitch"),
+        )
         with open(os.path.join(output_root, "pixelwise_results.txt"), "w") as f:
             json.dump(pixelwise_results, f, indent=4)
 
-        # 5. FID/FVD calculation
+        # 5. Camera pose error calculation
+        camera_pose_results, _ = run_camera_pose_error_calculation(output_root)
+        with open(os.path.join(output_root, "camera_pose_results.txt"), "w") as f:
+            json.dump(camera_pose_results, f, indent=4)
+
+        # 6-1. FID/KID calculation
         fid_score, kid_score = run_fid_kid_calculation(
             data_root=data_root,
             output_root=output_root,
         )
+        with open(os.path.join(output_root, "fid_fvd.txt"), "w") as f:
+            f.write(f"FID: {fid_score}\nKDI: {kid_score}")
+
+        if args.method == "invstitch":
+            print("InvStitch skips FVD and SED/MEt3R calculation.")
+            exit()
+
+        # 6-2. FVD calculation
         fvd_videogpt, fvd_stylegan = run_fvd_calculation(
             data_root=data_root,
             output_root=output_root,
         )
-        with open(os.path.join(output_root, "fid_fvd.txt"), "w") as f:
-            f.write("FID: " + str(fid_score) + \
-                    "\nKID: " + str(kid_score) + \
-                    "\nFVD (VideoGPT): " + str(fvd_videogpt) + \
-                    "\nFVD (StyleGAN): " + str(fvd_stylegan) + \
-                    "\n")
-
-        # 6. Camera pose error calculation
-        camera_pose_results, _ = run_camera_pose_error_calculation(output_root)
-        with open(os.path.join(output_root, "camera_pose_results.txt"), "w") as f:
-            json.dump(camera_pose_results, f, indent=4)
+        with open(os.path.join(output_root, "fid_fvd.txt"), "a") as f:
+            f.write(f"FVD (VideoGPT): {fvd_videogpt}\nFVD (StyleGAN): {fvd_stylegan}")
 
         # 7. SED calculation
         sed_results = run_sed_calculation(output_root)

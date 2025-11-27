@@ -149,7 +149,7 @@ def organize_videos_and_depth(data_root: str, input_root: str, output_root: str)
     for vidpath in glob.glob(os.path.join(input_root, "*.mkv")):
         vidname = os.path.basename(vidpath).split(".")[0]
         image_folder_path = os.path.join(input_root, vidname, "images")
-        depth_folder_path = os.path.join(input_root, vidname, "depth")
+        depth_folder_path = os.path.join(input_root, vidname, "depths")
         os.makedirs(image_folder_path)
         os.makedirs(depth_folder_path)
         shutil.move(os.path.join(output_root, vidname + "_depths.npz"), depth_folder_path)
@@ -178,7 +178,7 @@ def run_trajectory_extraction(
     try:
         result = subprocess.run(["python", "src/trajectory_extraction.py",
             "--image_folder", f"{input_root}/{scene}/images/",
-            "--depth_folder", f"{input_root}/{scene}/depth/",
+            "--depth_folder", f"{input_root}/{scene}/depths/",
             "--output_folder", f"{output_root}/{scene}/{motion_mode}_{degree}/warped",
             "--depth_format", "npz",
             "--invert_depth",

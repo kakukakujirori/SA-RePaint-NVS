@@ -442,10 +442,8 @@ def run_pixelwise_metrics_calculation(input_root: str, output_root: str, allow_r
         # align shapes (generated tensor may be smaller than warped_tensor)
         if allow_resize:
             print(f"[run_pixelwise_metrics_calculation] WARNING: Resizing input videos to match the generated video shapes.")
-            _, _, h_generated, w_generated = generated_tensor.shape
-            gt_tensor = F.interpolate(gt_tensor, (h_generated, w_generated), mode="bilinear")
-            mask_tensor = F.interpolate(mask_tensor, (h_generated, w_generated), mode="area")
-            warped_tensor = F.interpolate(warped_tensor, (h_generated, w_generated), mode="bilinear")
+            _, _, h_gt, w_gt = gt_tensor.shape
+            generated_tensor = F.interpolate(generated_tensor, (h_gt, w_gt), mode="bicubic")
 
         # binarize the mask
         mask_tensor_bool = mask_tensor < 0.5
@@ -487,7 +485,7 @@ def run_pixelwise_metrics_calculation(input_root: str, output_root: str, allow_r
             results["lpips_with_gt_on_mask"] = lpips_score.item()
 
             lpips_full = LPIPS(gt_tensor * 2 - 1, generated_tensor * 2 - 1)
-            lpips_score = torch.sum(lpips_full * mask_tensor_float) / torch.sum(mask_tensor_float)
+            lpips_score = torch.mean(lpips_full)
             results["lpips_with_gt_full"] = lpips_score.item()
 
         total_results[out_data_dir] = results
@@ -1071,7 +1069,7 @@ if __name__ == '__main__':
             output_root=output_root,
         )
         with open(os.path.join(output_root, "fid_fvd.txt"), "a") as f:
-            f.write(f"FVD (VideoGPT): {fvd_videogpt}\nFVD (StyleGAN): {fvd_stylegan}")
+            f.write(f"\nFVD (VideoGPT): {fvd_videogpt}\nFVD (StyleGAN): {fvd_stylegan}")
 
         # 7. SED calculation
         sed_results = run_sed_calculation(output_root)

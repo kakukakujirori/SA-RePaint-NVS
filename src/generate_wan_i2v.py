@@ -745,7 +745,7 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                     timestep = temp_ts.unsqueeze(0).expand(latents.shape[0], -1)
 
                     # Attention weighting
-                    base_weight = min(1, 0.8 + i / self._num_timesteps)
+                    base_weight = min(1, 0.0 + i * 8 / self._num_timesteps)  # TODO: MAGIC NUMBER!!!
                     weight_map = (1 - condition_mask) * (1 - base_weight) + base_weight
 
                     # SEG

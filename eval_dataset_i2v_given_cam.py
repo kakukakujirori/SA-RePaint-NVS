@@ -612,7 +612,7 @@ def run_fvd_calculation(data_root: str, output_root: str):
     for scene_imgname in os.listdir(output_root):
         if not os.path.isdir(os.path.join(output_root, scene_imgname)):
             continue
-        scene, imgname = scene_imgname.split("_")
+        scene, imgname = scene_imgname.split("_", maxsplit=1)
         if scene not in start_frames_per_scene:
             start_frames_per_scene[scene] = []
         start_frames_per_scene[scene].append(imgname)
@@ -952,7 +952,7 @@ def run_met3r_calculation(output_root: str, process_size: int = 256, resize_mode
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Image-to-Video Evaluation")
-    parser.add_argument("dataset", type=str, choices=["mannequin"], help="Dataset to use for evaluation.")
+    parser.add_argument("dataset", type=str, choices=["mannequin", "dl3dv_half"], help="Dataset to use for evaluation.")
     parser.add_argument("--scratch", action="store_true", help="If set, all the images, depth, and trajectories are re-organized and re-generated.")
     parser.add_argument("--method", type=str, default="mine", choices=["mine", "nvssolver", "trajattn", "trajcrafter", "das", "invstitch"], help="Method to use for generation. 'nvssolver' uses NVS-Solver, 'trajattn' uses Trajectory Attention, and 'das' uses DiffusionAsShader.")
     parser.add_argument("--use_mesh", action="store_true", help="If set, use mesh for trajectory extraction.")
@@ -963,6 +963,32 @@ if __name__ == '__main__':
         data_root = "/mnt/data/MannequinChallengeHQ/validation_frames"
         input_root = "./mannequin_challenge_input_given_cam"
         output_root = "./mannequin_challenge_output_given_cam"
+    elif args.dataset == "dl3dv_half":
+        original_data_root = "/disk2/DL3DV-Evaluation/images"
+        input_root = "./dl3dv_half_input_given_cam"
+        output_root = "./dl3dv_half_output_given_cam"
+
+        # create tmp data folder
+        data_root = "/tmp/dl3dv_half"
+
+        if args.scratch or not os.path.isdir(data_root):
+            if os.path.isdir(data_root):
+                shutil.rmtree(data_root)
+            os.makedirs(data_root)
+
+            for idx, scene in enumerate(tqdm(sorted(os.listdir(original_data_root)), desc="Copying DL3DV scenes")):
+                scene_path = os.path.join(original_data_root, scene)
+                assert os.path.isdir(scene_path), f"Scene path {scene_path} is not a directory."
+
+                if idx % 2 == 1: continue  # reduce the data amount by half
+
+                # copy images
+                src_scene_path = os.path.join(original_data_root, scene, scene, "gaussian_splat/images_4")
+                dst_scene_path = os.path.join(data_root, scene)
+                os.makedirs(dst_scene_path, exist_ok=True)
+                for imgpath in glob.glob(os.path.join(src_scene_path, "*.png")):
+                    Image.open(imgpath).save(os.path.join(dst_scene_path, os.path.basename(imgpath).replace(".png", ".jpg")), "JPEG")
+
     else:
         raise NotImplementedError(f"Dataset '{args.dataset}' is not implemented.")
 

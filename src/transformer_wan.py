@@ -829,7 +829,8 @@ class MyWanTransformer3DModel(WanTransformer3DModel):
                 # attention_mask = torch.where(attention_mask > 0.5, kv_weight_min - 1.0, 0.0).to(query.dtype)
                 # attention_mask = rearrange(attention_mask, "l s -> () () l s")
 
-                attention_mask = rearrange(kv_weight_reshaped > 0.0, "b l () () -> b () () l")
+                attention_mask = rearrange(kv_weight_reshaped.to(query.dtype), "b l () () -> b () () l") > 0.0
+
 
             if query_blur_sigma is not None:
                 chans = query.shape[-1]

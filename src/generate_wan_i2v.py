@@ -31,12 +31,13 @@ from transformers import AutoProcessor, AutoTokenizer, Blip2ForConditionalGenera
 from diffusers.callbacks import MultiPipelineCallbacks, PipelineCallback
 from diffusers.image_processor import PipelineImageInput
 from diffusers.loaders import WanLoraLoaderMixin
-from diffusers.models import AutoencoderKLWan, WanTransformer3DModel
+# from diffusers.models import AutoencoderKLWan, WanTransformer3DModel
 from diffusers.utils import BaseOutput, logging, export_to_video, is_ftfy_available, is_torch_xla_available
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 
+from autoencoder_kl_wan import AutoencoderKLWan
 from covariance import guided_blur_2D, local_covariance_2D, local_covariance_3D, safe_division_3D
 from gpu_memory_monitor import GPUMemoryMonitor
 from scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
@@ -186,13 +187,13 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
             the
             [clip-vit-huge-patch14](https://github.com/mlfoundations/open_clip/blob/main/docs/PRETRAINED.md#vit-h14-xlm-roberta-large)
             variant.
-        transformer ([`WanTransformer3DModel`]):
+        transformer ([`MyWanTransformer3DModel`]):
             Conditional Transformer to denoise the input latents.
         scheduler ([`UniPCMultistepScheduler`]):
             A scheduler to be used in combination with `transformer` to denoise the encoded image latents.
         vae ([`AutoencoderKLWan`]):
             Variational Auto-Encoder (VAE) Model to encode and decode videos to and from latent representations.
-        transformer_2 ([`WanTransformer3DModel`], *optional*):
+        transformer_2 ([`MyWanTransformer3DModel`], *optional*):
             Conditional Transformer to denoise the input latents during the low-noise stage. In two-stage denoising,
             `transformer` handles high-noise stages and `transformer_2` handles low-noise stages. If not provided, only
             `transformer` is used.
@@ -210,8 +211,8 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         scheduler: FlowMatchEulerDiscreteScheduler,
         image_processor: CLIPImageProcessor = None,
         image_encoder: CLIPVisionModel = None,
-        transformer: WanTransformer3DModel = None,
-        transformer_2: WanTransformer3DModel = None,
+        transformer: MyWanTransformer3DModel = None,
+        transformer_2: MyWanTransformer3DModel = None,
     ):
         super().__init__()
 
@@ -736,20 +737,7 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                 for j in range(repaint_iter_num):
                     latents_ori = rearrange(latents, "b c f h w -> b f c h w").float()
 
-                    from kornia.filters import gaussian_blur2d
-                    if i < self._num_timesteps * 1. // 5:
-                        condition_blurred = rearrange(
-                            gaussian_blur2d(
-                                rearrange(condition, "b c f h w -> (b f) c h w"),
-                                (3, 3),
-                                (0.5, 0.5)
-                            ),
-                            "(b f) c h w -> b c f h w", b=condition.shape[0],
-                        )
-                    else:
-                        condition_blurred = condition
-
-                    latent_model_input = (1 - first_frame_mask) * condition_blurred + first_frame_mask * latents
+                    latent_model_input = (1 - first_frame_mask) * condition + first_frame_mask * latents
                     latent_model_input = latent_model_input.to(transformer_dtype)
 
                     # seq_len: num_latent_frames * (latent_height // patch_size) * (latent_width // patch_size)
@@ -760,13 +748,6 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                     # Attention weighting
                     base_weight = max(0.0, min(1.0, i * 8 / self._num_timesteps))  # TODO: MAGIC NUMBER!!!
                     weight_map = (1 - condition_mask) * (1 - base_weight) + base_weight
-
-                    # SEG
-                    # query_blur_sigma_invalid_max = 2  # TODO: MAGIC NUMBER!!!
-                    # query_blur_sigma_invalid_min = 2  # TODO: MAGIC NUMBER!!!
-                    # query_blur_sigma_invalid = query_blur_sigma_invalid_min + (query_blur_sigma_invalid_max - query_blur_sigma_invalid_min) * i / self._num_timesteps
-                    # query_blur_sigma_valid = 4  # TODO: MAGIC NUMBER!!!
-                    # query_blur_sigma = (1 - condition_mask) * query_blur_sigma_valid + condition_mask * query_blur_sigma_invalid
 
                     with self.transformer.cache_context("cond"):
                         self.transformer.latent_shape_ = latents.shape[-3:]
@@ -784,7 +765,7 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                         # retrieve qk
                         attn_query = self.transformer.record_query_[0]
                         attn_key = self.transformer.record_key_[0]
-                        attn_value = self.transformer.record_value_[0]
+                        # attn_value = self.transformer.record_value_[0]
                         # os.makedirs("dump", exist_ok=True)
                         # torch.save(attn_query, f"dump/query_{i}_{j}_{0}.pt")
                         # torch.save(attn_key, f"dump/key_{i}_{j}_{0}.pt")
@@ -792,34 +773,18 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
 
                     # perform guidance
                     if self.do_classifier_free_guidance:
-                        use_seg = False #i % 3 == 0
-
-                        if use_seg:
-                            with self.transformer.cache_context("uncond"):
-                                self.transformer.latent_shape_ = latents.shape[-3:]
-                                self.transformer.inject(weight_map, query_blur_sigma=query_blur_sigma)
-                                noise_uncond = self.transformer(
-                                    hidden_states=latent_model_input,
-                                    timestep=timestep,
-                                    encoder_hidden_states=prompt_embeds,
-                                    encoder_hidden_states_image=image_embeds,
-                                    attention_kwargs=attention_kwargs,
-                                    return_dict=False,
-                                    record_attention=False,
-                                )[0]
-                        else:
-                            with self.transformer.cache_context("uncond"):
-                                self.transformer.latent_shape_ = latents.shape[-3:]
-                                self.transformer.inject(weight_map)
-                                noise_uncond = self.transformer(
-                                    hidden_states=latent_model_input,
-                                    timestep=timestep,
-                                    encoder_hidden_states=negative_prompt_embeds,
-                                    encoder_hidden_states_image=image_embeds,
-                                    attention_kwargs=attention_kwargs,
-                                    return_dict=False,
-                                    record_attention=False,
-                                )[0]
+                        with self.transformer.cache_context("uncond"):
+                            self.transformer.latent_shape_ = latents.shape[-3:]
+                            self.transformer.inject(weight_map)
+                            noise_uncond = self.transformer(
+                                hidden_states=latent_model_input,
+                                timestep=timestep,
+                                encoder_hidden_states=negative_prompt_embeds,
+                                encoder_hidden_states_image=image_embeds,
+                                attention_kwargs=attention_kwargs,
+                                return_dict=False,
+                                record_attention=False,
+                            )[0]
 
                         noise_pred = noise_uncond + guidance_scale * (noise_pred - noise_uncond)
 

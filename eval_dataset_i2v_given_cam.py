@@ -795,6 +795,7 @@ def run_sed_calculation(output_root: str):
                 gt_width=gt_width,
                 gt_height=gt_height,
                 gt_focal_len=gt_focal_len,
+                sed_thresholds=(0.0, 10.0),
                 save_sed_graph_to=None,
                 gpu_id=gpu_id,
             )

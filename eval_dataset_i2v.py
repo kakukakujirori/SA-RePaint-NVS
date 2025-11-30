@@ -193,6 +193,16 @@ def run_generation_task(output_root: str, scene: str, motion_mode: str, degree: 
                 "--seed", "12345",
                 "--gpu", f"{gpu_id}"],
                 check=True, capture_output=True, text=True, encoding='utf-8')
+        elif method == "wan":
+            result = subprocess.run(["python", "src/generate_wan_i2v.py",
+                "--output_folder", f"{output_root}/{scene}/{motion_mode}_{degree}/generated",
+                "--trajectory_folder", f"{output_root}/{scene}/{motion_mode}_{degree}/warped",
+                "--num_frames", f"{NUM_FRAMES}",
+                "--num_inference_steps", f"{NUM_INFERECE_STEPS}",
+                "--repaint_iter_num", f"{REPAINT_ITER_NUM}",
+                "--seed", "12345",
+                "--gpu", f"{gpu_id}"],
+                check=True, capture_output=True, text=True, encoding='utf-8')
         elif method == "nvssolver":
             result = subprocess.run(["python", "src/generate_nvssolver.py",
                 "--output_folder", f"{output_root}/{scene}/{motion_mode}_{degree}/generated",
@@ -756,7 +766,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Image-to-Video Evaluation")
     parser.add_argument("dataset", type=str, choices=["davis", "mannequin", "tanks"], help="Dataset to use for evaluation.")
     parser.add_argument("--scratch", action="store_true", help="If set, all the images, depth, and trajectories are re-organized and re-generated.")
-    parser.add_argument("--method", type=str, default="mine", choices=["mine", "nvssolver", "trajattn", "trajcrafter", "das"], help="Method to use for generation. 'nvssolver' uses NVS-Solver, 'trajattn' uses Trajectory Attention, and 'das' uses DiffusionAsShader.")
+    parser.add_argument("--method", type=str, default="mine", choices=["mine", "wan", "nvssolver", "trajattn", "trajcrafter", "das"], help="Method to use for generation. 'nvssolver' uses NVS-Solver, 'trajattn' uses Trajectory Attention, and 'das' uses DiffusionAsShader.")
     parser.add_argument("--use_mesh", action="store_true", help="If set, use mesh for trajectory extraction.")
     args = parser.parse_args()
 
@@ -855,7 +865,10 @@ if __name__ == '__main__':
                     raise exc
 
         # 4. Pixelwise metrics calculation
-        pixelwise_results, _ = run_pixelwise_metrics_calculation(output_root, allow_resize=(args.method in ["trajcrafter", "das"]))
+        pixelwise_results, _ = run_pixelwise_metrics_calculation(
+            output_root,
+            allow_resize=(args.method in ["trajcrafter", "das", "wan"]),
+        )
         with open(os.path.join(output_root, "pixelwise_results.txt"), "w") as f:
             json.dump(pixelwise_results, f, indent=4)
 

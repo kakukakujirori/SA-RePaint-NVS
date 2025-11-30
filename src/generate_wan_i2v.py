@@ -705,18 +705,18 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         warped_masks = (warped_masks > 0).float() # [-1, 1] -> {0, 1}
 
         latents_outputs = self.prepare_latents(
-            warped_images,
-            warped_masks,
-            batch_size * num_videos_per_prompt,
-            num_channels_latents,
-            height,
-            width,
-            num_frames,
-            torch.float32,
-            device,
-            generator,
-            latents,
-            denoise_start_step
+            warped_images=warped_images,
+            warped_masks=warped_masks,
+            batch_size=batch_size * num_videos_per_prompt,
+            num_channels_latents=num_channels_latents,
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            dtype=torch.float32,
+            device=device,
+            generator=generator,
+            latents=latents,
+            denoise_start_step=denoise_start_step
         )
         latents, condition, condition_mask = latents_outputs
         first_frame_mask = torch.ones_like(condition_mask)
@@ -736,7 +736,20 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                 for j in range(repaint_iter_num):
                     latents_ori = rearrange(latents, "b c f h w -> b f c h w").float()
 
-                    latent_model_input = (1 - first_frame_mask) * condition + first_frame_mask * latents
+                    from kornia.filters import gaussian_blur2d
+                    if i < self._num_timesteps * 1. // 5:
+                        condition_blurred = rearrange(
+                            gaussian_blur2d(
+                                rearrange(condition, "b c f h w -> (b f) c h w"),
+                                (3, 3),
+                                (0.5, 0.5)
+                            ),
+                            "(b f) c h w -> b c f h w", b=condition.shape[0],
+                        )
+                    else:
+                        condition_blurred = condition
+
+                    latent_model_input = (1 - first_frame_mask) * condition_blurred + first_frame_mask * latents
                     latent_model_input = latent_model_input.to(transformer_dtype)
 
                     # seq_len: num_latent_frames * (latent_height // patch_size) * (latent_width // patch_size)
@@ -745,7 +758,7 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                     timestep = temp_ts.unsqueeze(0).expand(latents.shape[0], -1)
 
                     # Attention weighting
-                    base_weight = min(1, 0.0 + i * 8 / self._num_timesteps)  # TODO: MAGIC NUMBER!!!
+                    base_weight = max(0.0, min(1.0, i * 8 / self._num_timesteps))  # TODO: MAGIC NUMBER!!!
                     weight_map = (1 - condition_mask) * (1 - base_weight) + base_weight
 
                     # SEG
@@ -772,10 +785,10 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                         attn_query = self.transformer.record_query_[0]
                         attn_key = self.transformer.record_key_[0]
                         attn_value = self.transformer.record_value_[0]
-                        os.makedirs("dump", exist_ok=True)
-                        torch.save(attn_query, f"dump/query_{i}_{j}_{0}.pt")
-                        torch.save(attn_key, f"dump/key_{i}_{j}_{0}.pt")
-                        torch.save(attn_value, f"dump/value_{i}_{j}_{0}.pt")
+                        # os.makedirs("dump", exist_ok=True)
+                        # torch.save(attn_query, f"dump/query_{i}_{j}_{0}.pt")
+                        # torch.save(attn_key, f"dump/key_{i}_{j}_{0}.pt")
+                        # torch.save(attn_value, f"dump/value_{i}_{j}_{0}.pt")
 
                     # perform guidance
                     if self.do_classifier_free_guidance:
@@ -820,8 +833,8 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                         print(f"SKIP SA-REPAINT!!! {i=}, {j=}")
                         break
 
-                    os.makedirs("dump", exist_ok=True)
-                    torch.save(pseudo_x0, f"dump/pseudo_x0_ori_{i}_{j}.pt")
+                    # os.makedirs("dump", exist_ok=True)
+                    # torch.save(pseudo_x0, f"dump/pseudo_x0_ori_{i}_{j}.pt")
 
                     # alignment
                     if i < self._num_timesteps * 1 // 5:
@@ -890,8 +903,8 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                             var_derivative = guided_blur_2D(var_data, var_derivative)
                             cov_pseudo_x0_derivative = guided_blur_2D(var_data, cov_pseudo_x0_derivative)
 
-                            coeff_A = var_derivative - identity
-                            coeff_B = cov_pseudo_x0_derivative
+                            coeff_A = var_derivative - var_data - identity
+                            coeff_B = cov_pseudo_x0_derivative + var_data
                             coeff_C = var_pseudo_x0 - var_data
 
                             # check two roots
@@ -1072,7 +1085,7 @@ if __name__ == '__main__':
     transformer = MyWanTransformer3DModel.from_pretrained(model_id, subfolder="transformer", torch_dtype=torch.bfloat16)
     pipe = WanImageToVideoPipeline.from_pretrained(model_id, vae=vae, transformer=transformer, torch_dtype=torch.bfloat16)
     pipe.scheduler = FlowMatchEulerDiscreteScheduler.from_config(pipe.scheduler.config)
-    pipe.to(device)
+    pipe.enable_model_cpu_offload(device=device)
 
     # load captioner
     blip_path = "Salesforce/blip2-opt-2.7b"
@@ -1110,13 +1123,13 @@ if __name__ == '__main__':
         denoise_start_step=args.denoise_start_step,
         repaint_iter_num=args.repaint_iter_num,
         prompt=prompt,
-        negative_prompt="Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards",
+        negative_prompt="Bright tones, overexposed, blurred details, subtitles, style, works, paintings, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, messy background, three legs, many people in the background, walking backwards",
         height=704,
         width=1280,
         num_frames=args.num_frames,
         guidance_scale=args.guidance_scale,
         num_inference_steps=args.num_inference_steps,
-        generator=torch.manual_seed(args.seed),
+        generator=torch.Generator(device).manual_seed(args.seed),
     ).frames[0]
 
     # monitor.stop()

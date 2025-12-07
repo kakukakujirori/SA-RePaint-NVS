@@ -34,12 +34,12 @@ fi
 
 # depth estimation
 ffmpeg -y -framerate 10 -i "${IMAGE_DIR}/%04d.png" -c:v ffv1 -g 1 "data/${ITEM}/${ITEM}.mkv"
-rm -rf "data/${ITEM}/depth"
+rm -rf "data/${ITEM}/depths"
 echo "Running Video Depth Anything..."
 python tools/Video-Depth-Anything/run.py \
   --encoder vitl \
   --input_video "data/${ITEM}/${ITEM}.mkv"  \
-  --output_dir "data/${ITEM}/depth" \
+  --output_dir "data/${ITEM}/depths" \
   --save_npz
 
 rm "data/${ITEM}/${ITEM}.mkv"
@@ -48,7 +48,7 @@ rm "data/${ITEM}/${ITEM}.mkv"
 echo "Running Trajectory Extraction..."
 python src/trajectory_extraction.py \
   --image_folder "data/${ITEM}/images/" \
-  --depth_folder "data/${ITEM}/depth/" \
+  --depth_folder "data/${ITEM}/depths/" \
   --output_folder "output/${ITEM}/${CAMERA_MOTION_MODE}_${DEGREE}/warped" \
   --depth_format npz \
   --invert_depth \
@@ -63,7 +63,7 @@ python src/trajectory_extraction.py \
   --use_mesh
 
 # generaiton
-python src/generate.py \
+python src/generate_faithful_svd.py \
   --output_folder "output/${ITEM}/${CAMERA_MOTION_MODE}_${DEGREE}/generated" \
   --trajectory_folder "output/${ITEM}/${CAMERA_MOTION_MODE}_${DEGREE}/warped" \
   --num_frames ${NUM_FRAMES} \

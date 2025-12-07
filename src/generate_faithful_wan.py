@@ -189,7 +189,7 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
             variant.
         transformer ([`MyWanTransformer3DModel`]):
             Conditional Transformer to denoise the input latents.
-        scheduler ([`UniPCMultistepScheduler`]):
+        scheduler ([`FlowMatchEulerDiscreteScheduler`]):
             A scheduler to be used in combination with `transformer` to denoise the encoded image latents.
         vae ([`AutoencoderKLWan`]):
             Variational Auto-Encoder (VAE) Model to encode and decode videos to and from latent representations.

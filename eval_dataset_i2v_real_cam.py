@@ -954,18 +954,19 @@ def run_met3r_calculation(output_root: str, process_size: int = 256, resize_mode
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Image-to-Video Evaluation")
     parser.add_argument("dataset", type=str, choices=["mannequin", "dl3dv_half"], help="Dataset to use for evaluation.")
-    parser.add_argument("--scratch", action="store_true", help="If set, all the images, depth, and trajectories are re-organized and re-generated.")
+    parser.add_argument("--data_root", type=str, default="/mnt/data/", help="Root directory of the datasets.")
     parser.add_argument("--method", type=str, default="mine", choices=["mine", "nvssolver", "trajattn", "trajcrafter", "das", "invstitch"], help="Method to use for generation. 'nvssolver' uses NVS-Solver, 'trajattn' uses Trajectory Attention, and 'das' uses DiffusionAsShader.")
     parser.add_argument("--use_mesh", action="store_true", help="If set, use mesh for trajectory extraction.")
+    parser.add_argument("--scratch", action="store_true", help="If set, all the images, depth, and trajectories are re-organized and re-generated.")
     args = parser.parse_args()
 
     # 0. Set up paths
     if args.dataset == "mannequin":
-        data_root = "/mnt/data/MannequinChallengeHQ/validation_frames"
+        data_root = os.path.join(args.data_root, "MannequinChallengeHQ/validation_frames")
         input_root = "./mannequin_challenge_input_given_cam"
         output_root = "./mannequin_challenge_output_given_cam"
     elif args.dataset == "dl3dv_half":
-        original_data_root = "/disk2/DL3DV-Evaluation/images"
+        original_data_root = os.path.join(args.data_root, "DL3DV-Evaluation/images")
         input_root = "./dl3dv_half_input_given_cam"
         output_root = "./dl3dv_half_output_given_cam"
 
@@ -1084,7 +1085,7 @@ if __name__ == '__main__':
             output_root=output_root,
         )
         with open(os.path.join(output_root, "fid_fvd.txt"), "w") as f:
-            f.write(f"FID: {fid_score}\nKDI: {kid_score}")
+            f.write(f"FID: {fid_score}\nKID: {kid_score}")
 
         if args.method == "invstitch":
             print("InvStitch skips FVD and SED/MEt3R calculation.")

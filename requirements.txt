@@ -6,6 +6,7 @@ dotdict
 easydict
 einops
 evo
+ftfy
 hydra-core
 imageio[ffmpeg]
 imagesize
@@ -13,6 +14,7 @@ jaxtyping
 kornia
 lovely_tensors
 lpips
+moviepy==1.0.3  # required for DaS and DA3
 numba
 opencv-python
 OpenEXR
@@ -29,4 +31,3 @@ viser
 wandb
 -e ./tools/utils3d
 ./tools/FVD/fvdcal-1.0-py3-none-any.whl
-git+https://github.com/mohammadasim98/met3r

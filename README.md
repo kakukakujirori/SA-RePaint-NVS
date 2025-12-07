@@ -5,12 +5,12 @@
 
 ## Installation
 
-1. Create a conda environment
+1. Create a conda environment (MAKE SURE to install xformers here)
     ```bash
     conda create -n myenv python=3.12
     conda activate myenv
-    # conda install conda-forge::imagemagick  # If imagemagick is not installed
-    # conda install conda-forge::ffmpeg       # If ffmpeg is not installed
+    conda install conda-forge::imagemagick
+    conda install conda-forge::ffmpeg
     pip3 install torch torchvision xformers --index-url https://download.pytorch.org/whl/cu126
     ```
 
@@ -20,7 +20,6 @@
     cd My-NVS-Solver
     bash patch/apply_patch.sh  # apply patch to submodules
     pip3 install -r requirements.txt
-    # pip3 install --no-build-isolation -e ./tools/vipe  # used only for video-to-video evaluation
     ```
 
 3. Download model weights
@@ -56,10 +55,24 @@ You will find the results in the ```output``` folder.
 
 ## Evaluation
 
-We assume the following data structure:
+### Preparation
+
+Make sure you have [colmap](https://colmap.github.io/install.html) and [glomap](https://github.com/colmap/glomap) installed in your environment.
+
+You also need to install additional dependencies:
+```bash
+conda activate my_env
+pip3 install git+https://github.com/ByteDance-Seed/Depth-Anything-3.git
+pip3 install --no-build-isolation git+https://github.com/mohammadasim98/met3r
+pip3 install --no-build-isolation git+https://github.com/nv-tlabs/vipe.git
+```
+
+### Directory Structure
+
+Download the respective datasets. We assume the following data structure:
 
 ```bash
-$(data_root)
+$(DATA_ROOT)
 ├── DAVIS
 │   ├── Annotations
 │   │   └── Full-Resolution
@@ -68,6 +81,12 @@ $(data_root)
 │   │   └── 2017
 │   └── JPEGImages
 │       └── Full-Resolution
+│
+├── TanksAndTemples
+│   ├── Auditorium
+│   ├── Ballroom
+│   └── ......
+│
 ├── MannequinChallenge
 │   ├── test
 │   ├── train
@@ -75,25 +94,28 @@ $(data_root)
 │       ├── 00c9878266685887.txt
 │       ├── 0370e2174d04548b.txt
 │       └── ......
-└── TanksAndTemples
-    ├── Auditorium
-    ├── Ballroom
+│
+└── DL3DV-Evaluation
+    ├── images
+    │       ├── 02267...bb1be/
+    │       ├── 0238d...f544e/
+    │       └── ......
     └── ......
 ```
-Then, change the `data_root` under the `if __name__ == '__main__':` block of `eval_dataset_[i/v]2v.py` to your own $(data_root).
-You may also want to change the `GPUS` and `MAX_WORKER_NUM` for multiprocessing at the top of these python files.
 
-### DAVIS / Tanks and Temples
+### Scripted Camera Motion (DAVIS & Tanks)
 
 ```bash
-python eval_dataset_i2v.py [davis/tanks] --method mine --use_mesh --scratch
+python eval_dataset_i2v_scripted_cam.py [davis/tanks] --data_root ${DATA_ROOT} --method XXX --use_mesh [--scratch]
 ```
 
-- `--method` : which inpainting method to use (`mine`, `trajcrafter`, `trajattn`, `nvssolver`, `das`)
-- `--use_mesh` : If set, mesh-based rendering is used. If not, NVS-Solver's bilinear splatting is used.
-- `--scratch` : Set when you run the evaluation for the first time. If not set, the code assumes that rendering has already completed and the results are stored in a particular folder.
+- `--method` : which inpainting method to use (`mine`, `wan`, `trajcrafter`, `trajattn`, `nvssolver`, `das`)
+- `--use_mesh` : If set, mesh-based rendering is used. If not, NVS-Solver's bilinear splatting is used. We recommend adding this flag.
+- `--scratch` : Set when you run the evaluation for the first time. If not set, the code assumes that rendering has already completed and its results are stored in a particular folder.
 
-### Mannequin Challenge
+Tips: You may want to change the `GPUS` and `MAX_WORKER_NUM` for multiprocessing at the top of `eval_dataset_i2v_scripted_cam.py`.
+
+### Real Camera Motion (Mannequin & DL3DV-Eval)
 
 TODO: provide `download_extract.py` (The following works only after you run `download_extract.py` and download all the videos).
 
@@ -104,11 +126,13 @@ If it's the first time, comment out the following two lines in line 676 of `eval
 ```
 Then run the following:
 ```bash
-python eval_dataset_i2v.py mannequin --method mine --use_mesh --scratch
+python eval_dataset_i2v_real_cam.py [mannequin/dl3dv_half] --data_root ${DATA_ROOT} --method XXX --use_mesh [--scratch]
 ```
 
 ### DAVIS Vdeos
 
+Currently, only `davis` is supported.
+
 ```bash
-python eval_dataset_v2v.py davis --method mine --use_mesh --scratch
+python eval_dataset_v2v_scripted_cam.py davis --data_root ${DATA_ROOT} --method XXX --use_mesh [--scratch]
 ```

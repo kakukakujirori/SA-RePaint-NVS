@@ -7,10 +7,10 @@ import tempfile
 from tqdm import tqdm
 from tabulate import tabulate
 
-from eval_dataset_i2v import run_pixelwise_metrics_calculation, run_fid_kid_calculation, run_fvd_calculation, run_camera_pose_error_calculation, run_sed_calculation
+from eval_dataset_i2v_scripted_cam import run_pixelwise_metrics_calculation, run_fid_kid_calculation, run_fvd_calculation, run_camera_pose_error_calculation, run_sed_calculation, run_met3r_calculation
 
 NUM_FRAMES = 25
-MAX_WORKER_NUM = 16
+MAX_WORKER_NUM = 1
 GPUS = [0, 1]
 
 
@@ -30,12 +30,10 @@ if __name__ == '__main__':
     parser.add_argument("--suffix", type=str, default="nvssolver", help="Suffix for output directories")
     args = parser.parse_args()
 
-    davis_output_root = f"./davis_output_{args.suffix}"
-    mannequin_challenge_output_root = f"./mannequin_challenge_output_{args.suffix}"
-    tanks_and_temples_output_root = f"./tanks_and_temples_output_{args.suffix}"
+    davis_output_root = f"./experimental_results/davis_output_{args.suffix}"
+    tanks_and_temples_output_root = f"./experimental_results/tanks_and_temples_output_{args.suffix}"
 
     davis_data_root = f"{args.data_root}/DAVIS/JPEGImages/Full-Resolution"
-    mannequin_challenge_data_root = f"{args.data_root}/MannequinChallengeHQ/validation_frames"
     tanks_and_temples_data_root = f"{args.data_root}/TanksAndTemples"
 
     # 1. Gather all data
@@ -56,7 +54,7 @@ if __name__ == '__main__':
         os.mkdir(data_root)
         with concurrent.futures.ThreadPoolExecutor(max_workers=32) as executor:
             future_to_task_info = {}
-            for src_dir in [davis_data_root, mannequin_challenge_data_root, tanks_and_temples_data_root]:
+            for src_dir in [davis_data_root, tanks_and_temples_data_root]:
                 for scene in os.listdir(src_dir):
                     src_path = os.path.join(src_dir, scene)
                     dst_path = os.path.join(data_root, scene)
@@ -79,7 +77,7 @@ if __name__ == '__main__':
         os.mkdir(output_root)
         with concurrent.futures.ThreadPoolExecutor(max_workers=32) as executor:
             future_to_task_info = {}
-            for src_dir in [davis_output_root, mannequin_challenge_output_root, tanks_and_temples_output_root]:
+            for src_dir in [davis_output_root, tanks_and_temples_output_root]:
                 for scene in os.listdir(src_dir):
                     src_path = os.path.join(src_dir, scene)
                     dst_path = os.path.join(output_root, scene)
@@ -104,12 +102,12 @@ if __name__ == '__main__':
 
             # 5. FID/FVD calculation
             fid_score, kid_score = run_fid_kid_calculation(
-                data_root=data_root,
-                output_root=output_root,
+               data_root=data_root,
+               output_root=output_root,
             )
             fvd_videogpt, fvd_stylegan = run_fvd_calculation(
-                data_root=data_root,
-                output_root=output_root,
+               data_root=data_root,
+               output_root=output_root,
             )
 
             # 6. Camera pose error calculation
@@ -118,14 +116,16 @@ if __name__ == '__main__':
             # 7. SED calculation
             sed_results = run_sed_calculation(output_root)
 
-            # 8. VBench
+            # 8. MET3R calculation
+            met3r_results, _ = run_met3r_calculation(output_root, process_size=256, resize_mode="area")
+
+            # 9. VBench
             davis_vbench = load_vbench_scores(f"./vbench_results/davis_output_{args.suffix}_eval_results.json")
-            mannequin_challenge_vbench = load_vbench_scores(f"./vbench_results/mannequin_challenge_output_{args.suffix}_eval_results.json")
             tanks_and_temples_vbench = load_vbench_scores(f"./vbench_results/tanks_and_temples_output_{args.suffix}_eval_results.json")
-            assert set(davis_vbench.keys()) == set(mannequin_challenge_vbench.keys()) == set(tanks_and_temples_vbench.keys())
+            assert set(davis_vbench.keys()) == set(tanks_and_temples_vbench.keys())
             vbench_average_scores = {}
             for dimension in davis_vbench.keys():
-                vbench_average_scores[dimension] = (davis_vbench[dimension] + mannequin_challenge_vbench[dimension] + tanks_and_temples_vbench[dimension]) / 3
+                vbench_average_scores[dimension] = (davis_vbench[dimension] + tanks_and_temples_vbench[dimension]) / 2
             print(tabulate(vbench_average_scores.items(), floatfmt=".4f"))
 
 

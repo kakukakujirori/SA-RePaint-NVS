@@ -1,5 +1,6 @@
 import argparse
 import concurrent.futures
+import gc
 import glob
 import json
 import os
@@ -16,15 +17,13 @@ import torch
 import torch.nn.functional as F
 from cleanfid import fid
 from diffusers.utils import load_image
-from einops import rearrange
 from fvdcal import FVDCalculation
-from met3r import MEt3R
 from pathos.multiprocessing import ProcessingPool
 from torchmetrics.image import PeakSignalNoiseRatio
 
 from src.eval_sed import eval_sed
 from src.eval_ssim import ssim
-from src.eval_trajectories import eval_trajectories, run_glomap
+from src.eval_trajectories import eval_trajectories
 
 
 NUM_FRAMES = 25
@@ -32,8 +31,8 @@ NUM_INFERECE_STEPS = 50
 DENOISE_START_STEP = NUM_INFERECE_STEPS // 3
 REPAINT_ITER_NUM = 2
 MOTION_MODES = ["horizontal", "vertical", "zoomout"]
-DEGREE_LIST = [-1.0, -0.5, 0.5, 1.0]
-MOTION_DEGREE_PAIRS = [x for x in product(MOTION_MODES, DEGREE_LIST) if x not in [('vertical', -1.0), ('vertical', 1.0)]]
+DEGREE_LIST = [-0.5, -0.25, 0.25, 0.5]
+MOTION_DEGREE_PAIRS = [x for x in product(MOTION_MODES, DEGREE_LIST) if x not in [('vertical', -0.5), ('vertical', 0.5)]]
 MAJOR_RADIUS = 80
 MINOR_RADIUS = 70
 
@@ -41,34 +40,7 @@ GPUS = [0, 1]
 MAX_WORKER_NUM = 16
 
 
-def reorganize_frames(mannequin_challenge_data_root: str):
-    """This script is expected to be run after
-    `python download_extract.py` is executed."""
-    for split in ["validation", "test", "train"]:
-        split_root = os.path.join(mannequin_challenge_data_root, split, "data")
-        output_root = os.path.join(mannequin_challenge_data_root, f"{split}_frames")
-        assert os.path.isdir(split_root), f"Directory {split_root} does not exist."
-
-        if os.path.isdir(output_root):
-            shutil.rmtree(output_root)
-        os.makedirs(output_root)
-
-        cnt = 0
-        for uid in os.listdir(split_root):
-            frame_dir = os.path.join(split_root, uid, "frames")
-            if not os.path.isdir(frame_dir):
-                continue
-
-            dst_dir = os.path.join(output_root, uid)
-            if os.path.isdir(dst_dir):
-                shutil.rmtree(dst_dir)
-            shutil.copytree(frame_dir, dst_dir)
-            cnt += 1
-
-        print(f"[extract_frames] Finished reorganizing '{split}' ({cnt}/{len(os.listdir(split_root))})")
-
-
-def organize_images_and_depth(data_root: str, input_root: str, output_root: str):
+def organize_videos_and_depth(data_root: str, input_root: str, output_root: str):
     assert os.path.isdir(data_root), f"Folder not found: {data_root}"
     if os.path.isdir(input_root):
         shutil.rmtree(input_root)
@@ -77,48 +49,118 @@ def organize_images_and_depth(data_root: str, input_root: str, output_root: str)
     os.makedirs(input_root)
     os.makedirs(output_root)
 
-    # extract keyframes from each scene
-    for i, scene in enumerate(glob.glob(os.path.join(data_root, "*"))):
-        if not os.path.isdir(scene):
-            continue
+    # define tasks
+    def to_chunk(chunk_img_paths: list[str], outdir: str):
+        with tempfile.TemporaryDirectory() as td:
+            # copy images
+            for idx, imgpath in enumerate(chunk_img_paths):
+                dst_img = os.path.join(td, f"{idx:04d}.jpg")
+                shutil.copy(imgpath, dst_img)
 
-        scene_name = os.path.basename(scene)
-        print(scene_name)
+            # resize images
+            subprocess.run(["magick", "mogrify", "-resize", "1024x576!", os.path.join(td, "*.jpg")])
 
-        for cnt, imgpath in enumerate(sorted(glob.glob(os.path.join(scene, "*.jpg")))):
-            # pool images
-            if cnt % NUM_FRAMES == 0:
-                img_num = os.path.basename(imgpath).split(".")[0]
-                dst_path = os.path.join(input_root, scene_name + "_" + img_num + ".jpg")
-                shutil.copy(imgpath, dst_path)
+            # to mkv (= lossless video format)
+            try:
+                scene_name = os.path.basename(os.path.dirname(chunk_img_paths[0])).split(".")[0]
+                start_img_num = os.path.basename(chunk_img_paths[0]).split(".")[0]
+                dst_mkv = os.path.join(outdir, f"{scene_name}_{start_img_num}.mkv")
+                result = subprocess.run([
+                    "ffmpeg", "-y",
+                    "-framerate", "10",
+                    "-i", os.path.join(td, "%04d.jpg"),
+                    "-c:v", "ffv1",
+                    "-g", "1",
+                    dst_mkv,
+                ], check=True, capture_output=True, text=True, encoding='utf-8')
+            except subprocess.CalledProcessError as e:
+                error_message = (
+                    f"ERROR!!!\n"
+                    f"Command: {' '.join(e.cmd)}\n"
+                    f"Return code: {e.returncode}\n"
+                    f"Stdout:\n{e.stdout.strip()}\n"
+                    f"Stderr:\n{e.stderr.strip()}"
+                )
+                print(error_message)
+                raise e
 
-    # resize to 1024x576
-    subprocess.run(["magick", "mogrify", "-resize", "1024x576!", os.path.join(input_root, "*.jpg")])
+    # separate frames in chunks from each scene
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKER_NUM) as executor:
+        future_to_task_info = {}
+        for scene in glob.glob(os.path.join(data_root, "*")):
+            if not os.path.isdir(scene):
+                continue
+
+            imgpaths = sorted(glob.glob(os.path.join(scene, "*.jpg")))
+            num_chunks = len(imgpaths) // NUM_FRAMES
+
+            for chunk_idx in range(num_chunks):
+                chunk_imgs = imgpaths[chunk_idx * NUM_FRAMES : (chunk_idx + 1) * NUM_FRAMES]
+                if not chunk_imgs:
+                    continue
+                future = executor.submit(to_chunk, chunk_imgs, input_root)
+                future_to_task_info[future] = (chunk_imgs, input_root)
+
+        for future in tqdm(concurrent.futures.as_completed(future_to_task_info), total=len(future_to_task_info), desc="Separating videos to chunks"):
+            chunk_imgs, input_root = future_to_task_info[future]
+            task_desc = f"{chunk_imgs=}, {input_root=}"
+            try:
+                _ = future.result()
+            except Exception as exc:
+                print(f"Main loop caught exception for {task_desc}: {exc}")
+                raise exc
 
     # depth estimation
-    imglist = glob.glob(os.path.join(input_root, "*.jpg"))
-    imglist_path = os.path.join(input_root, "tmp.txt")
-    with open(imglist_path, "a") as f:
-        for imgpath in imglist:
-            f.write(imgpath + "\n")
+    video_path_list = glob.glob(os.path.join(input_root, "*.mkv"))
+    task_per_GPU = (len(video_path_list) + len(GPUS) - 1) // len(GPUS)
+    processes = []
+    for i, gpu_id in enumerate(GPUS):
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
-    subprocess.run(["python", "tools/Depth-Anything-V2/run.py",
-        "--encoder", "vitl",
-        "--img-path", imglist_path,
-        "--outdir", output_root])  # TEMPORAL USE
+        video_path_per_GPU = video_path_list[task_per_GPU * i : task_per_GPU * (i + 1)]
+        vidlist_path = os.path.join(input_root, f"tmp_{gpu_id}.txt")
+        with open(vidlist_path, "w") as f:
+            for imgpath in video_path_per_GPU:
+                f.write(imgpath + "\n")
 
-    os.remove(imglist_path)
+        proc = subprocess.Popen([
+                "python", "tools/Video-Depth-Anything/run.py",
+                "--encoder", "vitl",
+                "--input_video", vidlist_path,
+                "--output_dir", output_root,
+                "--save_npz",
+            ], stdout=None, stderr=None, text=True, encoding='utf-8', env=env)
+        processes.append((proc, gpu_id, vidlist_path))
+
+    # wait for all the process to finish
+    for proc, gpu_id, vidlist_path in processes:
+        stdout, stderr = proc.communicate()
+        if proc.returncode != 0:
+            print(f"[GPU {gpu_id}] ERROR: returncode={proc.returncode}")
+            print(f"[GPU {gpu_id}] STDOUT:\n{stdout}")
+            print(f"[GPU {gpu_id}] STDERR:\n{stderr}")
+        else:
+            print(f"[GPU {gpu_id}] Finished successfully.")
+
+        os.remove(vidlist_path)
 
     # store in each folder
-    for imgpath in glob.glob(os.path.join(input_root, "*.jpg")):
-        imgname = os.path.basename(imgpath).split(".")[0]
-        image_folder_path = os.path.join(input_root, imgname, "images")
-        depth_folder_path = os.path.join(input_root, imgname, "depths")
+    for vidpath in glob.glob(os.path.join(input_root, "*.mkv")):
+        vidname = os.path.basename(vidpath).split(".")[0]
+        image_folder_path = os.path.join(input_root, vidname, "images")
+        depth_folder_path = os.path.join(input_root, vidname, "depths")
         os.makedirs(image_folder_path)
         os.makedirs(depth_folder_path)
-        shutil.move(imgpath, image_folder_path)
-        shutil.move(os.path.join(output_root, imgname + ".png"), depth_folder_path)
-        shutil.move(os.path.join(output_root, imgname + ".npy"), depth_folder_path)
+        shutil.move(os.path.join(output_root, vidname + "_depths.npz"), depth_folder_path)
+        subprocess.run([
+            "ffmpeg", "-i", vidpath,
+            "-start_number", "0",
+            os.path.join(image_folder_path, "%04d.png"),
+        ], check=True, capture_output=True, text=True, encoding='utf-8')
+        os.remove(vidpath)
+        os.remove(os.path.join(output_root, vidname + "_src.mp4"))
+        os.remove(os.path.join(output_root, vidname + "_vis.mp4"))
 
 
 def run_trajectory_extraction(
@@ -138,7 +180,7 @@ def run_trajectory_extraction(
             "--image_folder", f"{input_root}/{scene}/images/",
             "--depth_folder", f"{input_root}/{scene}/depths/",
             "--output_folder", f"{output_root}/{scene}/{motion_mode}_{degree}/warped",
-            "--depth_format", "npy",
+            "--depth_format", "npz",
             "--invert_depth",
             "--focal_len", "260",
             "--degrees_per_frame", f"{degree}",
@@ -146,7 +188,7 @@ def run_trajectory_extraction(
             "--major_radius", f"{MAJOR_RADIUS}",
             "--minor_radius", f"{MINOR_RADIUS}",
             "--num_frames", f"{NUM_FRAMES}",
-            "--control_mode", "image",
+            "--control_mode", "video",
             ] + (
                 ["--no_occlusion_revealing"] if no_occlusion_revealing else []
             ) + (
@@ -174,7 +216,7 @@ def run_trajectory_extraction(
         return f"Unexpected error for {task_id}: {e}"
 
 
-def run_generation_task(input_root: str, output_root: str, scene: str, motion_mode: str, degree: float, gpu_id: int, method: str = "mine") -> str:
+def run_generation_task(output_root: str, scene: str, motion_mode: str, degree: float, gpu_id: int, method: str = "mine") -> str:
     task_id = f"Scene: {scene}, Motion: {motion_mode + '_' + str(degree)}, GPU: {gpu_id}"
     print(f"STARTING task: {task_id}")
     with torch.cuda.device(f'cuda:{gpu_id}'):
@@ -233,17 +275,6 @@ def run_generation_task(input_root: str, output_root: str, scene: str, motion_mo
                 "--seed", "12345",
                 "--gpu", f"{gpu_id}"],
                 check=True, capture_output=True, text=True, encoding='utf-8')
-        elif method == "invstitch":
-            result = subprocess.run(["python", "src/generate_invstitch.py",
-                "--input_folder", f"{input_root}/{scene}",
-                "--invert_depth",
-                "--output_folder", f"{output_root}/{scene}/{motion_mode}_{degree}/generated",
-                "--trajectory_folder", f"{output_root}/{scene}/{motion_mode}_{degree}/warped",
-                "--num_frames", f"{NUM_FRAMES}",
-                "--outpaint_frame_interval", "5",
-                "--seed", "12345",
-                "--gpu", f"{gpu_id}"],
-                check=True, capture_output=True, text=True, encoding='utf-8')
         else:
             raise NotImplementedError(f"Method '{method}' is not implemented.")
         print(f"COMPLETED task: {task_id}\nSTDOUT:\n{result.stdout.strip()}")
@@ -270,7 +301,7 @@ def run_generation_task(input_root: str, output_root: str, scene: str, motion_mo
     return msg
 
 
-def run_pixelwise_metrics_calculation(output_root: str, allow_resize: bool = False, allow_missing_frames: bool = False):
+def run_pixelwise_metrics_calculation(output_root: str, allow_resize: bool = False):
     PSNR_MODULES = {i: PeakSignalNoiseRatio(data_range=1.0).eval().to(f"cuda:{i}") for i in GPUS}
     LPIPS_MODULES = {i: lpips.LPIPS(net='alex', spatial=True).eval().to(f"cuda:{i}") for i in GPUS}
 
@@ -284,17 +315,9 @@ def run_pixelwise_metrics_calculation(output_root: str, allow_resize: bool = Fal
         device = f"cuda:{gpu_id}"
 
         # load warped frames and generated frames
-        generated_frame_paths = sorted(glob.glob(os.path.join(data_dir, "generated", "*.png")))
-        valid_frame_ids = [int(os.path.basename(x).split(".")[0]) for x in generated_frame_paths]
-        mask_frame_paths = [os.path.join(data_dir, "warped", f"{i:04d}_mask.png") for i in valid_frame_ids]
-        warped_frame_paths = [os.path.join(data_dir, "warped", f"{i:04d}.png") for i in valid_frame_ids]
-
-        if not allow_missing_frames:
-            assert len(mask_frame_paths) == len(warped_frame_paths) == len(generated_frame_paths) == NUM_FRAMES
-
-        generated_frames = [load_image(x) for x in generated_frame_paths]
-        mask_frames = [load_image(x) for x in mask_frame_paths]
-        warped_frames = [load_image(x) for x in warped_frame_paths]
+        mask_frames = [load_image(os.path.join(data_dir, "warped", f"{i:04d}_mask.png")) for i in range(NUM_FRAMES)]
+        warped_frames = [load_image(os.path.join(data_dir, "warped", f"{i:04d}.png")) for i in range(NUM_FRAMES)]
+        generated_frames = [load_image(os.path.join(data_dir, "generated", f"{i:04d}.png")) for i in range(NUM_FRAMES)]
 
         # batchfy the frames
         mask_tensor = torch.stack([torch.from_numpy(np.array(x).astype(np.float32) / 255.0).permute(2, 0, 1) for x in mask_frames], dim=0).to(device)
@@ -506,70 +529,109 @@ def run_fvd_calculation(data_root: str, output_root: str):
     return score_videogpt, score_stylegan
 
 
-def run_camera_pose_error_calculation(output_root: str, gt_focal_len: float = 260.0):
-
-    def run_task(args: tuple[str, int]):
-        data_dir, gpu_id = args
-
-        if not os.path.isfile(os.path.join(data_dir, "generated/generated.mp4")):
-            print(f"Missing video for {data_dir}")
-            return (data_dir, None)
-
-        # Load the generated frames
-        image_names = sorted(glob.glob(os.path.join(data_dir, f"generated/0*.png")))
-        image_ids = [int(os.path.basename(x).split(".")[0]) for x in image_names]
-
-        # Load the gt image size
-        gt_width, gt_height = imagesize.get(os.path.join(data_dir, f"warped/0000.png"))
-
-        # Load the camera poses
-        gt_poses_w2c = [np.load(os.path.join(data_dir, f"warped/{i:04d}_pose.npy")) for i in image_ids]
-        gt_poses_c2w = [np.linalg.inv(p) for p in gt_poses_w2c]
-        gt_K = np.array([
-            [gt_focal_len, 0, gt_width/2],
-            [0, gt_focal_len, gt_height/2],
-            [0, 0, 1],
-        ], dtype=np.float32)
-
-        # Estimate the camera poses from the generated video
-        estimated_poses_c2w = run_glomap(image_names, gt_width=gt_width, gt_height=gt_height, gt_focal_len=gt_focal_len, gpu_id=gpu_id)
-        estimated_K = gt_K
-
-        # Filter out missing poses
-        missing_estimated_poses_ids = [i for (i, pose) in enumerate(estimated_poses_c2w) if pose is None]
-        estimated_poses_c2w = [pose for (i, pose) in enumerate(estimated_poses_c2w) if i not in missing_estimated_poses_ids]
-        gt_poses_c2w = [pose for (i, pose) in enumerate(gt_poses_c2w) if i not in missing_estimated_poses_ids]
-        if len(estimated_K.shape) == 3:  # (N, 3, 3)
-            estimated_K = np.array([estimated_K[i] for i in range(len(estimated_K)) if i not in missing_estimated_poses_ids])
-
-        # Compute errors
-        if estimated_poses_c2w:
-            results, estimated_abs_poses_c2w, gt_abs_poses_c2w = eval_trajectories(estimated_poses_c2w, gt_poses_c2w, estimated_K, gt_K)
-            return (data_dir, results)
-        else:
-            print(f"[WARNING] `estimated_poses_c2w` was empty for {data_dir}. This is usually unexpected; check the data manually.")
-            return (data_dir, None)
-
-    tasks = []
-    for idx, scene in enumerate(os.listdir(output_root)):
-        scene_path = os.path.join(output_root, scene)
-        if not os.path.isdir(scene_path):
-            continue
-        for motion_degree in os.listdir(scene_path):
-            data_dir = os.path.join(output_root, scene, motion_degree)
-            assert os.path.isdir(data_dir)
-            tasks.append((data_dir, GPUS[idx % len(GPUS)]))
-
-    with ProcessingPool(nodes=MAX_WORKER_NUM) as pool:
-        results = list(tqdm(pool.imap(run_task, tasks), total=len(tasks), desc="Calculating camera pose errors"))
+def run_camera_pose_error_calculation(input_root: str, output_root: str, gt_focal_len: float = 260.0):
 
     total_results = {}
     missing = []
-    for data_dir, result in results:
-        if result is None:
-            missing.append(data_dir)
-        else:
-            total_results[data_dir] = result
+
+    def run_task(input_frame_paths: list[str], output_frame_paths: list[str], gt_pose_paths: list[str], gpu_id: int):
+        with tempfile.TemporaryDirectory() as td:
+            # load properties
+            env = os.environ.copy()
+            env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+            gt_width, gt_height = imagesize.get(input_frame_paths[0])
+            dirname = os.path.dirname(os.path.dirname(output_frame_paths[0]))
+            dirname_flatten = dirname.replace("/", "_")
+
+            concat_frame_paths = input_frame_paths[::-1] + output_frame_paths
+            for i, p in enumerate(concat_frame_paths):
+                img = load_image(p).resize((gt_width, gt_height))
+                img.save(os.path.join(td, f"{i:04d}.png"))
+
+            try:
+                # to mkv (= lossless video format)
+                subprocess.run([
+                    "ffmpeg", "-y",
+                    "-framerate", "10",
+                    "-i", os.path.join(td, f"%04d.png"),
+                    "-c:v", "ffv1",
+                    "-g", "1",
+                    os.path.join(td, f"{dirname_flatten}.mkv"),
+                ], check=True, capture_output=True, text=True, encoding='utf-8', env=env)
+                # free cache
+                gc.collect()
+                with torch.cuda.device(f'cuda:{gpu_id}'):
+                    torch.cuda.empty_cache()
+                # vipe
+                subprocess.run([
+                    "vipe", "infer", os.path.join(td, f"{dirname_flatten}.mkv"),
+                    "--output", os.path.join(td, "vipe_results"),
+                ], check=True, capture_output=True, text=True, encoding='utf-8', env=env)
+
+            except subprocess.CalledProcessError as e:
+                error_message = (
+                    f"ERROR!!!\n"
+                    f"Command: {' '.join(e.cmd)}\n"
+                    f"Return code: {e.returncode}\n"
+                    f"Stdout:\n{e.stdout.strip()}\n"
+                    f"Stderr:\n{e.stderr.strip()}"
+                )
+                print(error_message)
+                missing.append(dirname)
+                return
+
+            # extract camera poses
+            pose_data = np.load(os.path.join(td, f"vipe_results/pose/{dirname_flatten}.npz"))
+            poses = pose_data["data"]  # (N, 4, 4)
+            input_poses_c2w = poses[:NUM_FRAMES][::-1]
+            output_poses_c2w = poses[NUM_FRAMES:]
+            relative_poses_c2w = np.linalg.inv(input_poses_c2w) @ output_poses_c2w
+
+            intrinsics_data = np.load(os.path.join(td, f"vipe_results/intrinsics/{dirname_flatten}.npz"))
+            intrinsics = intrinsics_data["data"][0]  # (4,)
+            pred_K = np.array([
+                [intrinsics[0], 0, intrinsics[2]],
+                [0, intrinsics[1], intrinsics[3]],
+                [0, 0, 1],
+            ], dtype=np.float32)
+
+            # load gt poses
+            gt_poses_w2c = [np.load(p) for p in gt_pose_paths]
+            gt_poses_c2w = [np.linalg.inv(p) for p in gt_poses_w2c]
+            gt_K = np.array([
+                [gt_focal_len, 0, gt_width/2],
+                [0, gt_focal_len, gt_height/2],
+                [0, 0, 1],
+            ], dtype=np.float32)
+
+            # eval
+            results, estimated_abs_poses_c2w, gt_abs_poses_c2w = eval_trajectories(relative_poses_c2w, gt_poses_c2w, pred_K, gt_K)
+            total_results[dirname] = results
+            # return dirname, results
+
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(GPUS)) as executor:
+        future_to_task_info = {}
+        cnt = 0
+        for scene in os.listdir(input_root):
+            input_frame_paths = [os.path.join(input_root, scene, "images", f"{i:04d}.png") for i in range(NUM_FRAMES)]
+            for motion_degree in os.listdir(os.path.join(output_root, scene)):
+                output_frame_paths = [os.path.join(output_root, scene, motion_degree, "generated", f"{i:04d}.png") for i in range(NUM_FRAMES)]
+                gt_pose_paths= [os.path.join(output_root, scene, motion_degree, "warped", f"{i:04d}_pose.npy") for i in range(NUM_FRAMES)]
+
+                future = executor.submit(run_task, input_frame_paths, output_frame_paths, gt_pose_paths, GPUS[cnt % len(GPUS)])
+                future_to_task_info[future] = (input_frame_paths, output_frame_paths, gt_pose_paths, GPUS[cnt % len(GPUS)])
+                cnt += 1
+
+        for future in tqdm(concurrent.futures.as_completed(future_to_task_info), total=len(future_to_task_info), desc="Calculating camera pose errors"):
+            input_frame_paths, output_frame_paths, gt_pose_paths, gpu_id = future_to_task_info[future]
+            task_desc = f"{input_frame_paths=}, {output_frame_paths=}, {gt_pose_paths=}, {gpu_id=}"
+            try:
+                result_message = future.result()
+                # print(f"Result for {task_desc}: {result_message}")
+            except Exception as exc:
+                print(f"Main loop caught exception for {task_desc}: {exc}")
+                raise exc
 
     total_ape_mean = sum([result["ape_mean"] for result in total_results.values()]) / len(total_results)
     total_rre_mean = sum([result["rre_mean"] for result in total_results.values()]) / len(total_results)
@@ -580,226 +642,38 @@ def run_camera_pose_error_calculation(output_root: str, gt_focal_len: float = 26
     print(f"Total APE Mean: {total_ape_mean}, Median: {total_ape_median}")
     print(f"Total RRE Mean: {total_rre_mean}, Median: {total_rre_median}")
     print(f"Total RTE Mean: {total_rte_mean}, Median: {total_rte_median}")
-    print(f"Missing videos: {len(missing)}")
+    print(f"Missing dirs: {len(missing)}")
     total_results["total_ape_mean"] = total_ape_mean
     total_results["total_rre_mean"] = total_rre_mean
     total_results["total_rte_mean"] = total_rte_mean
     total_results["total_ape_median"] = total_ape_median
     total_results["total_rre_median"] = total_rre_median
     total_results["total_rte_median"] = total_rte_median
-    total_results["missing_videos"] = missing
-
-    return total_results, missing
-
-
-def run_sed_calculation(output_root: str):
-
-    def run_task(args: tuple[str, float, int]):
-        data_dir, gt_focal_len, gpu_id = args
-
-        video_path = os.path.join(data_dir, "generated/generated.mp4")
-        if not os.path.isfile(video_path):
-            return (data_dir, None)
-
-        # Load the gt image size and camera poses
-        gt_width, gt_height = imagesize.get(os.path.join(data_dir, f"warped/0000.png"))
-        camera_paths = os.path.join(data_dir, "warped/*_pose.npy")
-        poses = [np.load(p) for p in sorted(glob.glob(camera_paths))]
-
-        with tempfile.TemporaryDirectory() as colmap_root:
-            consistent_ratios, sed_summary = eval_sed(
-                colmap_root=colmap_root,
-                video_path=video_path,
-                poses=poses,
-                gt_width=gt_width,
-                gt_height=gt_height,
-                gt_focal_len=gt_focal_len,
-                save_sed_graph_to=None,
-                gpu_id=gpu_id,
-            )
-            return (data_dir, consistent_ratios)
-
-    tasks = []
-    for idx, scene in enumerate(os.listdir(output_root)):
-        scene_path = os.path.join(output_root, scene)
-        if not os.path.isdir(scene_path):
-            continue
-        for motion_degree in os.listdir(scene_path):
-            data_dir = os.path.join(output_root, scene, motion_degree)
-            assert os.path.isdir(data_dir)
-            tasks.append((data_dir, 260.0, GPUS[idx % len(GPUS)]))
-
-    with ProcessingPool(nodes=MAX_WORKER_NUM) as pool:
-        results = list(tqdm(pool.imap(run_task, tasks), total=len(tasks), desc="Calculating SED"))
-
-    total_results = {}
-    missing = []
-    for data_dir, result in results:
-        if result is None:
-            missing.append(data_dir)
-        else:
-            total_results[data_dir] = result
-
-    total_consistent_ratios = {}
-    probably_failed = []
-    for data_dir, result in total_results.items():
-        for key, value in result.items():
-            if key not in total_consistent_ratios:
-                total_consistent_ratios[key] = 0
-            total_consistent_ratios[key] += value
-        # sanity check
-        if max(result.values()) == 0:
-            probably_failed.append(data_dir)
-
-    for key in total_consistent_ratios:
-        total_consistent_ratios[key] /= len(total_results)
-        print(f"Total SED Mean (threshold {key:.2f}): {total_consistent_ratios[key]:.3f}")
-    if probably_failed:
-        print("[run_sed_calcluation] All SED values are 0 in the following data_dir. "
-              "This may indicate that the multiprocess worker failed to process the data. "
-              "Consider reducing MAX_WORKER_NUM.")
-        for data_dir in probably_failed:
-            print("  " + data_dir)
-
-
-    total_results["total_sed_mean"] = total_consistent_ratios
-    total_results["missing_videos"] = missing
-
-    return total_results, missing
-
-
-def run_met3r_calculation(output_root: str, process_size: int = 256, resize_mode: str = "area"):
-    # Initialize MEt3R
-    MET3R_MODULES = {i: MEt3R(
-            img_size=None, # Default to 256, set to `None` to use the input resolution on the fly!
-            use_norm=True, # Default to True
-            backbone="mast3r", # Default to MASt3R, select from ["mast3r", "dust3r", "raft"]
-            feature_backbone="dino16", # Default to DINO, select from ["dino16", "dinov2", "maskclip", "vit", "clip", "resnet50"]
-            feature_backbone_weights="mhamilton723/FeatUp", # Default
-            upsampler="featup", # Default to FeatUP upsampling, select from ["featup", "nearest", "bilinear", "bicubic"]
-            distance="cosine", # Default to feature similarity, select from ["cosine", "lpips", "rmse", "psnr", "mse", "ssim"]
-            freeze=True, # Default to True
-        ).to(f"cuda:{i}") for i in GPUS}
-
-    def run_task(data_dir: str, gpu_id: int, process_size: int, resize_mode: str):
-        # select evaluator
-        metric = MET3R_MODULES[gpu_id]
-        device = f"cuda:{gpu_id}"
-
-        # load warped frames and generated frames
-        generated_frames = [load_image(os.path.join(data_dir, "generated", f"{i:04d}.png")) for i in range(NUM_FRAMES)]
-        generated_tensor_source = torch.stack([torch.from_numpy(np.array(x).astype(np.float32) / 255.0).permute(2, 0, 1) for x in generated_frames[:-1]], dim=0)
-        generated_tensor_target = torch.stack([torch.from_numpy(np.array(x).astype(np.float32) / 255.0).permute(2, 0, 1) for x in generated_frames[1:]], dim=0)
-        generated_tensor = torch.stack([generated_tensor_source, generated_tensor_target], dim=1) * 2 - 1
-
-        # resize (NOTE: size must be multiple of 32)
-        height, width = generated_tensor.shape[-2:]
-        if width >= height:
-            width_sh = process_size
-            height_sh = int(32 * round(process_size * height / (32 * width)))
-        else:
-            height_sh = process_size
-            width_sh = int(32 * round(process_size * width / (32 * height)))
-        generated_tensor = F.interpolate(
-            rearrange(generated_tensor, "b v c h w -> (b v) c h w", v=2),
-            size=(height_sh, width_sh),
-            mode=resize_mode,
-        )
-        generated_tensor = rearrange(generated_tensor, "(b v) c h w -> b v c h w", v=2)
-        # print(f"Process size: {generated_tensor.shape}")
-
-        # Evaluate MEt3R
-        scores = {}
-        for idx, inputs in enumerate(generated_tensor):
-            s, *_ = metric(
-                images=inputs.unsqueeze(0).to(device),
-                return_overlap_mask=False, # Default
-                return_score_map=False, # Default
-                return_projections=False # Default
-            )
-            scores[f"{idx}_{idx+1}"] = s.cpu().item()
-        total_results[data_dir] = scores
-
-        # Clear up GPU memory
-        torch.cuda.empty_cache()
-
-
-    total_results = {}
-    missing = []
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(GPUS)) as executor:
-        future_to_task_info = {}
-        for idx, scene in enumerate(sorted(os.listdir(output_root))):
-            scene_path = os.path.join(output_root, scene)
-            if not os.path.isdir(scene_path):
-                continue
-            for motion_degree in os.listdir(scene_path):
-                data_dir = os.path.join(output_root, scene, motion_degree)
-                assert os.path.isdir(data_dir)
-
-                if not os.path.isdir(os.path.join(data_dir, "generated")):
-                    print(f"Missing {os.path.join(data_dir, 'generated')}")
-                    missing.append(data_dir)
-                    continue
-
-                future = executor.submit(run_task, data_dir, GPUS[idx % len(GPUS)], process_size, resize_mode)
-                future_to_task_info[future] = (data_dir, GPUS[idx % len(GPUS)])
-
-        for future in tqdm(concurrent.futures.as_completed(future_to_task_info), total=len(future_to_task_info), desc="Calculating MEt3R metrics"):
-            data_dir, gpu_id = future_to_task_info[future]
-            task_desc = f"{data_dir=}, {gpu_id=}"
-            try:
-                result_message = future.result()
-                # print(f"Result for {task_desc}: {result_message}")
-            except Exception as exc:
-                print(f"Main loop caught exception for {task_desc}: {exc}")
-                raise exc
-
-    total_met3r_values = []
-    for scores in total_results.values():
-        total_met3r_values += list(scores.values())
-    total_met3r_values = np.array(total_met3r_values)
-    total_met3r_mean = np.mean(total_met3r_values)
-    total_met3r_median = np.median(total_met3r_values)
-    print(f"Total MEt3R Mean: {total_met3r_mean}")
-    print(f"Total MEt3R Median: {total_met3r_median}")
-    print(f"Missing dirs: {len(missing)}")
-    total_results["total_met3r_mean"] = total_met3r_mean
-    total_results["total_met3r_median"] = total_met3r_median
     total_results["missing_dirs"] = missing
 
     return total_results, missing
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Image-to-Video Evaluation")
-    parser.add_argument("dataset", type=str, choices=["davis", "mannequin", "tanks"], help="Dataset to use for evaluation.")
-    parser.add_argument("--scratch", action="store_true", help="If set, all the images, depth, and trajectories are re-organized and re-generated.")
-    parser.add_argument("--method", type=str, default="mine", choices=["mine", "nvssolver", "trajattn", "trajcrafter", "das", "invstitch"], help="Method to use for generation. 'nvssolver' uses NVS-Solver, 'trajattn' uses Trajectory Attention, and 'das' uses DiffusionAsShader.")
+    parser = argparse.ArgumentParser(description="Video-to-Video Evaluation")
+    parser.add_argument("dataset", type=str, choices=["davis"], help="Dataset to use for evaluation.")
+    parser.add_argument("--data_root", type=str, default="/mnt/data/", help="Root directory of the datasets.")
+    parser.add_argument("--method", type=str, default="mine", choices=["mine", "nvssolver", "trajattn", "trajcrafter", "das"], help="Method to use for generation. 'nvssolver' uses NVS-Solver, 'trajattn' uses Trajectory Attention, and 'das' uses DiffusionAsShader.")
     parser.add_argument("--use_mesh", action="store_true", help="If set, use mesh for trajectory extraction.")
+    parser.add_argument("--scratch", action="store_true", help="If set, all the images, depth, and trajectories are re-organized and re-generated.")
     args = parser.parse_args()
 
     # 0. Set up paths
     if args.dataset == "davis":
-        data_root = "/mnt/data/DAVIS/JPEGImages/Full-Resolution"
-        input_root = "./davis_input"
-        output_root = "./davis_output"
-    elif args.dataset == "mannequin":
-        data_root = "/mnt/data/MannequinChallengeHQ/validation_frames"
-        input_root = "./mannequin_challenge_input"
-        output_root = "./mannequin_challenge_output"
-    elif args.dataset == "tanks":
-        data_root = "/mnt/data/TanksAndTemples"
-        input_root = "./tanks_and_temples_input"
-        output_root = "./tanks_and_temples_output"
+        data_root = os.path.join(args.data_root, "DAVIS/JPEGImages/Full-Resolution")
+        input_root = "./davis_video_input"
+        output_root = "./davis_video_output"
     else:
         raise NotImplementedError(f"Dataset '{args.dataset}' is not implemented.")
 
     # 1. Organize RGB images & Depth estimation
     if args.scratch:
-        # if args.dataset == "mannequin":
-        #     reorganize_frames(data_root)
-        organize_images_and_depth(data_root=data_root, input_root=input_root, output_root=output_root)
+        organize_videos_and_depth(data_root=data_root, input_root=input_root, output_root=output_root)
 
         scene_motion_degree_pairs = []
         for i, scene in enumerate(sorted(os.listdir(input_root))):
@@ -858,7 +732,7 @@ if __name__ == '__main__':
             future_to_task_info = {}
             for scene, motion, degree in scene_motion_degree_pairs:
                 gpu_id_for_task = GPUS[job_idx_for_gpu_assignment % len(GPUS)]
-                future = executor.submit(run_generation_task, input_root, output_root, scene, motion, degree, gpu_id_for_task, args.method)
+                future = executor.submit(run_generation_task, output_root, scene, motion, degree, gpu_id_for_task, args.method)
                 future_to_task_info[future] = (scene, motion, degree, gpu_id_for_task)
                 job_idx_for_gpu_assignment += 1 # This ensures round-robin submission to GPUs
 
@@ -874,48 +748,30 @@ if __name__ == '__main__':
                     raise exc
 
         # 4. Pixelwise metrics calculation
-        pixelwise_results, _ = run_pixelwise_metrics_calculation(
-            output_root,
-            allow_resize=(args.method in ["trajcrafter", "das"]),
-            allow_missing_frames=(args.method == "invstitch"),
-        )
+        pixelwise_results, _ = run_pixelwise_metrics_calculation(output_root, allow_resize=(args.method in ["trajcrafter", "das"]))
         with open(os.path.join(output_root, "pixelwise_results.txt"), "w") as f:
             json.dump(pixelwise_results, f, indent=4)
 
-        # 5. Camera pose error calculation
-        camera_pose_results, _ = run_camera_pose_error_calculation(output_root)
-        with open(os.path.join(output_root, "camera_pose_results.txt"), "w") as f:
-            json.dump(camera_pose_results, f, indent=4)
-
-        # 6-1. FID/KID calculation
+        # 5. FID/FVD calculation
         fid_score, kid_score = run_fid_kid_calculation(
             data_root=data_root,
             output_root=output_root,
         )
-        with open(os.path.join(output_root, "fid_fvd.txt"), "w") as f:
-            f.write(f"FID: {fid_score}\nKDI: {kid_score}")
-
-        if args.method == "invstitch":
-            print("InvStitch skips FVD and SED/MEt3R calculation.")
-            exit()
-
-        # 6-2. FVD calculation
         fvd_videogpt, fvd_stylegan = run_fvd_calculation(
             data_root=data_root,
             output_root=output_root,
         )
-        with open(os.path.join(output_root, "fid_fvd.txt"), "a") as f:
-            f.write(f"FVD (VideoGPT): {fvd_videogpt}\nFVD (StyleGAN): {fvd_stylegan}")
+        with open(os.path.join(output_root, "fid_fvd.txt"), "w") as f:
+            f.write("FID: " + str(fid_score) + \
+                    "\nKID: " + str(kid_score) + \
+                    "\nFVD (VideoGPT): " + str(fvd_videogpt) + \
+                    "\nFVD (StyleGAN): " + str(fvd_stylegan) + \
+                    "\n")
 
-        # 7. SED calculation
-        sed_results = run_sed_calculation(output_root)
-        with open(os.path.join(output_root, "sed.txt"), "w") as f:
-            json.dump(sed_results, f, indent=4)
-
-        # 8. MEt3R calculation
-        met3r_results, _ = run_met3r_calculation(output_root, process_size=256, resize_mode="area")
-        with open(os.path.join(output_root, "met3r.txt"), "w") as f:
-            json.dump(met3r_results, f, indent=4)
+        # 6. Camera pose error calculation
+        camera_pose_results, _ = run_camera_pose_error_calculation(input_root, output_root)
+        with open(os.path.join(output_root, "camera_pose_results.txt"), "w") as f:
+            json.dump(camera_pose_results, f, indent=4)
 
     except KeyboardInterrupt:
         print("Caught KeyboardInterrupt, shutting down.")

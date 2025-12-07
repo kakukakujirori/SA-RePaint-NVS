@@ -232,6 +232,7 @@ def eval_sed(
         sed_thresholds: tuple[float, float] = (0.0, 1.0),
         save_sed_graph_to: Optional[str] = None,
         gpu_id: int = 0,
+        verbose: bool = False,
     ):
     colmap_image_dir = os.path.join(colmap_root, "images")
     colmap_database_path = os.path.join(colmap_root, "colmap.db")
@@ -265,12 +266,12 @@ def eval_sed(
     env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
     # feature extraction
-    cmd = f'colmap feature_extractor --SiftExtraction.use_gpu 1 --SiftExtraction.edge_threshold 30 --ImageReader.camera_model PINHOLE --ImageReader.single_camera 1 --database_path {colmap_database_path} --image_path {colmap_image_dir}'
-    subprocess.run(cmd, shell=True, capture_output=True, env=env)
+    cmd = f'colmap feature_extractor --SiftExtraction.edge_threshold 30 --ImageReader.camera_model PINHOLE --ImageReader.single_camera 1 --database_path {colmap_database_path} --image_path {colmap_image_dir}'
+    subprocess.run(cmd, shell=True, capture_output=not verbose, env=env)
 
     # feature matcher
     cmd = f'colmap exhaustive_matcher --database_path {colmap_database_path}'
-    subprocess.run(cmd, shell=True, capture_output=True, env=env)
+    subprocess.run(cmd, shell=True, capture_output=not verbose, env=env)
 
     # Read COLMAP database
     reader = DB_reader(colmap_database_path)

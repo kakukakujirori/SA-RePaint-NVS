@@ -35,7 +35,7 @@ python src/trajectory_extraction.py \
   --use_mesh
 
 # generaiton
-python src/generate.py \
+python src/generate_faithful_svd.py \
   --output_folder output/${ITEM}/${CAMERA_MOTION_MODE}_${DEGREE}/generated \
   --trajectory_folder output/${ITEM}/${CAMERA_MOTION_MODE}_${DEGREE}/warped \
   --num_frames ${NUM_FRAMES} \

@@ -39,14 +39,14 @@ GPUS = [0, 1]
 MAX_WORKER_NUM = 16
 
 
-def run_generation_task(output_root: str, scene: str, gpu_id: int, method: str = "mine") -> str:
+def run_generation_task(output_root: str, scene: str, gpu_id: int, method: str = "faithful_svd") -> str:
     task_id = f"Scene: {scene}, GPU: {gpu_id}"
     print(f"STARTING task: {task_id}")
     with torch.cuda.device(f'cuda:{gpu_id}'):
         torch.cuda.empty_cache()
     try:
-        if method == "mine":
-            result = subprocess.run(["python", "src/generate.py",
+        if method == "faithful_svd":
+            result = subprocess.run(["python", "src/generate_faithful_svd.py",
                 "--output_folder", f"{output_root}/{scene}/generated",
                 "--trajectory_folder", f"{output_root}/{scene}/warped",
                 "--num_frames", f"{NUM_FRAMES}",
@@ -600,13 +600,13 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Image-to-Video Evaluation")
     parser.add_argument("--dataset", type=str, choices=["dycheck"], default="dycheck", help="Dataset to use for evaluation.")
     parser.add_argument("--scratch", action="store_true", help="If set, all the images, depth, and trajectories are re-organized and re-generated.")
-    parser.add_argument("--method", type=str, default="mine", choices=["mine", "nvssolver", "trajattn", "trajcrafter", "das"], help="Method to use for generation. 'nvssolver' uses NVS-Solver, 'trajattn' uses Trajectory Attention, and 'das' uses DiffusionAsShader.")
+    parser.add_argument("--method", type=str, default="faithful_svd", choices=["faithful_svd", "nvssolver", "trajattn", "trajcrafter", "das"], help="Method to use for generation. 'nvssolver' uses NVS-Solver, 'trajattn' uses Trajectory Attention, and 'das' uses DiffusionAsShader.")
     parser.add_argument("--use_mesh", action="store_true", help="If set, use mesh for trajectory extraction.")
     args = parser.parse_args()
 
     # 0. Set up paths
     if args.dataset == "dycheck":
-        data_root = "/mnt/hdd1/ryotaro/data/iphone"
+        data_root = "/mnt/data/iphone"
         rendered_root = "./dycheck_rendered"
         output_root = "./dycheck_output"
     else:
@@ -617,11 +617,11 @@ if __name__ == '__main__':
 
     if args.scratch:
         # 2. Trajectory Extraction
-        # for sequence in available_scenes:
-        #     cmd = ["python", "src/render_dycheck.py", "--data_root", data_root, "--output_folder", rendered_root, "--sequence", sequence]
-        #     cmd += ["--save_trajectory_type", "2d_npy"] if args.method == "trajattn" else []
-        #     cmd += ["--use_mesh"] if args.use_mesh else []
-        #     subprocess.run(cmd, check=True, capture_output=True, text=True, encoding='utf-8')
+        for sequence in available_scenes:
+            cmd = ["python", "src/render_dycheck.py", "--data_root", data_root, "--output_folder", rendered_root, "--sequence", sequence]
+            cmd += ["--save_trajectory_type", "2d_npy"] if args.method == "trajattn" else []
+            cmd += ["--use_mesh"] if args.use_mesh else []
+            subprocess.run(cmd, check=True, capture_output=True, text=True, encoding='utf-8')
 
         # thin out processing scenes
         os.makedirs(output_root, exist_ok=True)

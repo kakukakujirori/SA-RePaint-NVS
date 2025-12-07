@@ -216,14 +216,14 @@ def run_trajectory_extraction(
         return f"Unexpected error for {task_id}: {e}"
 
 
-def run_generation_task(output_root: str, scene: str, motion_mode: str, degree: float, gpu_id: int, method: str = "mine") -> str:
+def run_generation_task(output_root: str, scene: str, motion_mode: str, degree: float, gpu_id: int, method: str = "faithful_svd") -> str:
     task_id = f"Scene: {scene}, Motion: {motion_mode + '_' + str(degree)}, GPU: {gpu_id}"
     print(f"STARTING task: {task_id}")
     with torch.cuda.device(f'cuda:{gpu_id}'):
         torch.cuda.empty_cache()
     try:
-        if method == "mine":
-            result = subprocess.run(["python", "src/generate.py",
+        if method == "faithful_svd":
+            result = subprocess.run(["python", "src/generate_faithful_svd.py",
                 "--output_folder", f"{output_root}/{scene}/{motion_mode}_{degree}/generated",
                 "--trajectory_folder", f"{output_root}/{scene}/{motion_mode}_{degree}/warped",
                 "--num_frames", f"{NUM_FRAMES}",
@@ -658,7 +658,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Video-to-Video Evaluation")
     parser.add_argument("dataset", type=str, choices=["davis"], help="Dataset to use for evaluation.")
     parser.add_argument("--data_root", type=str, default="/mnt/data/", help="Root directory of the datasets.")
-    parser.add_argument("--method", type=str, default="mine", choices=["mine", "nvssolver", "trajattn", "trajcrafter", "das"], help="Method to use for generation. 'nvssolver' uses NVS-Solver, 'trajattn' uses Trajectory Attention, and 'das' uses DiffusionAsShader.")
+    parser.add_argument("--method", type=str, default="faithful_svd", choices=["faithful_svd", "nvssolver", "trajattn", "trajcrafter", "das"], help="Method to use for generation. 'nvssolver' uses NVS-Solver, 'trajattn' uses Trajectory Attention, and 'das' uses DiffusionAsShader.")
     parser.add_argument("--use_mesh", action="store_true", help="If set, use mesh for trajectory extraction.")
     parser.add_argument("--scratch", action="store_true", help="If set, all the images, depth, and trajectories are re-organized and re-generated.")
     args = parser.parse_args()

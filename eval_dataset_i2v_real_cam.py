@@ -310,14 +310,14 @@ def render_point_cloud(
         raise NotImplementedError(f"Invalid save_trajectory_type: {save_trajectory_type}")
 
 
-def run_generation_task(input_root: str, output_root: str, scene: str, gpu_id: int, method: str = "mine") -> str:
+def run_generation_task(input_root: str, output_root: str, scene: str, gpu_id: int, method: str = "faithful_svd") -> str:
     task_id = f"Scene: {scene}, GPU: {gpu_id}"
     print(f"STARTING task: {task_id}")
     with torch.cuda.device(f'cuda:{gpu_id}'):
         torch.cuda.empty_cache()
     try:
-        if method == "mine":
-            result = subprocess.run(["python", "src/generate.py",
+        if method == "faithful_svd":
+            result = subprocess.run(["python", "src/generate_faithful_svd.py",
                 "--output_folder", f"{output_root}/{scene}/generated",
                 "--trajectory_folder", f"{output_root}/{scene}/warped",
                 "--num_frames", f"{NUM_FRAMES}",
@@ -955,7 +955,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Image-to-Video Evaluation")
     parser.add_argument("dataset", type=str, choices=["mannequin", "dl3dv_half"], help="Dataset to use for evaluation.")
     parser.add_argument("--data_root", type=str, default="/mnt/data/", help="Root directory of the datasets.")
-    parser.add_argument("--method", type=str, default="mine", choices=["mine", "nvssolver", "trajattn", "trajcrafter", "das", "invstitch"], help="Method to use for generation. 'nvssolver' uses NVS-Solver, 'trajattn' uses Trajectory Attention, and 'das' uses DiffusionAsShader.")
+    parser.add_argument("--method", type=str, default="faithful_svd", choices=["faithful_svd", "faithful_wan", "nvssolver", "trajattn", "trajcrafter", "das", "invstitch"], help="Method to use for generation. 'nvssolver' uses NVS-Solver, 'trajattn' uses Trajectory Attention, and 'das' uses DiffusionAsShader.")
     parser.add_argument("--use_mesh", action="store_true", help="If set, use mesh for trajectory extraction.")
     parser.add_argument("--scratch", action="store_true", help="If set, all the images, depth, and trajectories are re-organized and re-generated.")
     args = parser.parse_args()

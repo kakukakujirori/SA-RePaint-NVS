@@ -5,10 +5,12 @@
 
 ## Installation
 
-1. Create a conda environment (MAKE SURE to install xformers here)
+1. Create a conda environment
+    - MAKE SURE to install xformers here.
+    - Change the CUDA version in the `--index-url` based on your environment.
     ```bash
-    conda create -n myenv python=3.12
-    conda activate myenv
+    conda create -n faithful_nvs python=3.12
+    conda activate faithful_nvs
     conda install conda-forge::imagemagick
     conda install conda-forge::ffmpeg
     pip3 install torch torchvision xformers --index-url https://download.pytorch.org/whl/cu126
@@ -16,8 +18,8 @@
 
 2. Clone the repository
     ```bash
-    git clone --recursive git@github.com:kakukakujirori/My-NVS-Solver.git
-    cd My-NVS-Solver
+    git clone --recursive https://github.com/kakukakujirori/FaithfulNVS.git
+    cd FaithfulNVS
     bash patch/apply_patch.sh  # apply patch to submodules
     pip3 install -r requirements.txt
     ```
@@ -61,7 +63,7 @@ Make sure you have [colmap](https://colmap.github.io/install.html) and [glomap](
 
 You also need to install additional dependencies:
 ```bash
-conda activate my_env
+conda activate faithful_nvs
 pip3 install git+https://github.com/ByteDance-Seed/Depth-Anything-3.git
 pip3 install --no-build-isolation git+https://github.com/mohammadasim98/met3r
 pip3 install --no-build-isolation git+https://github.com/nv-tlabs/vipe.git
@@ -109,7 +111,7 @@ $(DATA_ROOT)
 python eval_dataset_i2v_scripted_cam.py [davis/tanks] --data_root ${DATA_ROOT} --method XXX --use_mesh [--scratch]
 ```
 
-- `--method` : which inpainting method to use (`mine`, `wan`, `trajcrafter`, `trajattn`, `nvssolver`, `das`)
+- `--method` : which inpainting method to use (`faithful_svd`, `faithful_wan`, `trajcrafter`, `trajattn`, `nvssolver`, `das`)
 - `--use_mesh` : If set, mesh-based rendering is used. If not, NVS-Solver's bilinear splatting is used. We recommend adding this flag.
 - `--scratch` : Set when you run the evaluation for the first time. If not set, the code assumes that rendering has already completed and its results are stored in a particular folder.
 

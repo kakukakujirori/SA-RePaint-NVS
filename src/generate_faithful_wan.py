@@ -798,8 +798,8 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                         print(f"SKIP SA-REPAINT!!! {i=}, {j=}")
                         break
 
-                    # os.makedirs("dump", exist_ok=True)
-                    # torch.save(pseudo_x0, f"dump/pseudo_x0_ori_{i}_{j}.pt")
+                    os.makedirs("dump", exist_ok=True)
+                    torch.save(pseudo_x0, f"dump/pseudo_x0_ori_{i}_{j}.pt")
 
                     # alignment
                     if i < self._num_timesteps * 1 // 5:
@@ -812,8 +812,11 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                             max_iters=100,
                             num_control_points=None,#num_frames//3,
                             fix_first_frame=True,
-                            acceleration_penalty_weight=0.5,
+                            smoothness_weight=0.,
+                            smoothness_order=0.5,
                             padding_mode="border",
+                            padding_noise_std=0.1,
+                            init_homography=M_init,
                         )
                         from kornia.geometry.transform.imgwarp import homography_warp
                         latents_ori = homography_warp(
@@ -824,9 +827,9 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                         )
                         latents_ori = rearrange(latents_ori, "(b f) c h w -> b f c h w", b=latents.shape[0])
 
-                        # os.makedirs("dump", exist_ok=True)
-                        # torch.save(M, f"dump/homography_{i}_{j}.pt")
-                        # torch.save(pseudo_x0, f"dump/pseudo_x0_{i}_{j}.pt")
+                        os.makedirs("dump", exist_ok=True)
+                        torch.save(M, f"dump/homography_{i}_{j}.pt")
+                        torch.save(pseudo_x0, f"dump/pseudo_x0_{i}_{j}.pt")
                         # torch.save(latents_ori, f"dump/latents_ori_{i}_{j}.pt")
 
                     # resampling
@@ -1046,10 +1049,14 @@ if __name__ == '__main__':
 
     # load pipeline
     model_id = "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
-    vae = AutoencoderKLWan.from_pretrained(model_id, subfolder="vae", torch_dtype=torch.float32)
+    vae = AutoencoderKLWan.from_pretrained(model_id, subfolder="vae", torch_dtype=torch.bfloat16)
     transformer = MyWanTransformer3DModel.from_pretrained(model_id, subfolder="transformer", torch_dtype=torch.bfloat16)
     pipe = WanImageToVideoPipeline.from_pretrained(model_id, vae=vae, transformer=transformer, torch_dtype=torch.bfloat16)
     pipe.scheduler = FlowMatchEulerDiscreteScheduler.from_config(pipe.scheduler.config)
+
+    # FIX: text encoder.encoder.embed_tokens.weight | MISSING
+    pipe.text_encoder.encoder.embed_tokens.weight = pipe.text_encoder.shared.weight
+
     pipe.enable_model_cpu_offload(device=device)
 
     # load captioner

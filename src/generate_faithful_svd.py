@@ -720,7 +720,8 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
                                 max_iters=100,
                                 num_control_points=None,#num_frames//3,
                                 fix_first_frame=True,
-                                acceleration_penalty_weight=0.5,
+                                smoothness_weight=0.5,
+                                smoothness_order=2,
                                 padding_mode="border",
                             )
                             from kornia.geometry.transform.imgwarp import homography_warp

@@ -98,6 +98,55 @@ def interpolate_linear(signal, times):
     return interpolation
 
 
+def compute_corner_motion_smoothness(
+    homography_matrices: Float[torch.Tensor, "batch num_frames 3 3"],
+    order: int = 1,
+) -> Float[torch.Tensor, ""]:
+    """
+    Compute smoothness regularization based on corner point motion:
+    1. Transforms 4 image corners through each homography matrix
+    2. Computes first/second-order finite differences of corner positions
+    3. Returns the mean absolute acceleration as a loss term
+
+    Args:
+        homography_matrices: Homography matrices of shape (batch, num_frames, 3, 3)
+        order: Order of the finite difference (1 for first-order, 2 for second-order)
+
+    Returns:
+        Scalar loss representing mean corner acceleration magnitude
+    """
+    batch, num_frames, _, _ = homography_matrices.shape
+
+    if num_frames < 3:  # motion smoothness undefined
+        return torch.tensor(0.0, device=homography_matrices.device, dtype=homography_matrices.dtype)
+
+    # Define 4 corners in normalized coordinates [-1, 1] x [-1, 1]
+    # Shape: (4, 3) in homogeneous coordinates
+    corners = torch.tensor([
+        [-1.0, -1.0, 1.0],  # top-left
+        [ 1.0, -1.0, 1.0],  # top-right
+        [ 1.0,  1.0, 1.0],  # bottom-right
+        [-1.0,  1.0, 1.0],  # bottom-left
+    ], device=homography_matrices.device, dtype=homography_matrices.dtype)  # (4, 3)
+
+    # Apply homography to corners: (H @ p)^T = p^T @ H^T
+    # corners (1, 1, 4, 3) broadcasts with H.mT (batch, num_frames, 3, 3)
+    transformed_corners_homo = torch.matmul(corners[None, None], homography_matrices.mT)  # (batch, num_frames, 4, 3)
+
+    # Convert from homogeneous to Cartesian coordinates
+    transformed_corners = transformed_corners_homo[:, :, :, :2] / (transformed_corners_homo[:, :, :, 2:3] + 1e-8)  # (batch, num_frames, 4, 2)
+
+    # Compute [1/2]-order finite difference
+    if order == 1:
+        diff = transformed_corners[:, 1:] - transformed_corners[:, :-1]
+    elif order == 2:
+        diff = transformed_corners[:, 2:, :, :] - 2 * transformed_corners[:, 1:-1, :, :] + transformed_corners[:, :-2, :, :]
+    else:
+        raise NotImplementedError(f"{order=} unsupported.")
+
+    return diff.abs().mean()
+
+
 @torch.enable_grad()
 def homography_estimation(
         frames_src: Float[torch.Tensor, "batch num_frames c h w"],
@@ -108,8 +157,11 @@ def homography_estimation(
         max_iters: int = 100,
         num_control_points: Optional[int] = None,
         fix_first_frame: bool = True,
-        acceleration_penalty_weight: float = 0.5,  # regularization to prevent erratic warp
-        padding_mode: str = "border",
+        smoothness_weight: float = 0.5,  # regularization to prevent erratic warp
+        smoothness_order: int = 2,
+        padding_mode: str = "border",  # 'zeros', 'border', 'reflection'
+        padding_noise_std: float = 0.0,
+        init_homography: Optional[Float[torch.Tensor, "batch num_control_points 3 3"]] = None,
     ):
     batch, num_frames, channel, height, width = frames_src.shape
     assert frames_src.shape == frames_dst.shape, f"{frames_src.shape=}"
@@ -136,6 +188,13 @@ def homography_estimation(
     homography_params = torch.nn.Parameter(torch.zeros(batch, 8, num_control_points).to(frames_src))
     homography_params.data[:, 0, :] = 1.0
     homography_params.data[:, 4, :] = 1.0
+
+    if init_homography is not None:
+        init_homography_params = rearrange(init_homography, "b num_control_points m n -> b (m n) num_control_points", m=3, n=3)
+        init_homography_params = init_homography_params[:, :8, :] / init_homography_params[:, 8:9, :]  # NOTE: Assume the right bottom is non-zero
+        assert init_homography_params.shape == (batch, 8, num_control_points), f"{init_homography_params.shape=}"
+        homography_params.data.copy_(init_homography)
+
     homography_query_times = torch.linspace(0, 1, num_frames).reshape(1, num_frames).expand(batch, -1).to(frames_src)
     loss_func = torch.nn.L1Loss()
     optimizer = torch.optim.Adam([homography_params], lr=lr)
@@ -157,11 +216,8 @@ def homography_estimation(
 
         # update
         loss_reconst = loss_func(src_warped[frames_dst_mask_sh], frames_dst_sh[frames_dst_mask_sh])
-        if num_control_points >= 3:
-            loss_regularize = (homography_params[:, :, 2:] - 2 * homography_params[:, :, 1:-1] + homography_params[:, :, :-2]).abs().mean() * acceleration_penalty_weight
-        else:
-            loss_regularize = 0
-        loss = loss_reconst + loss_regularize
+        loss_regularize = compute_corner_motion_smoothness(M.reshape(batch, num_frames, 3, 3), order=smoothness_order)
+        loss = loss_reconst + loss_regularize * smoothness_weight
         loss.backward()
         if fix_first_frame:
             homography_params.grad[:, :, 0] = 0.0  # Zero grad for 0-th control point
@@ -178,5 +234,15 @@ def homography_estimation(
             dsize=(height, width),
             padding_mode=padding_mode,
         ).reshape_as(frames_src)
+
+        if padding_noise_std > 0:
+            valid_region = homography_warp(
+                torch.ones(batch * num_frames, 1, height, width, dtype=frames_src.dtype, device=frames_src.device),
+                M,
+                dsize=(height, width),
+                padding_mode='zeros',
+            ).reshape(batch, num_frames, 1, height, width)
+            noise = torch.randn_like(src_warped) * padding_noise_std
+            src_warped += noise * (1 - valid_region)
 
     return M, src_warped

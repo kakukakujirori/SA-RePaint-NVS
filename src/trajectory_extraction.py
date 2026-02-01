@@ -592,6 +592,63 @@ def save_images(
         assert tracking_tensor.shape[0] == len(poses)
         np.save(os.path.join(save_path, 'trans_coordinates_rgb.npy'), tracking_tensor.cpu().numpy())
 
+    elif save_trajectory_type == "2d_homography":
+        trans_coordinates_list = [coords[:, :, :2] for coords in trans_coordinates_3D_list]
+
+        # overwrite the first frame trans coordinates and valid (just in case)
+        trans_coordinates_list[0] = create_grid(height, width)
+        trans_valid_list[0] = trans_valid_list[0] + True
+
+        # homography fitting
+        from tqdm import tqdm
+        homographies = []
+        for trans_coord, valid_area in tqdm(zip(trans_coordinates_list, trans_valid_list), desc="Fitting homography", total=len(trans_valid_list)):
+            src_points = create_grid(height, width)[valid_area].reshape(-1, 2)
+            tgt_points = trans_coord[valid_area].reshape(-1, 2)
+            if len(src_points) >= 4:
+                M, _ = cv2.findHomography(src_points, tgt_points, cv2.LMEDS)  # NOTE: cv2.RANSAC is likely to cause fluctuation
+                if M is None or np.abs(np.linalg.det(M)) < 1e-5:
+                    M = homographies[-1] if len(homographies) > 0 else np.eye(3)
+            else:
+                M = homographies[-1] if len(homographies) > 0 else np.eye(3)
+            homographies.append(M / M[2,2])
+        homographies = np.stack(homographies, axis=0)
+
+        # homography smoothing (element-wise)
+        from scipy.signal import savgol_filter
+        smoothing_method = "polyfit"  # "savgol"
+        N = homographies.shape[0]
+        smoothed_homographies = np.zeros_like(homographies)
+
+        for i in range(3):
+            for j in range(3):
+                if smoothing_method == "savgol":
+                    smoothed_homographies[:, i, j] = savgol_filter(
+                        homographies[:, i, j],
+                        window_length=N//2+(1 if N//2 % 2 == 0 else 0),
+                        polyorder=2,
+                        axis=0
+                    )
+                elif smoothing_method == "polyfit":
+                    coeffs = np.polyfit(np.arange(N), homographies[:, i, j], 2)
+                    p = np.poly1d(coeffs)
+                    smoothed_homographies[:, i, j] = p(np.arange(N))
+                else:
+                    raise NotImplementedError(f"Invalid smoothing_method: {smoothing_method}")
+
+        homographies = smoothed_homographies
+
+        # convert to kornia format ([0, H/W] -> [-1, 1])
+        import torch
+        from kornia.geometry.conversions import normalize_homography
+        M_kornia = normalize_homography(
+            torch.from_numpy(homographies),
+            (height, width), # Source size
+            (height, width)  # Dest size
+        )
+        M_kornia = torch.linalg.inv(M_kornia)
+        np.save(os.path.join(save_path, 'trans_coordinates_homography.npy'), M_kornia.numpy())
+
     elif save_trajectory_type is None:
         pass
     else:
@@ -697,7 +754,7 @@ if __name__== '__main__':
     parser.add_argument(
         "--save_trajectory_type",
         type=str,
-        choices=[None, "2d_npy", "3d_rgb"],
+        choices=[None, "2d_npy", "3d_rgb", "2d_homography"],
         default=None,
         help="If set, the trajectory will be saved as a numpy file. (Use it for TrajectoryAttention or DiffusionAsShader)"
     )

@@ -535,6 +535,7 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         num_frames: int = 81,
         num_inference_steps: int = 50,
         guidance_scale: float = 5.0,
+        warping_homographies: Optional[np.ndarray | list[np.ndarray]] = None,
         num_videos_per_prompt: Optional[int] = 1,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         latents: Optional[torch.Tensor] = None,
@@ -669,6 +670,19 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
             warped_images[i] = PIL.Image.fromarray(img)
             # warped_images[i].save(f"inpainted_{i}.png")
 
+        # Prepare init homographies
+        if warping_homographies is not None:
+            if isinstance(warping_homographies, (list, tuple)):
+                warping_homographies = np.stack(warping_homographies, axis=0)
+            assert warping_homographies.shape == (num_frames, 3, 3), f"{warping_homographies.shape=}"
+            # thin out
+            M_init = [warping_homographies[0]] + [w for w in warping_homographies[2::4]]
+            M_init = torch.from_numpy(np.stack(M_init, axis=0)).to(device).reshape(1, -1, 3, 3)
+            torch.save(M_init, "dump/homography_init.pt")
+        else:
+            M_init = None
+            raise ValueError("Experimenting with `warping_homographies`, so it's must. Please remove this line afterwards.")
+
         # 2. Define call parameters
         if prompt is not None and isinstance(prompt, str):
             batch_size = 1
@@ -798,8 +812,8 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                         print(f"SKIP SA-REPAINT!!! {i=}, {j=}")
                         break
 
-                    os.makedirs("dump", exist_ok=True)
-                    torch.save(pseudo_x0, f"dump/pseudo_x0_ori_{i}_{j}.pt")
+                    # os.makedirs("dump", exist_ok=True)
+                    # torch.save(pseudo_x0, f"dump/pseudo_x0_ori_{i}_{j}.pt")
 
                     # alignment
                     if i < self._num_timesteps * 1 // 5:
@@ -807,16 +821,15 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                             pseudo_x0,
                             rearrange(condition, "b c f h w -> b f c h w"),
                             rearrange(condition_mask, "b c f h w -> b f c h w") < 0.5,
-                            process_size=128,
+                            corner_max_shift_ratio=1,
                             lr=1e-2,
                             max_iters=100,
-                            num_control_points=None,#num_frames//3,
                             fix_first_frame=True,
-                            smoothness_weight=0.,
-                            smoothness_order=0.5,
+                            smoothness_weight=0.5,
+                            smoothness_order=2,
                             padding_mode="border",
-                            padding_noise_std=0.1,
-                            init_homography=M_init,
+                            padding_noise_std=0.2,
+                            init_homography=M_init.float(),
                         )
                         from kornia.geometry.transform.imgwarp import homography_warp
                         latents_ori = homography_warp(
@@ -831,6 +844,14 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                         torch.save(M, f"dump/homography_{i}_{j}.pt")
                         torch.save(pseudo_x0, f"dump/pseudo_x0_{i}_{j}.pt")
                         # torch.save(latents_ori, f"dump/latents_ori_{i}_{j}.pt")
+
+                    # TODO: REMOVE BELOW
+                    # if j < repaint_iter_num - 1 and i < self._num_timesteps * 1 // 5:
+                    #     sigma_t = self.scheduler.sigmas[i]
+                    #     pseudo_x0 = rearrange(pseudo_x0, "b f c h w -> b c f h w")
+                    #     latents = (1 - sigma_t) * pseudo_x0 + sigma_t * randn_tensor(
+                    #        latents.shape, generator=generator, device=latents.device, dtype=latents.dtype)
+                    #     continue
 
                     # resampling
                     if j < repaint_iter_num - 1:
@@ -1070,6 +1091,9 @@ if __name__ == '__main__':
     warped_images = [PIL.Image.open(os.path.join(args.trajectory_folder, f"{i:04d}.png")) for i in range(args.num_frames)]
     warped_masks = [PIL.Image.open(os.path.join(args.trajectory_folder, f"{i:04d}_mask.png")) for i in range(args.num_frames)]
 
+    warping_homographies_path = os.path.join(args.trajectory_folder, 'trans_coordinates_homography.npy')
+    warping_homographies = np.load(warping_homographies_path) if os.path.isfile(warping_homographies_path) else None
+
     # inference
     # monitor = GPUMemoryMonitor(gpu_id=args.gpu)
     # monitor.start()
@@ -1101,6 +1125,7 @@ if __name__ == '__main__':
         num_frames=args.num_frames,
         guidance_scale=args.guidance_scale,
         num_inference_steps=args.num_inference_steps,
+        warping_homographies=warping_homographies,
         generator=torch.Generator(device).manual_seed(args.seed),
     ).frames[0]
 

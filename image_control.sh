@@ -32,7 +32,8 @@ python src/trajectory_extraction.py \
   --num_frames ${NUM_FRAMES} \
   --control_mode image \
   --no_occlusion_revealing \
-  --use_mesh
+  --use_mesh \
+  --save_trajectory_type 2d_homography
 
 # generaiton
 python src/generate_faithful_wan.py \

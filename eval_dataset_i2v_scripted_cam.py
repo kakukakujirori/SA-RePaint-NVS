@@ -757,7 +757,7 @@ def run_met3r_calculation(output_root: str, process_size: int = 256, resize_mode
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Image-to-Video Evaluation")
     parser.add_argument("dataset", type=str, choices=["davis", "tanks"], help="Dataset to use for evaluation.")
-    parser.add_argument("--data_root", type=str, default="/mnt/data/", help="Root directory of the datasets.")
+    parser.add_argument("--data_root", type=str, default="/media/ryotaro/ssd1/", help="Root directory of the datasets.")
     parser.add_argument("--method", type=str, default="faithful_svd", choices=["faithful_svd", "faithful_wan", "nvssolver", "trajattn", "trajcrafter", "das", "invstitch"], help="Method to use for generation. 'nvssolver' uses NVS-Solver, 'trajattn' uses Trajectory Attention, and 'das' uses DiffusionAsShader.")
     parser.add_argument("--use_mesh", action="store_true", help="If set, use mesh for trajectory extraction.")
     parser.add_argument("--scratch", action="store_true", help="If set, all the images, depth, and trajectories are re-organized and re-generated.")
@@ -796,7 +796,7 @@ if __name__ == '__main__':
                     scene,
                     motion,
                     degree,
-                    save_trajectory_type=("2d_npy" if args.method == "trajattn" else "3d_rgb" if args.method == "das" else None),
+                    save_trajectory_type=("2d_npy" if args.method == "trajattn" else "3d_rgb" if args.method == "das" else "2d_homography" if args.method == "faithful_wan" else None),
                     use_mesh=args.use_mesh,
                 )
                 future_to_task_info[future] = (scene, motion, degree, None)

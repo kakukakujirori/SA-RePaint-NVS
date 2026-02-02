@@ -678,7 +678,8 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
             # thin out
             M_init = [warping_homographies[0]] + [w for w in warping_homographies[2::4]]
             M_init = torch.from_numpy(np.stack(M_init, axis=0)).to(device).reshape(1, -1, 3, 3)
-            torch.save(M_init, "dump/homography_init.pt")
+            # os.makedirs("dump", exist_ok=True)
+            # torch.save(M_init, "dump/homography_init.pt")
         else:
             M_init = None
             raise ValueError("Experimenting with `warping_homographies`, so it's must. Please remove this line afterwards.")
@@ -748,7 +749,13 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                     progress_bar.update()
                     continue
 
-                for j in range(repaint_iter_num):
+
+                apply_homography_until = self._num_timesteps * 3 // 50
+                repaint_iter_num_tmp = repaint_iter_num * 2 if i < apply_homography_until else repaint_iter_num
+
+
+
+                for j in range(repaint_iter_num_tmp):
                     latents_ori = rearrange(latents, "b c f h w -> b f c h w").float()
 
                     latent_model_input = (1 - first_frame_mask) * condition + first_frame_mask * latents
@@ -816,20 +823,21 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                     # torch.save(pseudo_x0, f"dump/pseudo_x0_ori_{i}_{j}.pt")
 
                     # alignment
-                    if i < self._num_timesteps * 1 // 5:
+                    if i < apply_homography_until:
                         M, pseudo_x0 = homography_estimation(
                             pseudo_x0,
                             rearrange(condition, "b c f h w -> b f c h w"),
                             rearrange(condition_mask, "b c f h w -> b f c h w") < 0.5,
                             corner_max_shift_ratio=1,
-                            lr=1e-2,
-                            max_iters=100,
+                            lr=1,
+                            max_iters=1,
                             fix_first_frame=True,
                             smoothness_weight=0.5,
                             smoothness_order=2,
                             padding_mode="border",
-                            padding_noise_std=0.2,
+                            padding_noise_strength=0.5,
                             init_homography=M_init.float(),
+                            constrain_to_init_line=True,
                         )
                         from kornia.geometry.transform.imgwarp import homography_warp
                         latents_ori = homography_warp(
@@ -840,21 +848,13 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                         )
                         latents_ori = rearrange(latents_ori, "(b f) c h w -> b f c h w", b=latents.shape[0])
 
-                        os.makedirs("dump", exist_ok=True)
-                        torch.save(M, f"dump/homography_{i}_{j}.pt")
-                        torch.save(pseudo_x0, f"dump/pseudo_x0_{i}_{j}.pt")
+                        # os.makedirs("dump", exist_ok=True)
+                        # torch.save(M, f"dump/homography_{i}_{j}.pt")
+                        # torch.save(pseudo_x0, f"dump/pseudo_x0_{i}_{j}.pt")
                         # torch.save(latents_ori, f"dump/latents_ori_{i}_{j}.pt")
 
-                    # TODO: REMOVE BELOW
-                    # if j < repaint_iter_num - 1 and i < self._num_timesteps * 1 // 5:
-                    #     sigma_t = self.scheduler.sigmas[i]
-                    #     pseudo_x0 = rearrange(pseudo_x0, "b f c h w -> b c f h w")
-                    #     latents = (1 - sigma_t) * pseudo_x0 + sigma_t * randn_tensor(
-                    #        latents.shape, generator=generator, device=latents.device, dtype=latents.dtype)
-                    #     continue
-
                     # resampling
-                    if j < repaint_iter_num - 1:
+                    if j < repaint_iter_num_tmp - 1:
                         sigma_t = self.scheduler.sigmas[i]
 
                         if i < self._num_timesteps * 0 // 2:

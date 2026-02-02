@@ -1,4 +1,5 @@
 from typing import Literal
+import math
 
 import torch
 import torch.nn.functional as F
@@ -22,8 +23,9 @@ def homography_estimation(
         smoothness_weight: float = 0.5,  # regularization to prevent erratic warp
         smoothness_order: int = 2,
         padding_mode: str = "border",  # 'zeros', 'border', 'reflection'
-        padding_noise_std: float = 0.0,
+        padding_noise_strength: float = 0.0,
         init_homography: Float[torch.Tensor, "batch num_frames 3 3"] | None = None,
+        constrain_to_init_line: bool = True,
     ):
     batch, num_frames, channel, height, width = frames_src.shape
     assert frames_src.shape == frames_dst.shape, f"{frames_src.shape=}"
@@ -56,9 +58,6 @@ def homography_estimation(
     else:
         raise NotImplementedError(f"{loss_type=} unsupported.")
 
-    delta = torch.nn.Parameter(torch.zeros(batch, num_frames, 4, 2, device=frames_src.device, dtype=frames_src.dtype))
-    optimizer = torch.optim.Adam([delta], lr=lr)
-
     # base corners
     corners_src = torch.tensor([
         [-1.0, -1.0],  # top-left
@@ -66,22 +65,67 @@ def homography_estimation(
         [ 1.0,  1.0],  # bottom-right
         [-1.0,  1.0],  # bottom-left
     ], device=frames_src.device, dtype=frames_src.dtype).reshape(1, 1, 4, 2).expand(batch, num_frames, 4, 2)
-    if init_homography is not None:
+
+    alpha = None
+    delta = None
+    compute_delta = None
+
+    if constrain_to_init_line:
+        if init_homography is None:
+            raise NotImplementedError("constrain_to_init_line=True requires init_homography.")
+
         corners_src_hom = torch.cat([corners_src, torch.ones_like(corners_src[:, :, :, 0:1])], dim=-1)
         corners_tgt_hom = torch.matmul(corners_src_hom, init_homography.mT)      # (batch, num_frames, 4, 3)
         corners_tgt = corners_tgt_hom[:, :, :, 0:2] / corners_tgt_hom[:, :, :, 2:3]  # (batch, num_frames, 4, 2)
-        delta_constrained = corners_tgt - corners_src
-        delta_init = torch.atanh(delta_constrained / (corner_max_shift_ratio * 2))
-        if not torch.isfinite(delta_init).all():
-            print("[homography_estimation] homography init failed. Increase corner_max_shift_ratio or remove init_homography. Fallback to zero init.")
-            delta_init = torch.zeros_like(delta_init)
-        delta.data = delta_init
+        direction = corners_tgt - corners_src
 
-    for iter in range(max_iters):
+        alpha = torch.nn.Parameter(torch.full((batch, num_frames, 1, 1), 0.0, device=frames_src.device, dtype=frames_src.dtype))
+        # optimizer = torch.optim.Adam([alpha], lr=lr)
+        optimizer = torch.optim.LBFGS([alpha], lr=lr, max_iter=20, history_size=10, line_search_fn="strong_wolfe")
+
+        def compute_delta():
+            return torch.sigmoid(alpha) * direction
+
+        def zero_first_frame_grad():
+            if fix_first_frame and alpha.grad is not None:
+                alpha.grad[:, 0] = 0.0
+
+    else:
+        if init_homography is not None:
+            corners_src_hom = torch.cat([corners_src, torch.ones_like(corners_src[:, :, :, 0:1])], dim=-1)
+            corners_tgt_hom = torch.matmul(corners_src_hom, init_homography.mT)      # (batch, num_frames, 4, 3)
+            corners_tgt = corners_tgt_hom[:, :, :, 0:2] / corners_tgt_hom[:, :, :, 2:3]  # (batch, num_frames, 4, 2)
+            delta_constrained = corners_tgt - corners_src
+
+            delta = torch.nn.Parameter(torch.zeros(batch, num_frames, 4, 2, device=frames_src.device, dtype=frames_src.dtype))
+            delta_init = torch.atanh(delta_constrained / (corner_max_shift_ratio * 2))
+            if not torch.isfinite(delta_init).all():
+                print("[homography_estimation] homography init failed. Increase corner_max_shift_ratio or remove init_homography. Fallback to zero init.")
+                delta_init = torch.zeros_like(delta_init)
+            delta.data = delta_init
+        else:
+            delta = torch.nn.Parameter(torch.zeros(batch, num_frames, 4, 2, device=frames_src.device, dtype=frames_src.dtype))
+
+        #optimizer = torch.optim.Adam([delta], lr=lr)
+        optimizer = torch.optim.LBFGS([delta], lr=lr, max_iter=20, history_size=10, line_search_fn="strong_wolfe")
+
+        def compute_delta():
+            return torch.tanh(delta) * corner_max_shift_ratio * 2
+
+        def zero_first_frame_grad():
+            if fix_first_frame and delta.grad is not None:
+                delta.grad[:, 0] = 0.0
+
+    # blur setup
+    from kornia.filters import GaussianBlur2d
+    blur_layer = GaussianBlur2d(kernel_size=(9, 9), sigma=(1.0, 1.0))
+    frames_dst_sh_blurred = blur_layer(frames_dst_sh.flatten(0, 1)).reshape_as(frames_dst_sh)
+
+    def compute_loss():
         optimizer.zero_grad()
 
         # move corners
-        delta_constrained = torch.tanh(delta) * corner_max_shift_ratio * 2
+        delta_constrained = compute_delta()
         corners_tgt = corners_src + delta_constrained
 
         # deduce homography
@@ -94,8 +138,11 @@ def homography_estimation(
             dsize=(height_sh, width_sh),
         ).reshape_as(frames_src_sh)
 
+        # blur src
+        src_warped = blur_layer(src_warped.flatten(0, 1)).reshape_as(src_warped)
+
         # loss
-        loss_reconst = loss_func(src_warped, frames_dst_sh)[frames_dst_mask_sh].mean()
+        loss_reconst = loss_func(src_warped, frames_dst_sh_blurred)[frames_dst_mask_sh].mean()
         if smoothness_order == 0:
             loss_regularize = delta_constrained.abs().mean()
         elif smoothness_order == 1:
@@ -108,16 +155,21 @@ def homography_estimation(
         # update
         loss = loss_reconst + loss_regularize * smoothness_weight
         loss.backward()
-        if fix_first_frame:
-            delta.grad[:, 0] = 0.0  # Zero grad for 0-th frame
-        optimizer.step()
+        zero_first_frame_grad()
+        return loss
 
-        # if iter % 100 == 0 or iter == max_iters - 1:
-        #     print(f"[homography_estimation] {iter=}, loss_reconst={loss_reconst.item()}, loss_regularize={loss_regularize.item()}")
+
+    for iter in range(max_iters):
+        #_ = compute_loss()
+        optimizer.step(compute_loss)
 
     with torch.no_grad():
         # final homography
-        delta_constrained = torch.tanh(delta) * corner_max_shift_ratio * 2
+        delta_constrained = compute_delta()
+        if constrain_to_init_line:
+            # print(f"{alpha.flatten().v=}") # Leaving commented or removed as per standard practice unless requested
+            print(f"{alpha.flatten()=}")
+
         corners_tgt = corners_src + delta_constrained
         M = get_perspective_transform(corners_src.reshape(-1, 4, 2), corners_tgt.reshape(-1, 4, 2))
 
@@ -129,14 +181,27 @@ def homography_estimation(
             padding_mode=padding_mode,
         ).reshape_as(frames_src)
 
-        if padding_noise_std > 0:
+        if padding_noise_strength > 0:
+            assert padding_noise_strength <= 1.0, f"{padding_noise_strength=} must be within [0, 1]"
             valid_region = homography_warp(
                 torch.ones(batch * num_frames, 1, height, width, dtype=frames_src.dtype, device=frames_src.device),
                 M,
                 dsize=(height, width),
                 padding_mode='zeros',
             ).reshape(batch, num_frames, 1, height, width)
-            noise = torch.randn_like(src_warped) * padding_noise_std
-            src_warped += noise * (1 - valid_region)
+            padding_mask = (valid_region < 0.5).expand_as(src_warped)
+            padding_pixel_num = padding_mask.sum(dim=(2, 3, 4), keepdim=True).clamp(min=1)
+
+            # variance in padded region
+            src_warped_mean = (src_warped * padding_mask).sum(dim=(2, 3, 4), keepdim=True) / padding_pixel_num
+            src_warped_diff = (src_warped - src_warped_mean) * padding_mask
+            src_warped_var = (src_warped_diff ** 2).sum(dim=(2, 3, 4), keepdim=True) / (padding_pixel_num - 1).clamp(min=1.0)
+            src_warped_var *= padding_pixel_num > 1
+
+            # add noise while keeping variance
+            noise = torch.randn_like(src_warped)
+            src_warped_all_noised = math.sqrt(1 - padding_noise_strength) * src_warped + \
+                                    torch.sqrt(padding_noise_strength * src_warped_var) * noise
+            src_warped[padding_mask] = src_warped_all_noised[padding_mask]
 
     return M, src_warped

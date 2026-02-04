@@ -641,13 +641,12 @@ def save_images(
         # convert to kornia format ([0, H/W] -> [-1, 1])
         import torch
         from kornia.geometry.conversions import normalize_homography
-        M_kornia = normalize_homography(
+        homographies_normalized = normalize_homography(
             torch.from_numpy(homographies),
             (height, width), # Source size
             (height, width)  # Dest size
         )
-        M_kornia = torch.linalg.inv(M_kornia)
-        np.save(os.path.join(save_path, 'trans_coordinates_homography.npy'), M_kornia.numpy())
+        np.save(os.path.join(save_path, 'trans_coordinates_homography.npy'), homographies_normalized.numpy())
 
     elif save_trajectory_type is None:
         pass

@@ -824,7 +824,7 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
 
                     # alignment
                     if i < apply_homography_until:
-                        M, pseudo_x0 = homography_estimation(
+                        M_inv, pseudo_x0 = homography_estimation(
                             pseudo_x0,
                             rearrange(condition, "b c f h w -> b f c h w"),
                             rearrange(condition_mask, "b c f h w -> b f c h w") < 0.5,
@@ -832,24 +832,25 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                             lr=1,
                             max_iters=1,
                             fix_first_frame=True,
-                            smoothness_weight=0.5,
+                            smoothness_weight=0.0,
                             smoothness_order=2,
                             padding_mode="border",
-                            padding_noise_strength=0.5,
+                            padding_noise_strength=0.3,
                             init_homography=M_init.float(),
                             constrain_to_init_line=True,
+                            invert_output_homography=True,
                         )
                         from kornia.geometry.transform.imgwarp import homography_warp
                         latents_ori = homography_warp(
                             rearrange(latents_ori, "b f c h w -> (b f) c h w"),
-                            M,
+                            rearrange(M_inv, "b f h w -> (b f) h w"),  # NOTE: homography_warp expects dst->src
                             dsize=latents.shape[-2:],
                             padding_mode="border",
                         )
                         latents_ori = rearrange(latents_ori, "(b f) c h w -> b f c h w", b=latents.shape[0])
 
                         # os.makedirs("dump", exist_ok=True)
-                        # torch.save(M, f"dump/homography_{i}_{j}.pt")
+                        # torch.save(torch.linalg.inv(M_inv), f"dump/homography_{i}_{j}.pt")
                         # torch.save(pseudo_x0, f"dump/pseudo_x0_{i}_{j}.pt")
                         # torch.save(latents_ori, f"dump/latents_ori_{i}_{j}.pt")
 

@@ -757,7 +757,7 @@ def run_met3r_calculation(output_root: str, process_size: int = 256, resize_mode
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Image-to-Video Evaluation")
     parser.add_argument("dataset", type=str, choices=["davis", "tanks"], help="Dataset to use for evaluation.")
-    parser.add_argument("--data_root", type=str, default="/media/ryotaro/ssd1/", help="Root directory of the datasets.")
+    parser.add_argument("--data_root", type=str, default="/home/ryotaro/data/", help="Root directory of the datasets.")
     parser.add_argument("--method", type=str, default="faithful_svd", choices=["faithful_svd", "faithful_wan", "nvssolver", "trajattn", "trajcrafter", "das", "invstitch"], help="Method to use for generation. 'nvssolver' uses NVS-Solver, 'trajattn' uses Trajectory Attention, and 'das' uses DiffusionAsShader.")
     parser.add_argument("--use_mesh", action="store_true", help="If set, use mesh for trajectory extraction.")
     parser.add_argument("--scratch", action="store_true", help="If set, all the images, depth, and trajectories are re-organized and re-generated.")

@@ -24,8 +24,9 @@ def homography_estimation(
         smoothness_order: int = 2,
         padding_mode: str = "border",  # 'zeros', 'border', 'reflection'
         padding_noise_strength: float = 0.0,
-        init_homography: Float[torch.Tensor, "batch num_frames 3 3"] | None = None,
+        init_homography: Float[torch.Tensor, "batch num_frames 3 3"] | None = None,  # src -> dst
         constrain_to_init_line: bool = True,
+        invert_output_homography: bool = False,  # if True, returns dst -> src
     ):
     batch, num_frames, channel, height, width = frames_src.shape
     assert frames_src.shape == frames_dst.shape, f"{frames_src.shape=}"
@@ -75,11 +76,13 @@ def homography_estimation(
             raise NotImplementedError("constrain_to_init_line=True requires init_homography.")
 
         corners_src_hom = torch.cat([corners_src, torch.ones_like(corners_src[:, :, :, 0:1])], dim=-1)
-        corners_tgt_hom = torch.matmul(corners_src_hom, init_homography.mT)      # (batch, num_frames, 4, 3)
-        corners_tgt = corners_tgt_hom[:, :, :, 0:2] / corners_tgt_hom[:, :, :, 2:3]  # (batch, num_frames, 4, 2)
-        direction = corners_tgt - corners_src
+        corners_ini_hom = torch.matmul(corners_src_hom, init_homography.mT)      # (batch, num_frames, 4, 3)
+        assert torch.all(corners_ini_hom[:, :, :, 2:3].abs()) > 1e-3, "init_homography is not valid."
+        corners_ini = corners_ini_hom[:, :, :, 0:2] / corners_ini_hom[:, :, :, 2:3]  # (batch, num_frames, 4, 2)
+        direction = corners_ini - corners_src
 
-        alpha = torch.nn.Parameter(torch.full((batch, num_frames, 1, 1), 0.0, device=frames_src.device, dtype=frames_src.dtype))
+        # NOTE: TESTING SINGLE PARAM (num_frames -> 1)
+        alpha = torch.nn.Parameter(torch.full((batch, 1, 1, 1), 0.0, device=frames_src.device, dtype=frames_src.dtype))
         # optimizer = torch.optim.Adam([alpha], lr=lr)
         optimizer = torch.optim.LBFGS([alpha], lr=lr, max_iter=20, history_size=10, line_search_fn="strong_wolfe")
 
@@ -87,15 +90,16 @@ def homography_estimation(
             return torch.sigmoid(alpha) * direction
 
         def zero_first_frame_grad():
-            if fix_first_frame and alpha.grad is not None:
+            if fix_first_frame and alpha.grad is not None and alpha.shape[1] > 1:
                 alpha.grad[:, 0] = 0.0
 
     else:
         if init_homography is not None:
             corners_src_hom = torch.cat([corners_src, torch.ones_like(corners_src[:, :, :, 0:1])], dim=-1)
-            corners_tgt_hom = torch.matmul(corners_src_hom, init_homography.mT)      # (batch, num_frames, 4, 3)
-            corners_tgt = corners_tgt_hom[:, :, :, 0:2] / corners_tgt_hom[:, :, :, 2:3]  # (batch, num_frames, 4, 2)
-            delta_constrained = corners_tgt - corners_src
+            corners_ini_hom = torch.matmul(corners_src_hom, init_homography.mT)      # (batch, num_frames, 4, 3)
+            assert torch.all(corners_ini_hom[:, :, :, 2:3].abs()) > 1e-3, "init_homography is not valid."
+            corners_ini = corners_ini_hom[:, :, :, 0:2] / corners_ini_hom[:, :, :, 2:3]  # (batch, num_frames, 4, 2)
+            delta_constrained = corners_ini - corners_src
 
             delta = torch.nn.Parameter(torch.zeros(batch, num_frames, 4, 2, device=frames_src.device, dtype=frames_src.dtype))
             delta_init = torch.atanh(delta_constrained / (corner_max_shift_ratio * 2))
@@ -128,13 +132,13 @@ def homography_estimation(
         delta_constrained = compute_delta()
         corners_tgt = corners_src + delta_constrained
 
-        # deduce homography
-        M = get_perspective_transform(corners_src.reshape(-1, 4, 2), corners_tgt.reshape(-1, 4, 2))
+        # deduce "inverse" homography (target -> source)
+        M_inv = get_perspective_transform(corners_tgt.reshape(-1, 4, 2), corners_src.reshape(-1, 4, 2))
 
         # warp
         src_warped = homography_warp(
             frames_src_sh.reshape(batch * num_frames, channel, height_sh, width_sh),
-            M,
+            M_inv,  # NOTE: homography_warp expects dst->src
             dsize=(height_sh, width_sh),
         ).reshape_as(frames_src_sh)
 
@@ -167,16 +171,16 @@ def homography_estimation(
         # final homography
         delta_constrained = compute_delta()
         if constrain_to_init_line:
-            # print(f"{alpha.flatten().v=}") # Leaving commented or removed as per standard practice unless requested
             print(f"{alpha.flatten()=}")
 
         corners_tgt = corners_src + delta_constrained
-        M = get_perspective_transform(corners_src.reshape(-1, 4, 2), corners_tgt.reshape(-1, 4, 2))
+        M_inv = get_perspective_transform(corners_tgt.reshape(-1, 4, 2), corners_src.reshape(-1, 4, 2))
+        M_inv = M_inv.reshape(batch, num_frames, 3, 3)
 
         # apply the optimized warp
         src_warped = homography_warp(
             frames_src.flatten(0, 1),
-            M,
+            M_inv.flatten(0, 1),  # NOTE: homography_warp expects dst->src
             dsize=(height, width),
             padding_mode=padding_mode,
         ).reshape_as(frames_src)
@@ -185,7 +189,7 @@ def homography_estimation(
             assert padding_noise_strength <= 1.0, f"{padding_noise_strength=} must be within [0, 1]"
             valid_region = homography_warp(
                 torch.ones(batch * num_frames, 1, height, width, dtype=frames_src.dtype, device=frames_src.device),
-                M,
+                M_inv.flatten(0, 1),  # NOTE: homography_warp expects dst->src
                 dsize=(height, width),
                 padding_mode='zeros',
             ).reshape(batch, num_frames, 1, height, width)
@@ -204,4 +208,7 @@ def homography_estimation(
                                     torch.sqrt(padding_noise_strength * src_warped_var) * noise
             src_warped[padding_mask] = src_warped_all_noised[padding_mask]
 
-    return M, src_warped
+    if invert_output_homography:
+        return M_inv, src_warped
+    else:
+        return torch.linalg.inv(M_inv), src_warped

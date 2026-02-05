@@ -614,29 +614,29 @@ def save_images(
             homographies.append(M / M[2,2])
         homographies = np.stack(homographies, axis=0)
 
-        # homography smoothing (element-wise)
-        from scipy.signal import savgol_filter
-        smoothing_method = "polyfit"  # "savgol"
-        N = homographies.shape[0]
-        smoothed_homographies = np.zeros_like(homographies)
+        # # homography smoothing (element-wise)
+        # from scipy.signal import savgol_filter
+        # smoothing_method = "polyfit"  # "savgol"
+        # N = homographies.shape[0]
+        # smoothed_homographies = np.zeros_like(homographies)
 
-        for i in range(3):
-            for j in range(3):
-                if smoothing_method == "savgol":
-                    smoothed_homographies[:, i, j] = savgol_filter(
-                        homographies[:, i, j],
-                        window_length=N//2+(1 if N//2 % 2 == 0 else 0),
-                        polyorder=2,
-                        axis=0
-                    )
-                elif smoothing_method == "polyfit":
-                    coeffs = np.polyfit(np.arange(N), homographies[:, i, j], 2)
-                    p = np.poly1d(coeffs)
-                    smoothed_homographies[:, i, j] = p(np.arange(N))
-                else:
-                    raise NotImplementedError(f"Invalid smoothing_method: {smoothing_method}")
+        # for i in range(3):
+        #     for j in range(3):
+        #         if smoothing_method == "savgol":
+        #             smoothed_homographies[:, i, j] = savgol_filter(
+        #                 homographies[:, i, j],
+        #                 window_length=N//2+(1 if N//2 % 2 == 0 else 0),
+        #                 polyorder=2,
+        #                 axis=0
+        #             )
+        #         elif smoothing_method == "polyfit":
+        #             coeffs = np.polyfit(np.arange(N), homographies[:, i, j], 2)
+        #             p = np.poly1d(coeffs)
+        #             smoothed_homographies[:, i, j] = p(np.arange(N))
+        #         else:
+        #             raise NotImplementedError(f"Invalid smoothing_method: {smoothing_method}")
 
-        homographies = smoothed_homographies
+        # homographies = smoothed_homographies
 
         # convert to kornia format ([0, H/W] -> [-1, 1])
         import torch

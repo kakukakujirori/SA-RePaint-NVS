@@ -750,7 +750,7 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                     continue
 
 
-                apply_homography_until = self._num_timesteps * 3 // 50
+                apply_homography_until = self._num_timesteps * 5 // 50
                 repaint_iter_num_tmp = repaint_iter_num * 2 if i < apply_homography_until else repaint_iter_num
 
 
@@ -835,7 +835,7 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                             smoothness_weight=0.0,
                             smoothness_order=2,
                             padding_mode="border",
-                            padding_noise_strength=0.3,
+                            padding_noise_strength=0.5,
                             init_homography=M_init.float(),
                             constrain_to_init_line=True,
                             invert_output_homography=True,

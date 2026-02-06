@@ -668,7 +668,8 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
             msk = np.array(msk).mean(axis=-1, keepdims=True).astype(np.uint8)
             img = cv2.inpaint(img, msk, 5, cv2.INPAINT_NS)
             warped_images[i] = PIL.Image.fromarray(img)
-            # warped_images[i].save(f"inpainted_{i}.png")
+            # os.makedirs("dump", exist_ok=True)
+            # warped_images[i].save(f"dump/inpainted_{i}.png")
 
         # Prepare init homographies
         if warping_homographies is not None:
@@ -833,11 +834,10 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                             max_iters=1,
                             fix_first_frame=True,
                             smoothness_weight=0.0,
-                            smoothness_order=2,
+                            smoothness_order=-1,
                             padding_mode="border",
                             padding_noise_strength=0.5,
                             init_homography=M_init.float(),
-                            constrain_to_init_line=True,
                             invert_output_homography=True,
                         )
                         from kornia.geometry.transform.imgwarp import homography_warp

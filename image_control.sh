@@ -1,4 +1,4 @@
-ITEM=breakdance_00000
+ITEM=dance-twirl_00000
 CAMERA_MOTION_MODE=horizontal
 DEGREE=-1.0
 NUM_FRAMES=25

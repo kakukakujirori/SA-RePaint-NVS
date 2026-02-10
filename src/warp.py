@@ -15,16 +15,17 @@ def homography_estimation(
         frames_dst: Float[torch.Tensor, "batch num_frames c h w"],
         frames_dst_mask: Float[torch.Tensor, "batch num_frames 1 h w"],
         process_size: int | None = None,
-        corner_max_shift_ratio: float = 0.5,  # half of the image size
         loss_type: Literal["cos_sim", "l1", "l2"] = "cos_sim",
+        optimizer_type: Literal["adam", "lbfgs"] = "adam",
         lr: float = 1e-2,
         max_iters: int = 100,
         fix_first_frame: bool = True,
         smoothness_weight: float = 0.5,  # regularization to prevent erratic warp
         smoothness_order: int = 2,
         padding_mode: str = "border",  # 'zeros', 'border', 'reflection'
-        padding_noise_strength: float = 0.0,
+        padding_noise_strength: float | str = 0.0,  # 'adaptive'
         init_homography: Float[torch.Tensor, "batch num_frames 3 3"] | None = None,  # src -> dst
+        init_alpha: float = 0.0,
         invert_output_homography: bool = False,  # if True, returns dst -> src
     ):
     batch, num_frames, channel, height, width = frames_src.shape
@@ -65,9 +66,15 @@ def homography_estimation(
     init_homography = init_homography / init_homography[..., 2:3, 2:3]
 
     # NOTE: TESTING SINGLE PARAM (num_frames -> 1)
-    alpha = torch.nn.Parameter(torch.full((batch, 1, 1, 1), -3.0, device=frames_src.device, dtype=frames_src.dtype))
-    # optimizer = torch.optim.Adam([alpha], lr=lr)
-    optimizer = torch.optim.LBFGS([alpha], lr=lr, max_iter=20, history_size=10, line_search_fn="strong_wolfe")
+    alpha = torch.nn.Parameter(torch.full((batch, 1, 1, 1), init_alpha, device=frames_src.device, dtype=frames_src.dtype))
+    if optimizer_type == "adam":
+        optimizer = torch.optim.Adam([alpha], lr=lr)
+    elif optimizer_type == "lbfgs":
+        if lr < 0.1:
+            print(f"[homography_estimation] Warning: {lr=} may be too low. Consider setting lr=1 when using LBFGS.")
+        optimizer = torch.optim.LBFGS([alpha], lr=lr, max_iter=max_iters, line_search_fn="strong_wolfe")
+    else:
+        raise NotImplementedError(f"{optimizer_type=} unsupported.")
 
     def zero_first_frame_grad():
         if fix_first_frame and alpha.grad is not None and alpha.shape[1] > 1:
@@ -109,10 +116,12 @@ def homography_estimation(
         zero_first_frame_grad()
         return loss
 
-
-    for iter in range(max_iters):
-        #_ = compute_loss()
+    if isinstance(optimizer, torch.optim.LBFGS):
         optimizer.step(compute_loss)
+    else:
+        for _ in range(max_iters):
+            compute_loss()
+            optimizer.step()
 
     with torch.no_grad():
         # final homography
@@ -129,7 +138,31 @@ def homography_estimation(
             padding_mode=padding_mode,
         ).reshape_as(frames_src)
 
-        if padding_noise_strength > 0:
+        if padding_noise_strength == "adaptive":
+            padding_noise_strength_ada = 0.5 * ratio
+            valid_region = homography_warp(
+                torch.ones(batch * num_frames, 1, height, width, dtype=frames_src.dtype, device=frames_src.device),
+                M_inv.flatten(0, 1),  # NOTE: homography_warp expects dst->src
+                dsize=(height, width),
+                padding_mode='zeros',
+            ).reshape(batch, num_frames, 1, height, width)
+            padding_mask = (valid_region < 0.5).expand_as(src_warped)
+            padding_pixel_num = padding_mask.sum(dim=(2, 3, 4), keepdim=True).clamp(min=1)
+
+            # variance in padded region
+            src_warped_mean = (src_warped * padding_mask).sum(dim=(2, 3, 4), keepdim=True) / padding_pixel_num
+            src_warped_diff = (src_warped - src_warped_mean) * padding_mask
+            src_warped_var = (src_warped_diff ** 2).sum(dim=(2, 3, 4), keepdim=True) / (padding_pixel_num - 1).clamp(min=1.0)
+            src_warped_var *= padding_pixel_num > 1
+
+            # add noise while keeping variance
+            noise = torch.randn_like(src_warped)
+            src_warped_all_noised = math.sqrt(1 - padding_noise_strength_ada) * src_warped + \
+                                    torch.sqrt(padding_noise_strength_ada * src_warped_var) * noise
+            src_warped[padding_mask] = src_warped_all_noised[padding_mask]
+
+
+        elif padding_noise_strength > 0:
             assert padding_noise_strength <= 1.0, f"{padding_noise_strength=} must be within [0, 1]"
             valid_region = homography_warp(
                 torch.ones(batch * num_frames, 1, height, width, dtype=frames_src.dtype, device=frames_src.device),

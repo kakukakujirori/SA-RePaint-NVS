@@ -753,6 +753,7 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
 
                 apply_homography_until = self._num_timesteps * 5 // 50
                 repaint_iter_num_tmp = repaint_iter_num * 2 if i < apply_homography_until else repaint_iter_num
+                total_homography_apply_num = apply_homography_until * repaint_iter_num_tmp
 
 
 
@@ -795,6 +796,20 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
 
                     # perform guidance
                     if self.do_classifier_free_guidance:
+
+
+
+
+                        # EXPERIMENT: Blur latent_model_input
+                        from kornia.filters import gaussian_blur2d
+                        latent_model_input = gaussian_blur2d(
+                                rearrange(latent_model_input, "b c f h w -> b (c f) h w"),
+                                3, (0.1, 0.1),
+                            ).reshape_as(latent_model_input)
+
+
+
+
                         with self.transformer.cache_context("uncond"):
                             self.transformer.latent_shape_ = latents.shape[-3:]
                             self.transformer.inject(weight_map)
@@ -829,15 +844,16 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                             pseudo_x0,
                             rearrange(condition, "b c f h w -> b f c h w"),
                             rearrange(condition_mask, "b c f h w -> b f c h w") < 0.5,
-                            corner_max_shift_ratio=1,
-                            lr=1,
-                            max_iters=1,
+                            optimizer_type="lbfgs",
+                            lr=1e-1,
+                            max_iters=100,
                             fix_first_frame=True,
                             smoothness_weight=0.0,
                             smoothness_order=-1,
                             padding_mode="border",
-                            padding_noise_strength=0.5,
+                            padding_noise_strength="adaptive",  # 0.3
                             init_homography=M_init.float(),
+                            init_alpha= - 3 * (i * repaint_iter_num_tmp + j) / total_homography_apply_num,
                             invert_output_homography=True,
                         )
                         from kornia.geometry.transform.imgwarp import homography_warp
@@ -846,8 +862,7 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                             rearrange(M_inv, "b f h w -> (b f) h w"),  # NOTE: homography_warp expects dst->src
                             dsize=latents.shape[-2:],
                             padding_mode="border",
-                        )
-                        latents_ori = rearrange(latents_ori, "(b f) c h w -> b f c h w", b=latents.shape[0])
+                        ).reshape_as(latents_ori)
 
                         # os.makedirs("dump", exist_ok=True)
                         # torch.save(torch.linalg.inv(M_inv), f"dump/homography_{i}_{j}.pt")

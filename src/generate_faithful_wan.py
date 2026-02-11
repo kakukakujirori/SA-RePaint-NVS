@@ -796,20 +796,6 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
 
                     # perform guidance
                     if self.do_classifier_free_guidance:
-
-
-
-
-                        # EXPERIMENT: Blur latent_model_input
-                        from kornia.filters import gaussian_blur2d
-                        latent_model_input = gaussian_blur2d(
-                                rearrange(latent_model_input, "b c f h w -> b (c f) h w"),
-                                3, (0.1, 0.1),
-                            ).reshape_as(latent_model_input)
-
-
-
-
                         with self.transformer.cache_context("uncond"):
                             self.transformer.latent_shape_ = latents.shape[-3:]
                             self.transformer.inject(weight_map)
@@ -845,16 +831,17 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                             rearrange(condition, "b c f h w -> b f c h w"),
                             rearrange(condition_mask, "b c f h w -> b f c h w") < 0.5,
                             optimizer_type="lbfgs",
-                            lr=1e-1,
+                            lr=1,
                             max_iters=100,
                             fix_first_frame=True,
                             smoothness_weight=0.0,
                             smoothness_order=-1,
                             padding_mode="border",
-                            padding_noise_strength="adaptive",  # 0.3
+                            padding_noise_strength=1.5,
                             init_homography=M_init.float(),
-                            init_alpha= - 3 * (i * repaint_iter_num_tmp + j) / total_homography_apply_num,
+                            init_alpha= 2 - 4 * (i * repaint_iter_num_tmp + j) / total_homography_apply_num,
                             invert_output_homography=True,
+                            generator=generator,
                         )
                         from kornia.geometry.transform.imgwarp import homography_warp
                         latents_ori = homography_warp(
@@ -873,7 +860,7 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                     if j < repaint_iter_num_tmp - 1:
                         sigma_t = self.scheduler.sigmas[i]
 
-                        if i < self._num_timesteps * 0 // 2:
+                        if i < apply_homography_until * 0:
                             sigma_s = torch.tensor([0], device=sigma_t.device, dtype=sigma_t.dtype).reshape(1, 1, 1, 1, 1)
                         else:
                             # approximate Var[z0] by attention qk-similarity

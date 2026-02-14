@@ -769,7 +769,7 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                     timestep = temp_ts.unsqueeze(0).expand(latents.shape[0], -1)
 
                     # Attention weighting
-                    base_weight = max(0.0, min(1.0, i * 8 / self._num_timesteps))  # TODO: MAGIC NUMBER!!!
+                    base_weight = 0.8 + 0.2 * min(1.0, i * 10 / self._num_timesteps)  # TODO: MAGIC NUMBER!!!
                     weight_map = (1 - condition_mask) * (1 - base_weight) + base_weight
 
                     with self.transformer.cache_context("cond"):
@@ -837,14 +837,14 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                             smoothness_weight=0.0,
                             smoothness_order=-1,
                             padding_mode="border",
-                            padding_noise_strength=1.5,
+                            padding_noise_strength=0.3,
                             init_homography=M_init.float(),
                             init_alpha= 2 - 4 * (i * repaint_iter_num_tmp + j) / total_homography_apply_num,
                             invert_output_homography=True,
                             generator=generator,
                         )
-                        from kornia.geometry.transform.imgwarp import homography_warp
-                        latents_ori = homography_warp(
+                        from warp import homography_warp_custom
+                        latents_ori = homography_warp_custom(
                             rearrange(latents_ori, "b f c h w -> (b f) c h w"),
                             rearrange(M_inv, "b f h w -> (b f) h w"),  # NOTE: homography_warp expects dst->src
                             dsize=latents.shape[-2:],

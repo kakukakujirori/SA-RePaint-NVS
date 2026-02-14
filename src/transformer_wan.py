@@ -747,12 +747,12 @@ class MyWanTransformer3DModel(WanTransformer3DModel):
         if (kv_weight is not None) and isinstance(kv_weight, torch.Tensor):
             batch = kv_weight.shape[0]
             kv_weight = rearrange(kv_weight, "batch () frames h w -> (batch frames) () h w", h=h, w=w)
-            kv_weight = F.interpolate(kv_weight.float(), size=(pph, ppw), mode="bilinear")
+            kv_weight = F.interpolate(kv_weight.float(), size=(pph, ppw), mode="area")
             kv_weight_reshaped = rearrange(kv_weight, "(b f) () pph ppw -> b (f pph ppw) () ()", b=batch, pph=pph, ppw=ppw)
 
         if (query_blur_sigma is not None) and isinstance(query_blur_sigma, torch.Tensor):
             query_blur_sigma = rearrange(query_blur_sigma, "batch () frames h w -> (batch frames) () h w", h=h, w=w)
-            query_blur_sigma = F.interpolate(query_blur_sigma.float(), size=(pph, ppw), mode="bilinear")
+            query_blur_sigma = F.interpolate(query_blur_sigma.float(), size=(pph, ppw), mode="area")
 
         def processor(
             attn: "WanAttention",
@@ -822,15 +822,14 @@ class MyWanTransformer3DModel(WanTransformer3DModel):
                 self.record_value_.append(rearrange(value, "() (f pph ppw) heads dim -> f heads (pph ppw) dim", f=ppf, pph=pph, ppw=ppw))
 
             if kv_weight is not None:
-                # key *= kv_weight_reshaped  # b (f pph ppw) () ()
+                key *= kv_weight_reshaped  # b (f pph ppw) () ()
 
                 # kv_weight_min = kv_weight_reshaped.min()
                 # attention_mask = torch.kron(torch.eye(pph * ppw), torch.ones((ppf, ppf))).to(query.device)
                 # attention_mask = torch.where(attention_mask > 0.5, kv_weight_min - 1.0, 0.0).to(query.dtype)
                 # attention_mask = rearrange(attention_mask, "l s -> () () l s")
 
-                attention_mask = rearrange(kv_weight_reshaped.to(query.dtype), "b l () () -> b () () l") > 0.0
-
+                # attention_mask = rearrange(kv_weight_reshaped.to(query.dtype), "b l () () -> b () () l") > 0.5
 
             if query_blur_sigma is not None:
                 chans = query.shape[-1]

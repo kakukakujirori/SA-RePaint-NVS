@@ -11,6 +11,108 @@ from kornia.geometry.transform import get_perspective_transform
 from kornia.geometry.transform.imgwarp import homography_warp
 
 
+def _diffuse_padding(
+    tensor: Float[torch.Tensor, "b c h w"],
+    mask: Float[torch.Tensor, "b c h w"],
+    kernel_size: int = 3,
+    iterations: int | None = None,
+):
+    batch, channels, height, width = tensor.shape
+    mask = mask.broadcast_to(tensor.shape)
+    assert mask.shape == (batch, channels, height, width), f"{tensor.shape=}, {mask.shape=}"
+    assert kernel_size % 2 == 1
+    epsilon = 1e-6
+
+    current_tensor = tensor.clone()
+    current_mask = mask.clone()
+
+    # prepare a kernel
+    weight = torch.ones((channels, 1, kernel_size, kernel_size), device=tensor.device)
+    padding = kernel_size // 2
+
+    if iterations is None:
+        iterations = max(height, width)
+
+    for _ in range(iterations):
+        sum_data = F.conv2d(current_tensor * current_mask, weight, padding=padding, groups=channels)
+        sum_mask = F.conv2d(current_mask, weight, padding=padding, groups=channels)
+        avg_data = sum_data / (sum_mask + epsilon)
+
+        current_tensor = current_tensor * current_mask + avg_data * (1 - current_mask)
+        current_mask = (sum_mask > 0).float()
+
+        if torch.all(current_mask):
+            break
+
+    return current_tensor
+
+
+def _add_noise(
+    src: Float[torch.Tensor, "b f c h w"],
+    mask: Float[torch.Tensor, "b f c h w"],  # 1 -> add noise, 0-> intact
+    noise_strength: float | torch.Tensor,
+    noise_boundary_smoothing_kernel_size: int,
+    generator: torch.Generator | None = None,
+) -> Float[torch.Tensor, "b f c h w"]:
+    assert len(src.shape) == len(mask.shape) == 5, f"{src.shape=} != {mask.shape=}"
+    mask = mask.expand_as(src)  # IMPORTANT: to calculate mask_pixel_num, mask must have same shape as src
+    assert src.shape == mask.shape
+
+    if isinstance(noise_strength, (int, float)):
+        noise_strength = torch.tensor(noise_strength, device=src.device, dtype=src.dtype)
+    assert torch.all(noise_strength >= 0), f"{noise_strength=}"
+
+    # variance in the mask region
+    mask_pixel_num = mask.sum(dim=(2, 3, 4), keepdim=True).clamp(min=1)
+    src_mean = (src * mask).sum(dim=(2, 3, 4), keepdim=True) / mask_pixel_num
+    src_diff = (src - src_mean) * mask
+    src_var = (src_diff ** 2).sum(dim=(2, 3, 4), keepdim=True) / (mask_pixel_num - 1).clamp(min=1.0)
+    src_var *= mask_pixel_num > 1
+
+    # add noise while keeping variance
+    noise = randn_tensor(src.shape, generator=generator, device=src.device, dtype=torch.float32)
+    src_all_noised = noise * noise_strength * torch.sqrt(1 - src_var.clip(max=0.999)) + src  # heuristics: noise_strength=1.0 => variance=1.0
+    padding_mask_smoothed = box_blur(
+        rearrange(mask, "b f c h w -> (b f) c h w").float(),
+        kernel_size=noise_boundary_smoothing_kernel_size).reshape_as(mask)
+    src_noised = (1 - padding_mask_smoothed) * src + padding_mask_smoothed * src_all_noised
+
+    return src_noised
+
+
+def homography_warp_custom(
+    patch_src: Float[torch.Tensor, "b c h w"],
+    src_homo_dst: Float[torch.Tensor, "b 3 3"],  # NOTE: homography_warp expects dst->src
+    dsize: tuple[int, int],
+    mode: str = "bilinear",
+    padding_mode: str = "zeros",
+    padding_blur_kernel_size: int = 11,
+    padding_mask_boundary_smoothing_kernel_size: int = 11,
+    return_mask: bool = False,
+):
+    assert len(patch_src.shape) == 4
+    patch_mask_src = torch.cat([patch_src, torch.ones_like(patch_src[:, 0:1, :, :])], dim=1)
+    patch_mask_dst = homography_warp(
+        patch_mask_src,
+        src_homo_dst,
+        dsize=dsize,
+        padding_mode="zeros" if padding_mode=="diffuse" else padding_mode,
+    )
+    patch_dst, mask_dst = torch.split(patch_mask_dst, [patch_src.shape[1], 1], dim=1)
+
+    # smoothen mask
+    mask_dst_smoothed = box_blur(mask_dst, kernel_size=padding_mask_boundary_smoothing_kernel_size)
+
+    # blur padding
+    if padding_mode == "diffuse":
+        patch_dst_blurred = _diffuse_padding(patch_dst, mask_dst, kernel_size=padding_blur_kernel_size, iterations=None)
+    else:
+        patch_dst_blurred = box_blur(patch_dst, padding_blur_kernel_size)
+
+    ret = mask_dst_smoothed * patch_dst + (1 - mask_dst_smoothed) * patch_dst_blurred
+    return (ret, mask_dst_smoothed) if return_mask else ret
+
+
 @torch.enable_grad()
 def homography_estimation(
         frames_src: Float[torch.Tensor, "batch num_frames c h w"],
@@ -24,7 +126,7 @@ def homography_estimation(
         fix_first_frame: bool = True,
         smoothness_weight: float = 0.5,  # regularization to prevent erratic warp
         smoothness_order: int = 2,
-        padding_mode: str = "border",  # 'zeros', 'border', 'reflection'
+        padding_mode: str = "border",  # 'zeros', 'border', 'reflection', 'diffuse'
         padding_noise_strength: float = 0.5,
         init_homography: Float[torch.Tensor, "batch num_frames 3 3"] | None = None,  # src -> dst
         init_alpha: float = 0.0,
@@ -94,10 +196,11 @@ def homography_estimation(
         M = ratio * init_homography + (1 - ratio) * M_identity
 
         # warp
-        src_warped = homography_warp(
+        src_warped = homography_warp_custom(
             frames_src_sh.reshape(batch * num_frames, channel, height_sh, width_sh),
             torch.linalg.inv(M).reshape(batch * num_frames, 3, 3),  # NOTE: homography_warp expects dst->src
             dsize=(height_sh, width_sh),
+            padding_mode=padding_mode,
         ).reshape_as(frames_src_sh)
 
         # loss
@@ -128,39 +231,6 @@ def homography_estimation(
             compute_loss()
             optimizer.step()
 
-    # warp & padding noise
-    def _add_noise(
-        src: Float[torch.Tensor, "b f c h w"],
-        mask: Float[torch.Tensor, "b f c h w"],
-        noise_strength: float | torch.Tensor,
-        noise_boundary_smoothing_kernel_size: int,
-        generator: torch.Generator | None = None,
-    ) -> Float[torch.Tensor, "b f c h w"]:
-        assert len(src.shape) == len(mask.shape) == 5, f"{src.shape=} != {mask.shape=}"
-        mask = mask.expand_as(src)  # IMPORTANT: to calculate mask_pixel_num, mask must have same shape as src
-        assert src.shape == mask.shape
-
-        if isinstance(noise_strength, (int, float)):
-            noise_strength = torch.tensor(noise_strength, device=src.device, dtype=src.dtype)
-        # assert torch.all(0 <= noise_strength) and torch.all(noise_strength <= 1), f"{noise_strength=}"
-
-        # variance in the mask region
-        mask_pixel_num = mask.sum(dim=(2, 3, 4), keepdim=True).clamp(min=1)
-        src_mean = (src * mask).sum(dim=(2, 3, 4), keepdim=True) / mask_pixel_num
-        src_diff = (src - src_mean) * mask
-        src_var = (src_diff ** 2).sum(dim=(2, 3, 4), keepdim=True) / (mask_pixel_num - 1).clamp(min=1.0)
-        src_var *= mask_pixel_num > 1
-
-        # add noise while keeping variance
-        noise = randn_tensor(src.shape, generator=generator, device=src.device, dtype=torch.float32)
-        src_all_noised = noise * noise_strength * torch.sqrt(src_var + 1e-8) + src #* torch.sqrt(1 - noise_strength)
-        padding_mask_smoothed = box_blur(
-            rearrange(mask, "b f c h w -> (b f) c h w").float(),
-            kernel_size=noise_boundary_smoothing_kernel_size).reshape_as(mask)
-        src_noised = (1 - padding_mask_smoothed) * src + padding_mask_smoothed * src_all_noised
-
-        return src_noised
-
     with torch.no_grad():
         # final homography
         print(f"{alpha.flatten()=}")
@@ -169,20 +239,17 @@ def homography_estimation(
         M_inv = torch.linalg.inv(M)
 
         # apply the optimized warp
-        src_warped = homography_warp(
+        src_warped, valid_region = homography_warp_custom(
             frames_src.flatten(0, 1),
             M_inv.flatten(0, 1),  # NOTE: homography_warp expects dst->src
             dsize=(height, width),
             padding_mode=padding_mode,
-        ).reshape_as(frames_src)
+            return_mask=True,
+        )
+        src_warped = rearrange(src_warped, "(b f) c h w -> b f c h w", b=batch, f=num_frames)
+        valid_region = rearrange(valid_region, "(b f) () h w -> b f () h w", b=batch, f=num_frames)
 
         # identify padding noise region
-        valid_region = homography_warp(
-            torch.ones(batch * num_frames, 1, height, width, dtype=frames_src.dtype, device=frames_src.device),
-            M_inv.flatten(0, 1),  # NOTE: homography_warp expects dst->src
-            dsize=(height, width),
-            padding_mode='zeros',
-        ).reshape(batch, num_frames, 1, height, width)
         inner_occlusion_mask = (valid_region > 0.5) * (frames_dst_mask_sh < 0.5)
         outer_padding_mask = (valid_region < 0.5).expand_as(src_warped)
 
@@ -197,7 +264,7 @@ def homography_estimation(
         src_warped = _add_noise(
             src_warped,
             inner_occlusion_mask,
-            padding_noise_strength * ratio / 2,
+            padding_noise_strength * ratio,  # // 2?
             noise_boundary_smoothing_kernel_size=5,
             generator=generator,
         )

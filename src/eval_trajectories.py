@@ -338,7 +338,9 @@ def run_anycam(image_paths: list[str], gpu_id: int = 0):
 def run_glomap(image_paths: list[str], gt_width: int, gt_height: int, gt_focal_len: float, gpu_id: int = 0, verbose: bool = False):
     with tempfile.TemporaryDirectory() as td:
         img_dir = os.path.join(td, "images")
+        out_dir = os.path.join(td, "sparse")
         os.mkdir(img_dir)
+        os.mkdir(out_dir)
 
         # copy images
         for p in image_paths:
@@ -361,7 +363,21 @@ def run_glomap(image_paths: list[str], gt_width: int, gt_height: int, gt_focal_l
                                     "--database_path", os.path.join(td, "database.db"),
                                     ],
                                     check=True, capture_output=not verbose, text=True, encoding='utf-8', env=env)
-            _ = subprocess.run(["glomap", "mapper",
+
+            # Check if 'global_mapper' is available in colmap
+            colmap_help = subprocess.run(["colmap", "help"], capture_output=True, text=True, check=False).stdout
+            has_global_mapper = "global_mapper" in colmap_help
+
+            if has_global_mapper:
+                _ = subprocess.run(["colmap", "global_mapper",
+                                    "--database_path", os.path.join(td, "database.db"),
+                                    "--image_path", img_dir,
+                                    "--output_path", os.path.join(td, "sparse"),
+                                    "--GlobalMapper.ba_refine_focal_length", "0",
+                                    ],
+                                    check=True, capture_output=not verbose, text=True, encoding='utf-8', env=env)
+            else:
+                _ = subprocess.run(["glomap", "mapper",
                                     "--database_path", os.path.join(td, "database.db"),
                                     "--image_path", img_dir,
                                     "--output_path", os.path.join(td, "sparse"),
@@ -369,6 +385,7 @@ def run_glomap(image_paths: list[str], gt_width: int, gt_height: int, gt_focal_l
                                     "--skip_view_graph_calibration", "1",
                                     ],
                                     check=True, capture_output=not verbose, text=True, encoding='utf-8', env=env)
+
         except subprocess.CalledProcessError as e:
             print(f"\n❌ command failed: {e.cmd}")
             print(f"📤 stdout:\n{e.stdout}")

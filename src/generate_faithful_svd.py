@@ -481,8 +481,9 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
         min_guidance_scale: float = 1.0,
         max_guidance_scale: float = 3.0,
         fps: int = 7,
+        warping_homographies: Optional[np.ndarray | list[np.ndarray]] = None,
         motion_bucket_id: int = 127,
-        noise_aug_strength: int = 0.0,  # NOTE: Modified
+        noise_aug_strength: float = 0.0,  # NOTE: Modified
         decode_chunk_size: Optional[int] = None,
         num_videos_per_prompt: Optional[int] = 1,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
@@ -522,6 +523,18 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
         # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
         # corresponds to doing no classifier free guidance.
         self._guidance_scale = max_guidance_scale
+
+        # Prepare init homographies
+        if warping_homographies is not None:
+            if isinstance(warping_homographies, (list, tuple)):
+                warping_homographies = np.stack(warping_homographies, axis=0)
+            assert warping_homographies.shape == (num_frames, 3, 3), f"{warping_homographies.shape=}"
+            M_init = torch.from_numpy(warping_homographies).to(device).reshape(1, -1, 3, 3)
+            # os.makedirs("dump", exist_ok=True)
+            # torch.save(M_init, "dump/homography_init.pt")
+        else:
+            M_init = None
+            raise ValueError("Experimenting with `warping_homographies`, so it's must. Please remove this line afterwards.")
 
         # 3. Encode input image
         with torch.no_grad():
@@ -637,6 +650,12 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
                     progress_bar.update()
                     continue
 
+
+                apply_homography_until = self._num_timesteps * 3 // 5
+                repaint_iter_num_tmp = repaint_iter_num * 1 if i < apply_homography_until else repaint_iter_num
+                total_homography_apply_num = apply_homography_until * repaint_iter_num_tmp
+
+
                 with torch.no_grad():
                     for j in range(repaint_iter_num):
                         latents_ori = latents.clone()
@@ -710,32 +729,32 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
                         # torch.save(pseudo_x0, f"dump/pseudo_x0_ori_{i}_{j}.pt")
 
                         # alignment
-                        if i < self._num_timesteps * 3 // 5:
-                            M, pseudo_x0 = homography_estimation(
+                        if i < apply_homography_until:
+                            M_inv, pseudo_x0 = homography_estimation(
                                 pseudo_x0,
                                 warped_latents[batch_size:] if self.do_classifier_free_guidance else warped_latents,
                                 warped_masks_sh < 0.5,
-                                process_size=128,
-                                lr=1e-2,
+                                optimizer_type="lbfgs",
+                                lr=1,
                                 max_iters=100,
-                                num_control_points=None,#num_frames//3,
                                 fix_first_frame=True,
-                                smoothness_weight=0.5,
-                                smoothness_order=2,
+                                smoothness_weight=0.0,
+                                smoothness_order=-1,
                                 padding_mode="border",
+                                padding_noise_strength=0.3,
+                                padding_blur_kernel_size=11,
+                                padding_mask_boundary_smoothing_kernel_size=11,
+                                init_homography=M_init.float(),
+                                init_alpha= 2 - 4 * (i * repaint_iter_num_tmp + j) / total_homography_apply_num,
+                                invert_output_homography=True,
+                                generator=generator,
                             )
                             from kornia.geometry.transform.imgwarp import homography_warp
-                            # latents = homography_warp(
-                            #     latents.flatten(0, 1).float(),
-                            #     M,
-                            #     dsize=latents.shape[-2:],
-                            #     padding_mode="reflection",
-                            # ).reshape_as(latents).to(latents.dtype)
                             latents_ori = homography_warp(
-                                latents_ori.flatten(0, 1).float(),
-                                M,
+                                rearrange(latents_ori, "b f c h w -> (b f) c h w").float(),
+                                rearrange(M_inv, "b f h w -> (b f) h w"),  # NOTE: homography_warp expects dst->src
                                 dsize=latents.shape[-2:],
-                                padding_mode="reflection",
+                                padding_mode="border",
                             ).reshape_as(latents_ori).to(latents_ori.dtype)
 
                         # os.makedirs("dump", exist_ok=True)
@@ -1040,6 +1059,9 @@ if __name__ == '__main__':
     warped_images = [PIL.Image.open(os.path.join(args.trajectory_folder, f"{i:04d}.png")).convert("RGB") for i in range(args.num_frames)]
     warped_masks = [PIL.Image.open(os.path.join(args.trajectory_folder, f"{i:04d}_mask.png")).convert("RGB") for i in range(args.num_frames)]
 
+    warping_homographies_path = os.path.join(args.trajectory_folder, 'trans_coordinates_homography.npy')
+    warping_homographies = np.load(warping_homographies_path) if os.path.isfile(warping_homographies_path) else None
+
     # inference
     # monitor = GPUMemoryMonitor(gpu_id=args.gpu)
     # monitor.start()
@@ -1055,6 +1077,7 @@ if __name__ == '__main__':
         num_inference_steps=args.num_inference_steps,
         min_guidance_scale=args.min_guidance_scale,
         max_guidance_scale=args.max_guidance_scale,
+        warping_homographies=warping_homographies,
         generator=torch.manual_seed(args.seed),
     )
     frames = svd_output.frames[0]

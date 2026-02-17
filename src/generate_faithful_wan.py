@@ -838,6 +838,8 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                             smoothness_order=-1,
                             padding_mode="border",
                             padding_noise_strength=0.3,
+                            padding_blur_kernel_size=11,
+                            padding_mask_boundary_smoothing_kernel_size=11,
                             init_homography=M_init.float(),
                             init_alpha= 2 - 4 * (i * repaint_iter_num_tmp + j) / total_homography_apply_num,
                             invert_output_homography=True,

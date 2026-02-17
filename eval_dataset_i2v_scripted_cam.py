@@ -766,12 +766,12 @@ if __name__ == '__main__':
     # 0. Set up paths
     if args.dataset == "davis":
         data_root = os.path.join(args.data_root, "DAVIS/JPEGImages/Full-Resolution")
-        input_root = "./davis_input"
-        output_root = "./davis_output"
+        input_root = "./davis_input_scripted_cam"
+        output_root = "./davis_output_scripted_cam"
     elif args.dataset == "tanks":
         data_root = os.path.join(args.data_root, "TanksAndTemples")
-        input_root = "./tanks_and_temples_input"
-        output_root = "./tanks_and_temples_output"
+        input_root = "./tanks_and_temples_input_scripted_cam"
+        output_root = "./tanks_and_temples_output_scripted_cam"
     else:
         raise NotImplementedError(f"Dataset '{args.dataset}' is not implemented.")
 
@@ -796,7 +796,7 @@ if __name__ == '__main__':
                     scene,
                     motion,
                     degree,
-                    save_trajectory_type=("2d_npy" if args.method == "trajattn" else "3d_rgb" if args.method == "das" else "2d_homography" if args.method == "faithful_wan" else None),
+                    save_trajectory_type=("2d_npy" if args.method == "trajattn" else "3d_rgb" if args.method == "das" else "2d_homography" if args.method.startswith("faithful_") else None),
                     use_mesh=args.use_mesh,
                 )
                 future_to_task_info[future] = (scene, motion, degree, None)

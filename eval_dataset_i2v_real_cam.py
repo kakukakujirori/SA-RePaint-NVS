@@ -304,6 +304,67 @@ def render_point_cloud(
         assert tracking_tensor.shape[0] == len(camera_list_extr)
         np.save(os.path.join(output_warped_dir, 'trans_coordinates_rgb.npy'), tracking_tensor.cpu().numpy())
 
+    elif save_trajectory_type == "2d_homography":
+        trans_coordinates_list = [coords[:, :, :2] for coords in trans_coordinates_3D_list]
+
+        # overwrite the first frame trans coordinates and valid (just in case)
+        trans_coordinates_list[0] = create_grid(height, width)
+        trans_valid_list[0] = trans_valid_list[0] + True
+
+        # homography fitting
+        from tqdm import tqdm
+        homographies = []
+        for trans_coord, valid_area in tqdm(zip(trans_coordinates_list, trans_valid_list), desc="Fitting homography", total=len(trans_valid_list)):
+            src_points = create_grid(height, width)[valid_area].reshape(-1, 2)
+            tgt_points = trans_coord[valid_area].reshape(-1, 2)
+            if len(src_points) >= 4:
+                M, _ = cv2.findHomography(src_points, tgt_points, cv2.LMEDS)  # NOTE: cv2.RANSAC is likely to cause fluctuation
+                if M is None or np.abs(np.linalg.det(M)) < 1e-5:
+                    M = homographies[-1] if len(homographies) > 0 else np.eye(3)
+            else:
+                M = homographies[-1] if len(homographies) > 0 else np.eye(3)
+            homographies.append(M / M[2,2])
+        homographies = np.stack(homographies, axis=0)
+
+        # homography smoothing (element-wise)
+        from scipy.signal import savgol_filter
+        smoothing_method = "savgol"
+        N = homographies.shape[0]
+        smoothed_homographies = np.zeros_like(homographies)
+
+        for i in range(3):
+            for j in range(3):
+                if smoothing_method == "savgol":
+                    smoothed_homographies[:, i, j] = savgol_filter(
+                        homographies[:, i, j],
+                        window_length=N//2+(1 if N//2 % 2 == 0 else 0),
+                        polyorder=2,
+                        axis=0
+                    )
+                elif smoothing_method == "polyfit":
+                    coeffs = np.polyfit(np.arange(N), homographies[:, i, j], 2)
+                    p = np.poly1d(coeffs)
+                    smoothed_homographies[:, i, j] = p(np.arange(N))
+                else:
+                    raise NotImplementedError(f"Invalid smoothing_method: {smoothing_method}")
+
+        # ensure that the starting homography is an identity
+        blend_weight = np.linspace(1, 0, N).reshape(-1, 1, 1)
+        blend_weight = blend_weight * np.linalg.inv(smoothed_homographies[0]) + (1 - blend_weight) * np.eye(3).reshape(1, 3, 3)
+        smoothed_homographies = blend_weight @ smoothed_homographies
+
+        homographies = smoothed_homographies
+
+        # convert to kornia format ([0, H/W] -> [-1, 1])
+        import torch
+        from kornia.geometry.conversions import normalize_homography
+        homographies_normalized = normalize_homography(
+            torch.from_numpy(homographies),
+            (height, width), # Source size
+            (height, width)  # Dest size
+        )
+        np.save(os.path.join(output_warped_dir, 'trans_coordinates_homography.npy'), homographies_normalized.numpy())
+
     elif save_trajectory_type is None:
         pass
     else:
@@ -964,7 +1025,7 @@ def run_met3r_calculation(output_root: str, process_size: int = 256, resize_mode
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Image-to-Video Evaluation")
     parser.add_argument("dataset", type=str, choices=["mannequin", "dl3dv_half"], help="Dataset to use for evaluation.")
-    parser.add_argument("--data_root", type=str, default="/mnt/data/", help="Root directory of the datasets.")
+    parser.add_argument("--data_root", type=str, default="/media/ryotaro/ssd1/", help="Root directory of the datasets.")
     parser.add_argument("--method", type=str, default="faithful_svd", choices=["faithful_svd", "faithful_wan", "nvssolver", "trajattn", "trajcrafter", "das", "invstitch"], help="Method to use for generation. 'nvssolver' uses NVS-Solver, 'trajattn' uses Trajectory Attention, and 'das' uses DiffusionAsShader.")
     parser.add_argument("--use_mesh", action="store_true", help="If set, use mesh for trajectory extraction.")
     parser.add_argument("--scratch", action="store_true", help="If set, all the images, depth, and trajectories are re-organized and re-generated.")
@@ -973,12 +1034,12 @@ if __name__ == '__main__':
     # 0. Set up paths
     if args.dataset == "mannequin":
         data_root = os.path.join(args.data_root, "MannequinChallengeHQ/validation_frames")
-        input_root = "./mannequin_challenge_input_given_cam"
-        output_root = "./mannequin_challenge_output_given_cam"
+        input_root = "./mannequin_challenge_input_real_cam"
+        output_root = "./mannequin_challenge_output_real_cam"
     elif args.dataset == "dl3dv_half":
         original_data_root = os.path.join(args.data_root, "DL3DV-Evaluation/images")
-        input_root = "./dl3dv_half_input_given_cam"
-        output_root = "./dl3dv_half_output_given_cam"
+        input_root = "./dl3dv_half_input_real_cam"
+        output_root = "./dl3dv_half_output_real_cam"
 
         # create tmp data folder
         data_root = "/tmp/dl3dv_half"
@@ -1022,7 +1083,7 @@ if __name__ == '__main__':
                     render_point_cloud,
                     input_scene,
                     output_warped_dir,
-                    save_trajectory_type=("2d_npy" if args.method == "trajattn" else "3d_rgb" if args.method == "das" else None),
+                    save_trajectory_type=("2d_npy" if args.method == "trajattn" else "3d_rgb" if args.method == "das" else "2d_homography" if args.method.startswith("faithful_") else None),
                     use_mesh=args.use_mesh,
                 )
                 future_to_task_info[future] = scene

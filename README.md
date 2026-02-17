@@ -14,6 +14,7 @@
     conda install conda-forge::imagemagick
     conda install conda-forge::ffmpeg
     pip3 install torch torchvision xformers --index-url https://download.pytorch.org/whl/cu126
+    MAX_JOBS=4 pip3 install flash-attn --no-build-isolation
     ```
 
 2. Clone the repository

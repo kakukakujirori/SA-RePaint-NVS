@@ -128,6 +128,8 @@ def homography_estimation(
         smoothness_order: int = 2,
         padding_mode: str = "border",  # 'zeros', 'border', 'reflection', 'diffuse'
         padding_noise_strength: float = 0.5,
+        padding_blur_kernel_size: int = 11,
+        padding_mask_boundary_smoothing_kernel_size: int = 11,
         init_homography: Float[torch.Tensor, "batch num_frames 3 3"] | None = None,  # src -> dst
         init_alpha: float = 0.0,
         invert_output_homography: bool = False,  # if True, returns dst -> src
@@ -201,6 +203,8 @@ def homography_estimation(
             torch.linalg.inv(M).reshape(batch * num_frames, 3, 3),  # NOTE: homography_warp expects dst->src
             dsize=(height_sh, width_sh),
             padding_mode=padding_mode,
+            padding_blur_kernel_size=padding_blur_kernel_size,
+            padding_mask_boundary_smoothing_kernel_size=padding_mask_boundary_smoothing_kernel_size,
         ).reshape_as(frames_src_sh)
 
         # loss
@@ -244,6 +248,8 @@ def homography_estimation(
             M_inv.flatten(0, 1),  # NOTE: homography_warp expects dst->src
             dsize=(height, width),
             padding_mode=padding_mode,
+            padding_blur_kernel_size=padding_blur_kernel_size,
+            padding_mask_boundary_smoothing_kernel_size=padding_mask_boundary_smoothing_kernel_size,
             return_mask=True,
         )
         src_warped = rearrange(src_warped, "(b f) c h w -> b f c h w", b=batch, f=num_frames)

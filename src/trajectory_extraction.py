@@ -1,4 +1,3 @@
-from typing import Optional
 import argparse
 import os
 
@@ -104,7 +103,7 @@ def compute_transformed_points(
         transformation1: np.ndarray,
         transformation2: np.ndarray,
         intrinsic1: np.ndarray,
-        intrinsic2: Optional[np.ndarray]):
+        intrinsic2: np.ndarray | None):
     """
     Computes transformed position for each pixel location
     """
@@ -171,10 +170,10 @@ def mask_occlusion_traj(
 
 def bilinear_splatting(
         frame1: np.ndarray,
-        mask1: Optional[np.ndarray],
+        mask1: np.ndarray | None,
         depth1: np.ndarray,
         flow12: np.ndarray,
-        flow12_mask: Optional[np.ndarray],
+        flow12_mask: np.ndarray | None,
         is_image: bool = False,
     ) -> tuple[np.ndarray, np.ndarray]:
     """
@@ -264,12 +263,12 @@ def bilinear_splatting(
 
 def forward_warp(
         frame1: np.ndarray,
-        mask1: Optional[np.ndarray],
+        mask1: np.ndarray | None,
         depth1: np.ndarray,
         transformation1: np.ndarray,
         transformation2: np.ndarray,
         intrinsic1: np.ndarray,
-        intrinsic2: Optional[np.ndarray],
+        intrinsic2: np.ndarray | None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Given a frame1 and global transformations transformation1 and transformation2, warps frame1 to next view using
@@ -333,7 +332,7 @@ def render_mesh(
         transformation1: np.ndarray,
         transformation2: np.ndarray,
         intrinsic1: np.ndarray,
-        intrinsic2: Optional[np.ndarray],
+        intrinsic2: np.ndarray | None,
         mask_deocclusion: bool = True,
         mask_postprocess_opening_kernel_size: int = 7,
     ) -> np.ndarray:
@@ -471,9 +470,8 @@ def save_images(
         minor_radius: float = 70,
         camera_motion_mode: str = "horizontal",
         no_occlusion_revealing: bool = False,
-        save_trajectory_type: Optional[str] = None,
         use_mesh: bool = True,
-    ) -> None:
+    ) -> tuple[list[np.ndarray], list[np.ndarray]]:
     """
     The images will be center cropped after each warp.
     """
@@ -561,13 +559,23 @@ def save_images(
         trans_coordinates_3D_list.append(trans_coordinates_3D)
         trans_valid_list.append(trans_valid)
 
+    return trans_coordinates_3D_list, trans_valid_list
+
+
+def save_trajectories(
+    save_path: str,
+    save_trajectory_type: str | None,
+    trans_coordinates_3D_list: list[np.ndarray],
+    trans_valid_list: list[np.ndarray],
+):
+    height, width, _ = trans_coordinates_3D_list[0].shape
+
+    # overwrite the first frame trans coordinates and valid (just in case)
+    trans_coordinates_list = [coords[:, :, :2] for coords in trans_coordinates_3D_list]
+    trans_coordinates_list[0] = create_grid(height, width)
+    trans_valid_list[0] = trans_valid_list[0] + True
+
     if save_trajectory_type == "2d_npy":
-        trans_coordinates_list = [coords[:, :, :2] for coords in trans_coordinates_3D_list]
-
-        # overwrite the first frame trans coordinates and valid (just in case)
-        trans_coordinates_list[0] = create_grid(height, width)
-        trans_valid_list[0] = trans_valid_list[0] + True
-
         trans_coordinates = np.stack(trans_coordinates_list, axis=0)
         trans_valid = np.stack(trans_valid_list, axis=0)
         np.save(os.path.join(save_path, 'trans_coordinates.npy'), trans_coordinates)
@@ -589,15 +597,23 @@ def save_images(
             mask=None,
             save_tracking=False,  # TODO: turn off during evaluation
         )
-        assert tracking_tensor.shape[0] == len(poses)
         np.save(os.path.join(save_path, 'trans_coordinates_rgb.npy'), tracking_tensor.cpu().numpy())
 
     elif save_trajectory_type == "2d_homography":
-        trans_coordinates_list = [coords[:, :, :2] for coords in trans_coordinates_3D_list]
 
-        # overwrite the first frame trans coordinates and valid (just in case)
-        trans_coordinates_list[0] = create_grid(height, width)
-        trans_valid_list[0] = trans_valid_list[0] + True
+        def spatially_normalize(M: np.ndarray | None):
+            if M is None:
+                return M
+
+            # convert to kornia format ([0, H/W] -> [-1, 1])
+            import torch
+            from kornia.geometry.conversions import normalize_homography
+            M_norm = normalize_homography(
+                torch.from_numpy(M).reshape(1, 3, 3),
+                (height, width), # Source size
+                (height, width)  # Dest size
+            )
+            return M_norm.cpu().numpy().reshape(3, 3)
 
         # homography fitting
         from tqdm import tqdm
@@ -605,36 +621,58 @@ def save_images(
         for trans_coord, valid_area in tqdm(zip(trans_coordinates_list, trans_valid_list), desc="Fitting homography", total=len(trans_valid_list)):
             src_points = create_grid(height, width)[valid_area].reshape(-1, 2)
             tgt_points = trans_coord[valid_area].reshape(-1, 2)
+
+            fallback = homographies[-1] if len(homographies) > 0 else np.eye(3)
+
             if len(src_points) >= 4:
-                M, _ = cv2.findHomography(src_points, tgt_points, cv2.LMEDS)  # NOTE: cv2.RANSAC is likely to cause fluctuation
-                if M is None or np.abs(np.linalg.det(M)) < 1e-5:
-                    M = homographies[-1] if len(homographies) > 0 else np.eye(3)
+                M, _ = cv2.findHomography(src_points, tgt_points, cv2.LMEDS)
+                M = spatially_normalize(M)
+                det = np.linalg.det(M) if M is not None else 0
+                if M is None or det <= 0 or det > 1e5 or abs(M[2, 2]) < 1e-6:
+                    M = None
+                else:
+                    M = M / M[2, 2]  # NOTE: cv2.findHomography outputs are already M[2,2]=1?
             else:
-                M = homographies[-1] if len(homographies) > 0 else np.eye(3)
-            homographies.append(M / M[2,2])
+                M = None
+
+            homographies.append(M)
+
+        # homography interpolation
+        for idx_current, M in enumerate(homographies):
+            if M is not None: continue
+
+            idx_pre, M_pre = idx_current - 1, homographies[idx_current - 1]
+
+            idx_post, M_post = -1, None
+            for j in range(idx_current + 1, len(homographies)):
+                if homographies[j] is not None:
+                    idx_post = j
+                    M_post = homographies[j]
+                    break
+
+            if M_post is None:
+                M_interpolated = M_pre
+            else:
+                M_interpolated = ((idx_post - idx_current) * M_pre + (idx_current - idx_pre) * M_post) / (idx_post - idx_pre)
+            homographies[idx_current] = M_interpolated
+
         homographies = np.stack(homographies, axis=0)
 
         # homography smoothing (element-wise)
+        from scipy.ndimage import median_filter
         from scipy.signal import savgol_filter
-        smoothing_method = "savgol"
-        N = homographies.shape[0]
-        smoothed_homographies = np.zeros_like(homographies)
 
+        N = homographies.shape[0]
+        window_length = max(3, N // 2)
+        window_length = window_length if window_length % 2 == 1 else window_length + 1  # make it odd
+
+        smoothed_homographies = np.zeros_like(homographies)
         for i in range(3):
             for j in range(3):
-                if smoothing_method == "savgol":
-                    smoothed_homographies[:, i, j] = savgol_filter(
-                        homographies[:, i, j],
-                        window_length=N//2+(1 if N//2 % 2 == 0 else 0),
-                        polyorder=2,
-                        axis=0
-                    )
-                elif smoothing_method == "polyfit":
-                    coeffs = np.polyfit(np.arange(N), homographies[:, i, j], 2)
-                    p = np.poly1d(coeffs)
-                    smoothed_homographies[:, i, j] = p(np.arange(N))
-                else:
-                    raise NotImplementedError(f"Invalid smoothing_method: {smoothing_method}")
+                cleaned = median_filter(homographies[:, i, j], size=5)
+                smoothed_homographies[:, i, j] = savgol_filter(cleaned, window_length=window_length, polyorder=2)
+
+        smoothed_homographies = smoothed_homographies / smoothed_homographies[:, 2:3, 2:3]
 
         # ensure that the starting homography is an identity
         blend_weight = np.linspace(1, 0, N).reshape(-1, 1, 1)
@@ -643,15 +681,7 @@ def save_images(
 
         homographies = smoothed_homographies
 
-        # convert to kornia format ([0, H/W] -> [-1, 1])
-        import torch
-        from kornia.geometry.conversions import normalize_homography
-        homographies_normalized = normalize_homography(
-            torch.from_numpy(homographies),
-            (height, width), # Source size
-            (height, width)  # Dest size
-        )
-        np.save(os.path.join(save_path, 'trans_coordinates_homography.npy'), homographies_normalized.numpy())
+        np.save(os.path.join(save_path, 'trans_coordinates_homography.npy'), homographies)
 
     elif save_trajectory_type is None:
         pass
@@ -798,7 +828,7 @@ if __name__== '__main__':
 
     os.makedirs(args.output_folder, exist_ok=True)
 
-    save_images(
+    trans_coordinates_3D_list, trans_valid_list = save_images(
         args.output_folder,
         image_list,
         depth_list,
@@ -809,7 +839,12 @@ if __name__== '__main__':
         args.minor_radius,
         args.camera_motion_mode,
         args.no_occlusion_revealing,
-        args.save_trajectory_type,
         args.use_mesh,
+    )
+    save_trajectories(
+        args.output_folder,
+        args.save_trajectory_type,
+        trans_coordinates_3D_list,
+        trans_valid_list,
     )
     print(f"Trajectory extraction finished, saved to {args.output_folder}")

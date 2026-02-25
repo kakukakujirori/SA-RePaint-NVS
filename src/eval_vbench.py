@@ -14,10 +14,12 @@ from vbench import VBench
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Run VBench evaluation")
-    parser.add_argument("--output_dir", type=str, help="Directory to save output files")
+    parser.add_argument("output_dir", type=str, help="Directory to save output files")
     parser.add_argument("--gpu", type=int, default=0, help="GPU device ID to use")
-    parser.add_argument("--cuda_home", type=str, default="/usr/local/cuda-11.8", help="Path to CUDA 11.8 installation")
+    parser.add_argument("--cuda_home", type=str, default="/data/ryotaro/cuda-11.8", help="Path to CUDA 11.8 installation")
     args = parser.parse_args()
+
+    os.environ["VBENCH_CACHE_DIR"] = "/data/ryotaro/.cache/vbench"
 
     # set up CUDA environment variables
     assert os.path.isdir(args.cuda_home)
@@ -40,6 +42,9 @@ if __name__ == '__main__':
     device = f"cuda:{args.gpu}"
     my_VBench = VBench(device, "", "vbench_results")
 
+    # define camera type
+    is_scripted = "_scripted_cam_" in args.output_dir
+
     with tempfile.TemporaryDirectory() as td:
         uid = 0
         # copy generated images
@@ -48,19 +53,22 @@ if __name__ == '__main__':
             scene_path = os.path.join(args.output_dir, scene)
             if not os.path.isdir(scene_path):
                 continue
-            for motion_degree in os.listdir(scene_path):
-                videopath = os.path.join(args.output_dir, scene, motion_degree, "generated/generated.mp4")
+
+            motion_degrees = os.listdir(scene_path) if is_scripted else ["."]
+
+            for motion_deg in motion_degrees:
+                videopath = os.path.join(args.output_dir, scene, motion_deg, "generated/generated.mp4")
                 videopath = os.path.normpath(videopath)  # delete the leading ./
 
                 # captioning
-                imagepath = os.path.join(args.output_dir, scene, motion_degree, "warped/0000.png")
+                imagepath = os.path.join(args.output_dir, scene, motion_deg, "warped/0000.png")
                 image = load_image(imagepath)
                 with torch.no_grad():
                     set_seed(42)
                     captioner_inputs = caption_processor(images=image, return_tensors="pt").to(device, torch.float16)
                     generated_ids = captioner.generate(**captioner_inputs)
                     generated_text = caption_processor.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
-                print(f"{os.path.join(scene, motion_degree)}: {generated_text}")
+                print(f"{os.path.join(scene, motion_deg)}: {generated_text}")
 
                 # video name is refereed as a text query for Overall Consistency evaluation
                 dst_path = os.path.join(td, f"{generated_text}-{uid}.mp4")  # NOTE: uid is to prevent path duplication

@@ -12,7 +12,7 @@ from tabulate import tabulate
 from eval_dataset_i2v_real_cam import run_pixelwise_metrics_calculation, run_fid_kid_calculation, run_fvd_calculation, run_camera_pose_error_calculation, run_sed_calculation, run_met3r_calculation
 
 NUM_FRAMES = 25
-MAX_WORKER_NUM = 1
+MAX_WORKER_NUM = 8
 GPUS = [0, 1]
 
 
@@ -28,12 +28,12 @@ def load_vbench_scores(json_path: str):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Image-to-Video Evaluation")
-    parser.add_argument("--data_root", type=str, default="/mnt/data", help="Root directory for the dataset")
+    parser.add_argument("--data_root", type=str, default="/data/ryotaro/data/", help="Root directory for the dataset")
     parser.add_argument("--suffix", type=str, default="nvssolver", help="Suffix for output directories")
     args = parser.parse_args()
 
-    mannequin_output_root = f"./mannequin_challenge_output_given_cam_{args.suffix}"
-    dl3dv_output_root = f"./dl3dv_half_output_given_cam_{args.suffix}"
+    mannequin_output_root = f"./experimental_results/mannequin_challenge_output_real_cam_{args.suffix}"
+    dl3dv_output_root = f"./experimental_results/dl3dv_half_output_real_cam_{args.suffix}"
 
     mannequin_data_root = f"{args.data_root}/MannequinChallengeHQ/validation_frames"
     dl3dv_data_root_original = f"{args.data_root}/DL3DV-Evaluation-img4/images"
@@ -120,19 +120,13 @@ if __name__ == '__main__':
                     raise exc
 
         try:
-            # 4. Pixelwise metrics calculation
-            allow_resize =  ("faithful_wan" in args.suffix) or ("trajcrafter" in args.suffix) or ("das" in args.suffix)
-            pixelwise_results, _ = run_pixelwise_metrics_calculation(output_root, allow_resize=allow_resize)
+            # # 4. Pixelwise metrics calculation (NOTE: input GT data is not available! Calculate manually!)
+            # allow_resize = ("wan" in args.suffix) or ("trajcrafter" in args.suffix) or ("das" in args.suffix)
+            # pixelwise_results, _ = run_pixelwise_metrics_calculation(???, output_root, allow_resize=allow_resize)
 
             # 5. FID/FVD calculation
-            fid_score, kid_score = run_fid_kid_calculation(
-                data_root=data_root,
-                output_root=output_root,
-            )
-            fvd_videogpt, fvd_stylegan = run_fvd_calculation(
-                data_root=data_root,
-                output_root=output_root,
-            )
+            fid_score, kid_score = run_fid_kid_calculation(data_root, output_root)
+            fvd_videogpt, fvd_stylegan = run_fvd_calculation(data_root, output_root)
 
             # 6. Camera pose error calculation
             camera_pose_results, _ = run_camera_pose_error_calculation(output_root)
@@ -144,8 +138,8 @@ if __name__ == '__main__':
             met3r_results, _ = run_met3r_calculation(output_root, process_size=256, resize_mode="area")
 
             # 9. VBench
-            mannequin_vbench = load_vbench_scores(f"./vbench_results/mannequin_challenge_output_{args.suffix}_eval_results.json")
-            dl3dv_vbench = load_vbench_scores(f"./vbench_results/dl3dv_half_output_{args.suffix}_eval_results.json")
+            mannequin_vbench = load_vbench_scores(f"./vbench_results/mannequin_challenge_output_real_cam_{args.suffix}_eval_results.json")
+            dl3dv_vbench = load_vbench_scores(f"./vbench_results/dl3dv_half_output_real_cam_{args.suffix}_eval_results.json")
             assert set(mannequin_vbench.keys()) == set(dl3dv_vbench.keys())
             vbench_average_scores = {}
             for dimension in mannequin_vbench.keys():
@@ -157,4 +151,3 @@ if __name__ == '__main__':
             print("Caught KeyboardInterrupt, shutting down.")
         finally:
             print("Program finished.")
-

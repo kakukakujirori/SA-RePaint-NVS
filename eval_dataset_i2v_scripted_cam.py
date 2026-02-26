@@ -38,7 +38,7 @@ MAJOR_RADIUS = 80
 MINOR_RADIUS = 70
 
 GPUS = [0, 1, 2, 3]
-MAX_WORKER_NUM = 16
+MAX_WORKER_NUM = 8
 
 
 def organize_images_and_depth(data_root: str, input_root: str, output_root: str):

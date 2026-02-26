@@ -10,7 +10,7 @@ from tabulate import tabulate
 from eval_dataset_i2v_scripted_cam import run_pixelwise_metrics_calculation, run_fid_kid_calculation, run_fvd_calculation, run_camera_pose_error_calculation, run_sed_calculation, run_met3r_calculation
 
 NUM_FRAMES = 25
-MAX_WORKER_NUM = 1
+MAX_WORKER_NUM = 8
 GPUS = [0, 1]
 
 
@@ -26,12 +26,12 @@ def load_vbench_scores(json_path: str):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Image-to-Video Evaluation")
-    parser.add_argument("--data_root", type=str, default="/mnt/data", help="Root directory for the dataset")
+    parser.add_argument("--data_root", type=str, default="/data/ryotaro/data/", help="Root directory for the dataset")
     parser.add_argument("--suffix", type=str, default="nvssolver", help="Suffix for output directories")
     args = parser.parse_args()
 
-    davis_output_root = f"./experimental_results/davis_output_{args.suffix}"
-    tanks_and_temples_output_root = f"./experimental_results/tanks_and_temples_output_{args.suffix}"
+    davis_output_root = f"./experimental_results/davis_output_scripted_cam_{args.suffix}"
+    tanks_and_temples_output_root = f"./experimental_results/tanks_and_temples_output_scripted_cam_{args.suffix}"
 
     davis_data_root = f"{args.data_root}/DAVIS/JPEGImages/Full-Resolution"
     tanks_and_temples_data_root = f"{args.data_root}/TanksAndTemples"
@@ -50,6 +50,7 @@ if __name__ == '__main__':
                 os.remove(warped_mask)
 
     with tempfile.TemporaryDirectory(dir=args.data_root) as td:  # NOTE: assuming args.data_root is on HDD
+        print(f"{td=}")
         data_root = os.path.join(td, "tmp_data_root")
         os.mkdir(data_root)
         with concurrent.futures.ThreadPoolExecutor(max_workers=32) as executor:
@@ -97,17 +98,17 @@ if __name__ == '__main__':
 
         try:
             # 4. Pixelwise metrics calculation
-            allow_resize = ("faithful_wan" in args.suffix) or ("trajcrafter" in args.suffix) or ("das" in args.suffix)
+            allow_resize = ("wan" in args.suffix) or ("trajcrafter" in args.suffix) or ("das" in args.suffix)
             pixelwise_results, _ = run_pixelwise_metrics_calculation(output_root, allow_resize=allow_resize)
 
             # 5. FID/FVD calculation
             fid_score, kid_score = run_fid_kid_calculation(
-               data_root=data_root,
-               output_root=output_root,
+                data_root=data_root,
+                output_root=output_root,
             )
             fvd_videogpt, fvd_stylegan = run_fvd_calculation(
-               data_root=data_root,
-               output_root=output_root,
+                data_root=data_root,
+                output_root=output_root,
             )
 
             # 6. Camera pose error calculation
@@ -120,8 +121,8 @@ if __name__ == '__main__':
             met3r_results, _ = run_met3r_calculation(output_root, process_size=256, resize_mode="area")
 
             # 9. VBench
-            davis_vbench = load_vbench_scores(f"./vbench_results/davis_output_{args.suffix}_eval_results.json")
-            tanks_and_temples_vbench = load_vbench_scores(f"./vbench_results/tanks_and_temples_output_{args.suffix}_eval_results.json")
+            davis_vbench = load_vbench_scores(f"./vbench_results/davis_output_scripted_cam_{args.suffix}_eval_results.json")
+            tanks_and_temples_vbench = load_vbench_scores(f"./vbench_results/tanks_and_temples_output_scripted_cam_{args.suffix}_eval_results.json")
             assert set(davis_vbench.keys()) == set(tanks_and_temples_vbench.keys())
             vbench_average_scores = {}
             for dimension in davis_vbench.keys():

@@ -3,6 +3,7 @@ import concurrent.futures
 import glob
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -930,10 +931,34 @@ def run_met3r_calculation(output_root: str, process_size: int = 256, resize_mode
     return total_results, missing
 
 
+def save_results(results: dict, output_dir: str, output_name: str):
+    # 1. Search for existing {output_name}_[n].txt
+    search_pattern = os.path.join(output_dir, f"{output_name}_*.txt")
+    existing_files = glob.glob(search_pattern)
+
+    # 2. Find the largest [n]
+    max_n = 0
+    for filepath in existing_files:
+        filename = os.path.basename(filepath)
+        # Extract the number part (\d+) from the filename using regular expression
+        match = re.search(f"{output_name}_(\\d+)\\.[a-zA-Z0-9]+$", filename)
+        if match:
+            current_n = int(match.group(1))
+            max_n = max(max_n, current_n)
+
+    # 3. Determine the next number and save
+    next_n = max_n + 1
+    save_path = os.path.join(output_dir, f"{output_name}_{next_n}.txt")
+
+    with open(save_path, "w") as f:
+        json.dump(results, f, indent=4)
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Image-to-Video Evaluation")
     parser.add_argument("dataset", type=str, choices=["mannequin", "dl3dv_half"], help="Dataset to use for evaluation.")
     parser.add_argument("--data_root", type=str, default="/data/ryotaro/data/", help="Root directory of the datasets.")
+    parser.add_argument("--output_root", type=str, default=None, help="If specified, the outputs are stored there. If None, the default directory is used.")
     parser.add_argument("--method", type=str, default="faithful_svd", choices=["faithful_svd", "faithful_wan", "nvssolver", "trajattn", "trajcrafter", "das", "invstitch"], help="Method to use for generation. 'nvssolver' uses NVS-Solver, 'trajattn' uses Trajectory Attention, and 'das' uses DiffusionAsShader.")
     parser.add_argument("--use_mesh", action="store_true", help="If set, use mesh for trajectory extraction.")
     parser.add_argument("--scratch", action="store_true", help="If set, all the images, depth, and trajectories are re-organized and re-generated.")
@@ -943,11 +968,11 @@ if __name__ == '__main__':
     if args.dataset == "mannequin":
         data_root = os.path.join(args.data_root, "MannequinChallengeHQ/validation_frames")
         input_root = "./mannequin_challenge_input_real_cam"
-        output_root = "./mannequin_challenge_output_real_cam"
+        output_root = args.output_root or "./mannequin_challenge_output_real_cam"
     elif args.dataset == "dl3dv_half":
         original_data_root = os.path.join(args.data_root, "DL3DV-Evaluation-img4/images")
         input_root = "./dl3dv_half_input_real_cam"
-        output_root = "./dl3dv_half_output_real_cam"
+        output_root = args.output_root or "./dl3dv_half_output_real_cam"
 
         # create tmp data folder
         data_root = "/tmp/dl3dv_half"
@@ -972,6 +997,8 @@ if __name__ == '__main__':
 
     else:
         raise NotImplementedError(f"Dataset '{args.dataset}' is not implemented.")
+
+    print(f"{output_root=}")
 
     # 1. Organize RGB images & Depth estimation
     if args.scratch:
@@ -1050,43 +1077,40 @@ if __name__ == '__main__':
             allow_resize=(args.method in ["faithful_wan", "trajcrafter", "das"]),
             allow_missing_frames=(args.method == "invstitch"),
         )
-        with open(os.path.join(output_root, "pixelwise_results.txt"), "w") as f:
-            json.dump(pixelwise_results, f, indent=4)
+        save_results(pixelwise_results, output_root, "pixelwise_results")
 
         # 5. Camera pose error calculation
         camera_pose_results, _ = run_camera_pose_error_calculation(output_root)
-        with open(os.path.join(output_root, "camera_pose_results.txt"), "w") as f:
-            json.dump(camera_pose_results, f, indent=4)
+        save_results(camera_pose_results, output_root, "camera_pose_results")
 
-        # 6-1. FID/KID calculation
+        if args.method == "invstitch":
+            print("InvStitch skips FID/KID, FVD and SED/MEt3R calculation.")
+            exit()
+
+        # 6-1. FID/KID, FVD calculation
         fid_score, kid_score = run_fid_kid_calculation(
             data_root=data_root,
             output_root=output_root,
         )
-        with open(os.path.join(output_root, "fid_fvd.txt"), "w") as f:
-            f.write(f"FID: {fid_score}\nKID: {kid_score}")
-
-        if args.method == "invstitch":
-            print("InvStitch skips FVD and SED/MEt3R calculation.")
-            exit()
-
-        # 6-2. FVD calculation
         fvd_videogpt, fvd_stylegan = run_fvd_calculation(
             data_root=data_root,
             output_root=output_root,
         )
-        with open(os.path.join(output_root, "fid_fvd.txt"), "a") as f:
-            f.write(f"\nFVD (VideoGPT): {fvd_videogpt}\nFVD (StyleGAN): {fvd_stylegan}")
+        fid_kid_fvd = {
+            "FID": fid_score,
+            "KID": kid_score,
+            "FVD (VideoGPT)": fvd_videogpt,
+            "FVD (StyleGAN)": fvd_stylegan,
+        }
+        save_results(fid_kid_fvd, output_root, "fid_fvd")
 
         # 7. SED calculation
         sed_results = run_sed_calculation(output_root)
-        with open(os.path.join(output_root, "sed.txt"), "w") as f:
-            json.dump(sed_results, f, indent=4)
+        save_results(sed_results, output_root, "sed")
 
         # 8. MEt3R calculation
         met3r_results, _ = run_met3r_calculation(output_root, process_size=256, resize_mode="area")
-        with open(os.path.join(output_root, "met3r.txt"), "w") as f:
-            json.dump(met3r_results, f, indent=4)
+        save_results(met3r_results, output_root, "met3r")
 
     except KeyboardInterrupt:
         print("Caught KeyboardInterrupt, shutting down.")

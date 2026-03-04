@@ -25,3 +25,6 @@
 [submodule "tools/invisible_stitch"]
 	path = tools/invisible_stitch
 	url = https://github.com/paulengstler/invisible-stitch.git
+[submodule "tools/vipe"]
+	path = tools/vipe
+	url = https://github.com/nv-tlabs/vipe.git

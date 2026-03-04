@@ -894,7 +894,7 @@ if __name__ == '__main__':
             print("InvStitch skips FID/KID, FVD and SED/MEt3R calculation.")
             exit()
 
-        # 6-1. FID/KID/FVD calculation
+        # 6. FID/KID/FVD calculation
         fid_score, kid_score = run_fid_kid_calculation(
             data_root=data_root,
             output_root=output_root,

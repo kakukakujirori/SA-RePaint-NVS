@@ -4,6 +4,7 @@ import gc
 import glob
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -36,8 +37,8 @@ MOTION_DEGREE_PAIRS = [x for x in product(MOTION_MODES, DEGREE_LIST) if x not in
 MAJOR_RADIUS = 80
 MINOR_RADIUS = 70
 
-GPUS = [0, 1]
-MAX_WORKER_NUM = 16
+GPUS = [0, 1, 2, 3]
+MAX_WORKER_NUM = 8
 
 
 def organize_videos_and_depth(data_root: str, input_root: str, output_root: str):
@@ -409,7 +410,7 @@ def run_pixelwise_metrics_calculation(output_root: str, allow_resize: bool = Fal
 
 
 def run_fid_kid_calculation(data_root: str, output_root: str):
-    with tempfile.TemporaryDirectory() as td:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
         print(f"[run_fid_calculation] Images are copied to {td} for FID/KID calculation.")
         gt_folder = os.path.join(td, "gt")
         generated_folder = os.path.join(td, "generated")
@@ -545,7 +546,7 @@ def run_camera_pose_error_calculation(input_root: str, output_root: str, gt_foca
     missing = []
 
     def run_task(input_frame_paths: list[str], output_frame_paths: list[str], gt_pose_paths: list[str], gpu_id: int):
-        with tempfile.TemporaryDirectory() as td:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
             # load properties
             env = os.environ.copy()
             env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
@@ -664,10 +665,34 @@ def run_camera_pose_error_calculation(input_root: str, output_root: str, gt_foca
     return total_results, missing
 
 
+def save_results(results: dict, output_dir: str, output_name: str):
+    # 1. Search for existing {output_name}_[n].txt
+    search_pattern = os.path.join(output_dir, f"{output_name}_*.txt")
+    existing_files = glob.glob(search_pattern)
+
+    # 2. Find the largest [n]
+    max_n = 0
+    for filepath in existing_files:
+        filename = os.path.basename(filepath)
+        # Extract the number part (\d+) from the filename using regular expression
+        match = re.search(f"{output_name}_(\\d+)\\.[a-zA-Z0-9]+$", filename)
+        if match:
+            current_n = int(match.group(1))
+            max_n = max(max_n, current_n)
+
+    # 3. Determine the next number and save
+    next_n = max_n + 1
+    save_path = os.path.join(output_dir, f"{output_name}_{next_n}.txt")
+
+    with open(save_path, "w") as f:
+        json.dump(results, f, indent=4)
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Video-to-Video Evaluation")
     parser.add_argument("dataset", type=str, choices=["davis"], help="Dataset to use for evaluation.")
-    parser.add_argument("--data_root", type=str, default="/mnt/data/", help="Root directory of the datasets.")
+    parser.add_argument("--data_root", type=str, default="/data/ryotaro/data/", help="Root directory of the datasets.")
+    parser.add_argument("--output_root", type=str, default=None, help="If specified, the outputs are stored there. If None, the default directory is used.")
     parser.add_argument("--method", type=str, default="faithful_svd", choices=["faithful_svd", "faithful_wan", "nvssolver", "trajattn", "trajcrafter", "das"], help="Method to use for generation. 'nvssolver' uses NVS-Solver, 'trajattn' uses Trajectory Attention, and 'das' uses DiffusionAsShader.")
     parser.add_argument("--use_mesh", action="store_true", help="If set, use mesh for trajectory extraction.")
     parser.add_argument("--scratch", action="store_true", help="If set, all the images, depth, and trajectories are re-organized and re-generated.")
@@ -676,10 +701,12 @@ if __name__ == '__main__':
     # 0. Set up paths
     if args.dataset == "davis":
         data_root = os.path.join(args.data_root, "DAVIS/JPEGImages/Full-Resolution")
-        input_root = "./davis_video_input"
-        output_root = "./davis_video_output"
+        input_root = "./davis_video_input_scripted_cam"
+        output_root = args.output_root or "./davis_video_output_scripted_cam"
     else:
         raise NotImplementedError(f"Dataset '{args.dataset}' is not implemented.")
+
+    print(f"{output_root=}")
 
     # 1. Organize RGB images & Depth estimation
     if args.scratch:
@@ -702,7 +729,7 @@ if __name__ == '__main__':
                     scene,
                     motion,
                     degree,
-                    save_trajectory_type=("2d_npy" if args.method == "trajattn" else "3d_rgb" if args.method == "das" else None),
+                    save_trajectory_type=("2d_npy" if args.method == "trajattn" else "3d_rgb" if args.method == "das" else "2d_homography" if args.method.startswith("faithful_") else None),
                     use_mesh=args.use_mesh,
                 )
                 future_to_task_info[future] = (scene, motion, degree, None)
@@ -762,10 +789,13 @@ if __name__ == '__main__':
             output_root,
             allow_resize=(args.method in ["faithful_wan", "trajcrafter", "das"]),
         )
-        with open(os.path.join(output_root, "pixelwise_results.txt"), "w") as f:
-            json.dump(pixelwise_results, f, indent=4)
+        save_results(pixelwise_results, output_root, "pixelwise_results")
 
-        # 5. FID/FVD calculation
+        # 5. Camera pose error calculation
+        camera_pose_results, _ = run_camera_pose_error_calculation(input_root, output_root)
+        save_results(camera_pose_results, output_root, "camera_pose_results")
+
+        # 6. FID/KID/FVD calculation
         fid_score, kid_score = run_fid_kid_calculation(
             data_root=data_root,
             output_root=output_root,
@@ -774,17 +804,13 @@ if __name__ == '__main__':
             data_root=data_root,
             output_root=output_root,
         )
-        with open(os.path.join(output_root, "fid_fvd.txt"), "w") as f:
-            f.write("FID: " + str(fid_score) + \
-                    "\nKID: " + str(kid_score) + \
-                    "\nFVD (VideoGPT): " + str(fvd_videogpt) + \
-                    "\nFVD (StyleGAN): " + str(fvd_stylegan) + \
-                    "\n")
-
-        # 6. Camera pose error calculation
-        camera_pose_results, _ = run_camera_pose_error_calculation(input_root, output_root)
-        with open(os.path.join(output_root, "camera_pose_results.txt"), "w") as f:
-            json.dump(camera_pose_results, f, indent=4)
+        fid_kid_fvd = {
+            "FID": fid_score,
+            "KID": kid_score,
+            "FVD (VideoGPT)": fvd_videogpt,
+            "FVD (StyleGAN)": fvd_stylegan,
+        }
+        save_results(fid_kid_fvd, output_root, "fid_fvd")
 
     except KeyboardInterrupt:
         print("Caught KeyboardInterrupt, shutting down.")

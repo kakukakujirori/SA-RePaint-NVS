@@ -758,7 +758,7 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
                             ).reshape_as(latents_ori).to(latents_ori.dtype)
 
                         # os.makedirs("dump", exist_ok=True)
-                        # torch.save(M, f"dump/homography_{i}_{j}.pt")
+                        # torch.save(torch.linalg.inv(M_inv), f"dump/homography_{i}_{j}.pt")
                         # torch.save(pseudo_x0, f"dump/pseudo_x0_{i}_{j}.pt")
                         # torch.save(latents_ori, f"dump/latents_ori_{i}_{j}.pt")
 

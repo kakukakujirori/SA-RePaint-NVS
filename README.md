@@ -67,7 +67,7 @@ You also need to install additional dependencies:
 conda activate faithful_nvs
 pip3 install git+https://github.com/ByteDance-Seed/Depth-Anything-3.git
 pip3 install --no-build-isolation git+https://github.com/mohammadasim98/met3r
-pip3 install --no-build-isolation git+https://github.com/nv-tlabs/vipe.git
+pip3 install --no-build-isolation ./tools/FVD/fvdcal-1.0-py3-none-any.whl
 ```
 
 ### Directory Structure
@@ -137,3 +137,5 @@ python eval_dataset_i2v_real_cam.py [mannequin/dl3dv_half] --data_root ${DATA_RO
 ```bash
 python eval_dataset_v2v_scripted_cam.py davis --data_root ${DATA_ROOT} --method XXX --use_mesh [--scratch]
 ```
+
+NOTE: For video-to-video evaluation, we use [ViPE](https://github.com/nv-tlabs/vipe/tree/main) for camera pose estimation. Since its requiring library versions are stricter than us, we recommend re-creating a virtual environment based on the ViPE instrallation process under `./tools/vipe`.

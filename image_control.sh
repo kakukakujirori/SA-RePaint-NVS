@@ -1,7 +1,8 @@
 ITEM=ride
-CAMERA_MOTION_MODE=horizontal
-DEGREE=1.0
+CAMERA_MOTION_MODE=horizontal  # [horizontal, vertical, zoomout]
+DEGREE=1.0                     # [-1.0, -0.5, 0.5, 1.0]
 NUM_FRAMES=25
+MODEL=SVD                      # [SVD, WAN]
 
 set -e
 
@@ -36,10 +37,25 @@ python src/trajectory_extraction.py \
   --save_trajectory_type 2d_homography
 
 # generaiton
-python src/generate_faithful_wan.py \
-  --output_folder output/${ITEM}/${CAMERA_MOTION_MODE}_${DEGREE}/generated \
-  --trajectory_folder output/${ITEM}/${CAMERA_MOTION_MODE}_${DEGREE}/warped \
-  --num_frames ${NUM_FRAMES} \
-  --num_inference_steps 50 \
-  --repaint_iter_num 2 \
-  --seed 12345
+echo "Running Generation with MODEL=${MODEL}..."
+if [ "${MODEL}" = "SVD" ]; then
+  python src/generate_faithful_svd.py \
+    --output_folder output/${ITEM}/${CAMERA_MOTION_MODE}_${DEGREE}/generated \
+    --trajectory_folder output/${ITEM}/${CAMERA_MOTION_MODE}_${DEGREE}/warped \
+    --num_frames ${NUM_FRAMES} \
+    --num_inference_steps 50 \
+    --denoise_start_step 16 \
+    --repaint_iter_num 2 \
+    --seed 12345
+elif [ "${MODEL}" = "WAN" ]; then
+  python src/generate_faithful_wan.py \
+    --output_folder output/${ITEM}/${CAMERA_MOTION_MODE}_${DEGREE}/generated \
+    --trajectory_folder output/${ITEM}/${CAMERA_MOTION_MODE}_${DEGREE}/warped \
+    --num_frames ${NUM_FRAMES} \
+    --num_inference_steps 50 \
+    --repaint_iter_num 2 \
+    --seed 12345
+else
+  echo "Error: Unknown MODEL '${MODEL}'. Must be 'SVD' or 'WAN'."
+  exit 1
+fi

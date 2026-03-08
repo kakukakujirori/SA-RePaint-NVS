@@ -683,7 +683,7 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
             # torch.save(M_init, "dump/homography_init.pt")
         else:
             M_init = None
-            raise ValueError("Experimenting with `warping_homographies`, so it's must. Please remove this line afterwards.")
+            raise ValueError("Experimenting with `warping_homographies`.")
 
         # 2. Define call parameters
         if prompt is not None and isinstance(prompt, str):

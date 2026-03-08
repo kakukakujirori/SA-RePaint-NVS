@@ -56,6 +56,11 @@ bash video_control.sh
 ```
 You will find the results in the ```output``` folder.
 
+Configurations (Modify the variables in the files):
+- `CAMERA_MOTION_MODE`: Camera motion (`horizontal`, `vertical`, or `zoomout`)
+- `DEGREE`: Camera motion amount
+- `MODEL`: Video diffusion model for inpainting (`SVD` or `WAN`)
+
 ## Evaluation
 
 ### Preparation
@@ -120,13 +125,8 @@ Tips: You may want to change the `GPUS` and `MAX_WORKER_NUM` for multiprocessing
 
 ### 2. Image-to-Video: Real Camera Motion (Mannequin & DL3DV-Eval)
 
-TODO: provide `download_extract.py` (The following works only after you run `download_extract.py` and download all the videos).
+[TODO: provide `download_extract.py` (The following works only after you run `download_extract.py` and download all the videos).]
 
-If it's the first time, comment out the following two lines in line 676 of `eval_dataset_i2v`:
-```python
-# if args.dataset == "mannequin":
-#     reorganize_frames(data_root)
-```
 Then run the following:
 ```bash
 python eval_dataset_i2v_real_cam.py [mannequin/dl3dv_half] --data_root ${DATA_ROOT} --method XXX --use_mesh [--scratch]

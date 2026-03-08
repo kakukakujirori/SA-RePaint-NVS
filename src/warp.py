@@ -167,35 +167,49 @@ def homography_estimation(
     else:
         raise NotImplementedError(f"{loss_type=} unsupported.")
 
-    if init_homography is None:
-        raise NotImplementedError("init_homography is required.")
-    assert init_homography.shape == (batch, num_frames, 3, 3)
-    assert init_homography[..., 2, 2].abs().min() > 1e-3, f"init_homography[..., 2, 2] is close to 0: {init_homography=}"
-    init_homography = init_homography / init_homography[..., 2:3, 2:3]
+    if init_homography is not None:
+        # opt_var = alpha
+        assert init_homography.shape == (batch, num_frames, 3, 3)
+        assert init_homography[..., 2, 2].abs().min() > 1e-3, f"init_homography[..., 2, 2] is close to 0: {init_homography=}"
+        init_homography = init_homography / init_homography[..., 2:3, 2:3]
+        opt_var = torch.nn.Parameter(torch.full((batch, 1, 1, 1), init_alpha, device=frames_src.device, dtype=frames_src.dtype))
+        solution_space_is_linear = True
+    else:
+        # opt_var = M
+        opt_var = torch.nn.Parameter(
+            torch.tensor([[[1, 0, 0, 0, 1, 0, 0, 0]]], device=frames_src.device, dtype=frames_src.dtype).repeat(batch, num_frames, 1)
+        )
+        solution_space_is_linear = False
 
-    # NOTE: TESTING SINGLE PARAM (num_frames -> 1)
-    alpha = torch.nn.Parameter(torch.full((batch, 1, 1, 1), init_alpha, device=frames_src.device, dtype=frames_src.dtype))
     if optimizer_type == "adam":
-        optimizer = torch.optim.Adam([alpha], lr=lr)
+        optimizer = torch.optim.Adam([opt_var], lr=lr)
     elif optimizer_type == "lbfgs":
         if lr < 0.1:
             print(f"[homography_estimation] Warning: {lr=} may be too low. Consider setting lr=1 when using LBFGS.")
-        optimizer = torch.optim.LBFGS([alpha], lr=lr, max_iter=max_iters, line_search_fn="strong_wolfe")
+        optimizer = torch.optim.LBFGS([opt_var], lr=lr, max_iter=max_iters, line_search_fn="strong_wolfe")
     else:
         raise NotImplementedError(f"{optimizer_type=} unsupported.")
 
     # optimization
+    def get_homography():
+        if solution_space_is_linear:
+            ratio = torch.sigmoid(opt_var)
+            M_identity = torch.eye(3, device=frames_src.device, dtype=frames_src.dtype).reshape(1, 1, 3, 3)
+            M = ratio * init_homography + (1 - ratio) * M_identity
+        else:
+            bottom_right_ones = torch.ones(batch, num_frames, 1, device=frames_src.device, dtype=frames_src.dtype)
+            M = torch.cat([opt_var, bottom_right_ones], dim=-1).reshape(batch, num_frames, 3, 3)
+            ratio = torch.ones(1, 1, 1, 1, device=frames_src.device, dtype=frames_src.dtype)
+        return M, ratio
+
     def zero_first_frame_grad():
-        if fix_first_frame and alpha.grad is not None and alpha.shape[1] > 1:
-            alpha.grad[:, 0] = 0.0
+        if fix_first_frame and opt_var.grad is not None and opt_var.shape[1] > 1:
+            opt_var.grad[:, 0] = 0.0
 
     def compute_loss():
         optimizer.zero_grad()
 
-        # linear interpolation between init_homography and identity
-        ratio = torch.sigmoid(alpha)
-        M_identity = torch.eye(3, device=frames_src.device, dtype=frames_src.dtype).reshape(1, 1, 3, 3)
-        M = ratio * init_homography + (1 - ratio) * M_identity
+        M, ratio = get_homography()
 
         # warp
         src_warped = homography_warp_custom(
@@ -237,9 +251,7 @@ def homography_estimation(
 
     with torch.no_grad():
         # final homography
-        print(f"{alpha.flatten()=}")
-        ratio = torch.sigmoid(alpha)
-        M = ratio * init_homography + (1 - ratio) * torch.eye(3, device=frames_src.device, dtype=frames_src.dtype).reshape(1, 1, 3, 3)
+        M, ratio = get_homography()
         M_inv = torch.linalg.inv(M)
 
         # apply the optimized warp

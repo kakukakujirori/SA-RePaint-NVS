@@ -534,7 +534,7 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
             # torch.save(M_init, "dump/homography_init.pt")
         else:
             M_init = None
-            raise ValueError("Experimenting with `warping_homographies`, so it's must. Please remove this line afterwards.")
+            raise ValueError("Experimenting with `warping_homographies`.")
 
         # 3. Encode input image
         with torch.no_grad():
@@ -854,14 +854,9 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
                             latents_mid_pasted = warped_masks_sh * latents_mid + \
                                         (1 - warped_masks_sh) * (warped_latents_noisy[batch_size:] if self.do_classifier_free_guidance else warped_latents_noisy)
 
-                            latents = self.stochastic_resample(
-                                opt_zs=latents_mid_pasted,
-                                ori_zt=latents_ori,
-                                sigma_s=sigma_s,
-                                sigma_t=sigma_t,
-                                posterior_sigma=torch.inf,  # sigma_t**2 / opt_std
-                                generator=generator,
-                            )
+                            coeff_noise = (sigma_t ** 2 - sigma_s ** 2).relu()**0.5
+                            latents = latents_mid_pasted + coeff_noise * randn_tensor(
+                                latents_mid_pasted.shape, generator=generator, device=latents_mid_pasted.device, dtype=latents_mid_pasted.dtype)
 
                         else:
                             pass
@@ -910,54 +905,6 @@ class StableVideoDiffusionPipeline(DiffusionPipeline):
             return frames
 
         return StableVideoDiffusionPipelineOutput(frames=frames)
-
-
-    def stochastic_resample(
-            self,
-            opt_zs: torch.Tensor,
-            ori_zt: Optional[torch.Tensor],
-            sigma_s: float | torch.Tensor,
-            sigma_t: float | torch.Tensor,
-            posterior_sigma: float | torch.Tensor = torch.inf,
-            generator: Optional[torch.Generator] = None,
-        ):
-        """
-        Function to resample z_t based on the ReSample paper.
-        The formulation is translated from VP to VE to adapt to SVD.
-
-        Arguments:
-            opt_zs: hat{z}_s(y)
-            ori_zt: z'_t
-            sigma_s: The noise level of opt_zs.
-            sigma_t: The noise level of ori_zt.
-            posterior_sigma: p(z'_t | hat{z}_t, hat{z}_s, y) ~ N(hat{z}_s(y), posterior_sigma)
-        """
-        if isinstance(sigma_s, torch.Tensor):
-            assert torch.all(0 <= sigma_s) and torch.all(sigma_s <= sigma_t), f"{sigma_s=}, {sigma_t=}"
-        else:
-            assert 0 <= sigma_s <= sigma_t, f"{sigma_s=}, {sigma_t=}"
-
-        # cast everything to float32
-        opt_zs = opt_zs.float()
-        ori_zt = ori_zt.float() if ori_zt is not None else ori_zt
-        sigma_s = sigma_s.float() if isinstance(sigma_s, torch.Tensor) else torch.tensor(sigma_s, dtype=torch.float32)
-        sigma_t = sigma_t.float() if isinstance(sigma_t, torch.Tensor) else torch.tensor(sigma_t, dtype=torch.float32)
-        posterior_sigma = posterior_sigma.float() if isinstance(posterior_sigma, torch.Tensor) else torch.tensor(posterior_sigma, dtype=torch.float32)
-
-        noise = randn_tensor(opt_zs.shape, generator=generator, device=opt_zs.device, dtype=opt_zs.dtype)
-
-        t_squared_minus_s_squared = (sigma_t ** 2 - sigma_s ** 2).relu()
-        post_sigma_squared = posterior_sigma ** 2
-
-        if posterior_sigma == torch.inf:
-            return opt_zs + noise * t_squared_minus_s_squared**0.5
-        else:
-            assert ori_zt is not None
-
-        denom = post_sigma_squared + t_squared_minus_s_squared
-        mean = (post_sigma_squared / denom) * opt_zs + (t_squared_minus_s_squared / denom) * ori_zt
-        std = posterior_sigma * (t_squared_minus_s_squared / (post_sigma_squared + t_squared_minus_s_squared)).relu().sqrt()
-        return mean + noise * std
 
 
 if __name__ == '__main__':

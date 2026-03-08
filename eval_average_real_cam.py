@@ -28,7 +28,7 @@ def load_vbench_scores(json_path: str):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Image-to-Video Evaluation")
-    parser.add_argument("--data_root", type=str, default="/data/ryotaro/data/", help="Root directory for the dataset")
+    parser.add_argument("--data_root", type=str, default="/mnt/data/", help="Root directory for the dataset")
     parser.add_argument("--suffix", type=str, default="nvssolver", help="Suffix for output directories")
     args = parser.parse_args()
 

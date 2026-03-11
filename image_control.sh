@@ -40,7 +40,7 @@ python src/trajectory_extraction.py \
 echo "Running Generation with MODEL=${MODEL}..."
 if [ "${MODEL}" = "SVD" ]; then
   python src/generate_faithful_svd.py \
-    --output_folder output/${ITEM}/${CAMERA_MOTION_MODE}_${DEGREE}/generated \
+    --output_folder output/${ITEM}/${CAMERA_MOTION_MODE}_${DEGREE}/generated_${MODEL} \
     --trajectory_folder output/${ITEM}/${CAMERA_MOTION_MODE}_${DEGREE}/warped \
     --num_frames ${NUM_FRAMES} \
     --num_inference_steps 50 \
@@ -49,7 +49,7 @@ if [ "${MODEL}" = "SVD" ]; then
     --seed 12345
 elif [ "${MODEL}" = "WAN" ]; then
   python src/generate_faithful_wan.py \
-    --output_folder output/${ITEM}/${CAMERA_MOTION_MODE}_${DEGREE}/generated \
+    --output_folder output/${ITEM}/${CAMERA_MOTION_MODE}_${DEGREE}/generated_${MODEL} \
     --trajectory_folder output/${ITEM}/${CAMERA_MOTION_MODE}_${DEGREE}/warped \
     --num_frames ${NUM_FRAMES} \
     --num_inference_steps 50 \

@@ -286,6 +286,15 @@ def run_generation_task(output_root: str, scene: str, motion_mode: str, degree: 
                 "--seed", "12345",
                 "--gpu", f"{gpu_id}"],
                 check=True, capture_output=True, text=True, encoding='utf-8')
+        elif method == "vace":
+            result = subprocess.run(["python", "src/generate_vace.py",
+                "--output_folder", f"{output_root}/{scene}/{motion_mode}_{degree}/generated",
+                "--trajectory_folder", f"{output_root}/{scene}/{motion_mode}_{degree}/warped",
+                "--num_frames", f"{NUM_FRAMES}",
+                "--num_inference_steps", "50",
+                "--seed", "12345",
+                "--gpu", f"{gpu_id}"],
+                check=True, capture_output=True, text=True, encoding='utf-8')
         else:
             raise NotImplementedError(f"Method '{method}' is not implemented.")
         print(f"COMPLETED task: {task_id}\nSTDOUT:\n{result.stdout.strip()}")
@@ -693,7 +702,7 @@ if __name__ == '__main__':
     parser.add_argument("dataset", type=str, choices=["davis"], help="Dataset to use for evaluation.")
     parser.add_argument("--data_root", type=str, default="/mnt/data/", help="Root directory of the datasets.")
     parser.add_argument("--output_root", type=str, default=None, help="If specified, the outputs are stored there. If None, the default directory is used.")
-    parser.add_argument("--method", type=str, default="faithful_svd", choices=["faithful_svd", "faithful_wan", "nvssolver", "trajattn", "trajcrafter", "das"], help="Method to use for generation. 'nvssolver' uses NVS-Solver, 'trajattn' uses Trajectory Attention, and 'das' uses DiffusionAsShader.")
+    parser.add_argument("--method", type=str, default="faithful_svd", choices=["faithful_svd", "faithful_wan", "nvssolver", "trajattn", "trajcrafter", "das", "vace"], help="Method to use for generation. 'nvssolver' uses NVS-Solver, 'trajattn' uses Trajectory Attention, and 'das' uses DiffusionAsShader.")
     parser.add_argument("--use_mesh", action="store_true", help="If set, use mesh for trajectory extraction.")
     parser.add_argument("--scratch", action="store_true", help="If set, all the images, depth, and trajectories are re-organized and re-generated.")
     args = parser.parse_args()
@@ -787,7 +796,7 @@ if __name__ == '__main__':
         # 4. Pixelwise metrics calculation
         pixelwise_results, _ = run_pixelwise_metrics_calculation(
             output_root,
-            allow_resize=(args.method in ["faithful_wan", "trajcrafter", "das"]),
+            allow_resize=(args.method in ["faithful_wan", "trajcrafter", "das", "vace"]),
         )
         save_results(pixelwise_results, output_root, "pixelwise_results")
 

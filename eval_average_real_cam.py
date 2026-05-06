@@ -121,7 +121,7 @@ if __name__ == '__main__':
 
         try:
             # # 4. Pixelwise metrics calculation (NOTE: input GT data is not available! Calculate manually!)
-            # allow_resize = ("wan" in args.suffix) or ("trajcrafter" in args.suffix) or ("das" in args.suffix)
+            # allow_resize = ("wan" in args.suffix) or ("trajcrafter" in args.suffix) or ("das" in args.suffix) or ("vace" in args.suffix)
             # pixelwise_results, _ = run_pixelwise_metrics_calculation(???, output_root, allow_resize=allow_resize)
 
             # 5. FID/FVD calculation

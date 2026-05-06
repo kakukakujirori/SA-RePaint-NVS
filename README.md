@@ -117,7 +117,7 @@ $(DATA_ROOT)
 python eval_dataset_i2v_scripted_cam.py [davis/tanks] --data_root ${DATA_ROOT} --method XXX --use_mesh [--scratch]
 ```
 
-- `--method` : which inpainting method to use (`faithful_svd`, `faithful_wan`, `trajcrafter`, `trajattn`, `nvssolver`, `das`)
+- `--method` : which inpainting method to use (`faithful_svd`, `faithful_wan`, `trajcrafter`, `trajattn`, `nvssolver`, `das`, `vace`)
 - `--use_mesh` : If set, mesh-based rendering is used. If not, NVS-Solver's bilinear splatting is used. We recommend adding this flag.
 - `--scratch` : Set when you run the evaluation for the first time. If not set, the code assumes that rendering has already completed and its results are stored in a particular folder.
 

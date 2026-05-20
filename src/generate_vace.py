@@ -127,7 +127,7 @@ def main():
     torch.cuda.empty_cache()
 
     # pack to tensors and resize
-    height, width = 480, 832
+    height, width = 720, 1280  # NOTE: 1280x720 results in better outcomes than 832x480
     warped_images = [x.resize((width, height), PIL.Image.Resampling.LANCZOS) for x in warped_images]
     warped_masks = [x.resize((width, height), PIL.Image.Resampling.NEAREST) for x in warped_masks]
 
@@ -146,9 +146,6 @@ def main():
         generator=torch.Generator(device).manual_seed(args.seed),
         output_type="pil",
     ).frames[0]
-
-    # monitor.stop()
-    # print(f"Peak GPU memory usage: {monitor.get_max_memory():.2f} GB")
 
     os.makedirs(args.output_folder, exist_ok=True)
     for i, frame in enumerate(frames):

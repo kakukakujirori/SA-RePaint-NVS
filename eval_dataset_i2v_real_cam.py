@@ -40,7 +40,7 @@ NUM_INFERECE_STEPS = 50
 DENOISE_START_STEP = NUM_INFERECE_STEPS // 3
 REPAINT_ITER_NUM = 2
 
-GPUS = [0, 1, 2, 3]
+GPUS = [0, 1]
 MAX_WORKER_NUM = 16
 
 
@@ -451,6 +451,9 @@ def run_pixelwise_metrics_calculation(input_root: str, output_root: str, allow_r
             psnr_score = PSNR(gt_tensor[mask_tensor_bool], generated_tensor[mask_tensor_bool])
             results["psnr_with_gt_on_mask"] = psnr_score.item()
 
+            psnr_score = PSNR(gt_tensor[~mask_tensor_bool], generated_tensor[~mask_tensor_bool])
+            results["psnr_with_gt_off_mask"] = psnr_score.item()
+
             psnr_score = PSNR(gt_tensor, generated_tensor)
             results["psnr_with_gt_full"] = psnr_score.item()
 
@@ -460,6 +463,9 @@ def run_pixelwise_metrics_calculation(input_root: str, output_root: str, allow_r
 
             ssim_score = ssim(gt_tensor, generated_tensor, mask=mask_tensor_bool, data_range=1.0, size_average=True)
             results["ssim_with_gt_on_mask"] = ssim_score.item()
+
+            ssim_score = ssim(gt_tensor, generated_tensor, mask=~mask_tensor_bool, data_range=1.0, size_average=True)
+            results["ssim_with_gt_off_mask"] = ssim_score.item()
 
             ssim_score = ssim(gt_tensor, generated_tensor, data_range=1.0, size_average=True)
             results["ssim_with_gt_full"] = ssim_score.item()
@@ -473,7 +479,9 @@ def run_pixelwise_metrics_calculation(input_root: str, output_root: str, allow_r
             lpips_score = torch.sum(lpips_full * mask_tensor_float) / torch.sum(mask_tensor_float)
             results["lpips_with_gt_on_mask"] = lpips_score.item()
 
-            lpips_full = LPIPS(gt_tensor * 2 - 1, generated_tensor * 2 - 1)
+            lpips_score = torch.sum(lpips_full * (1 - mask_tensor_float)) / torch.sum(1 - mask_tensor_float)
+            results["lpips_with_gt_off_mask"] = lpips_score.item()
+
             lpips_score = torch.mean(lpips_full)
             results["lpips_with_gt_full"] = lpips_score.item()
 
@@ -512,36 +520,52 @@ def run_pixelwise_metrics_calculation(input_root: str, output_root: str, allow_r
 
     total_psnr_with_warped_on_mask = sum([result["psnr_with_warped_on_mask"] for result in total_results.values()]) / len(total_results)
     total_psnr_with_gt_on_mask = sum([result["psnr_with_gt_on_mask"] for result in total_results.values()]) / len(total_results)
+    total_psnr_with_gt_off_mask = sum([result["psnr_with_gt_off_mask"] for result in total_results.values()]) / len(total_results)
     total_psnr_with_gt_full = sum([result["psnr_with_gt_full"] for result in total_results.values()]) / len(total_results)
+
     total_ssim_with_warped_on_mask = sum([result["ssim_with_warped_on_mask"] for result in total_results.values()]) / len(total_results)
     total_ssim_with_gt_on_mask = sum([result["ssim_with_gt_on_mask"] for result in total_results.values()]) / len(total_results)
+    total_ssim_with_gt_off_mask = sum([result["ssim_with_gt_off_mask"] for result in total_results.values()]) / len(total_results)
     total_ssim_with_gt_full = sum([result["ssim_with_gt_full"] for result in total_results.values()]) / len(total_results)
+
     total_lpips_with_warped_on_mask = sum([result["lpips_with_warped_on_mask"] for result in total_results.values()]) / len(total_results)
     total_lpips_with_gt_on_mask = sum([result["lpips_with_gt_on_mask"] for result in total_results.values()]) / len(total_results)
+    total_lpips_with_gt_off_mask = sum([result["lpips_with_gt_off_mask"] for result in total_results.values()]) / len(total_results)
     total_lpips_with_gt_full = sum([result["lpips_with_gt_full"] for result in total_results.values()]) / len(total_results)
+
     print("----------------------------------------------------------------")
     print(f"Total PSNR with warped on mask: {total_psnr_with_warped_on_mask}")
     print(f"Total PSNR with gt on mask: {total_psnr_with_gt_on_mask}")
+    print(f"Total PSNR with gt off mask: {total_psnr_with_gt_off_mask}")
     print(f"Total PSNR with gt full: {total_psnr_with_gt_full}")
     print("----------------------------------------------------------------")
     print(f"Total SSIM with warped on mask: {total_ssim_with_warped_on_mask}")
     print(f"Total SSIM with gt on mask: {total_ssim_with_gt_on_mask}")
+    print(f"Total SSIM with gt off mask: {total_ssim_with_gt_off_mask}")
     print(f"Total SSIM with gt full: {total_ssim_with_gt_full}")
     print("----------------------------------------------------------------")
     print(f"Total LPIPS with warped on mask: {total_lpips_with_warped_on_mask}")
     print(f"Total LPIPS with gt on mask: {total_lpips_with_gt_on_mask}")
+    print(f"Total LPIPS with gt off mask: {total_lpips_with_gt_off_mask}")
     print(f"Total LPIPS with gt full: {total_lpips_with_gt_full}")
     print("----------------------------------------------------------------")
     print(f"Missing dirs: {len(missing)}")
+
     total_results["total_psnr_with_warped_on_mask"] = total_psnr_with_warped_on_mask
     total_results["total_psnr_with_gt_on_mask"] = total_psnr_with_gt_on_mask
+    total_results["total_psnr_with_gt_off_mask"] = total_psnr_with_gt_off_mask
     total_results["total_psnr_with_gt_full"] = total_psnr_with_gt_full
+
     total_results["total_ssim_with_warped_on_mask"] = total_ssim_with_warped_on_mask
     total_results["total_ssim_with_gt_on_mask"] = total_ssim_with_gt_on_mask
+    total_results["total_ssim_with_gt_off_mask"] = total_ssim_with_gt_off_mask
     total_results["total_ssim_with_gt_full"] = total_ssim_with_gt_full
+
     total_results["total_lpips_with_warped_on_mask"] = total_lpips_with_warped_on_mask
     total_results["total_lpips_with_gt_on_mask"] = total_lpips_with_gt_on_mask
+    total_results["total_lpips_with_gt_off_mask"] = total_lpips_with_gt_off_mask
     total_results["total_lpips_with_gt_full"] = total_lpips_with_gt_full
+
     total_results["missing_dirs"] = missing
 
     return total_results, missing

@@ -37,7 +37,7 @@ MOTION_DEGREE_PAIRS = [x for x in product(MOTION_MODES, DEGREE_LIST) if x not in
 MAJOR_RADIUS = 80
 MINOR_RADIUS = 70
 
-GPUS = [0, 1, 2, 3]
+GPUS = [0, 1]
 MAX_WORKER_NUM = 8
 
 

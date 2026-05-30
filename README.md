@@ -1,4 +1,4 @@
-# Prioritizing Faithfulness: Efficient Zero-Shot Novel View Synthesis with Adaptive Latent Modulation
+# Prioritizing Faithfulness: Efficient Zero-Shot Novel View Synthesis via Homography-Guided SA-RePaint
 
 ![elephant](assets/elephant_00025_zoomout_1.0.gif)
 ![breakdance](assets/breakdance_00000_horizontal_-0.25.gif)

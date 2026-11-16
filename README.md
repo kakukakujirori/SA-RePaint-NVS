@@ -19,8 +19,8 @@
 
 2. Clone the repository
     ```bash
-    git clone --recursive https://github.com/kakukakujirori/FaithfulNVS.git
-    cd FaithfulNVS
+    git clone --recursive https://github.com/kakukakujirori/SA-RePaint-NVS.git
+    cd SA-RePaint-NVS
     bash patch/apply_patch.sh  # apply patch to submodules
     pip3 install -r requirements.txt
     ```
